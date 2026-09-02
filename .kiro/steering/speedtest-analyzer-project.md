@@ -1,7 +1,7 @@
 ---
 inclusion: fileMatch
 fileMatchPattern: "**/speedtest_analyzer/**"
-description: "Speedtest Analyzer project knowledge: guardrails, validated behavior, and the locked configuration-management HLD"
+description: "Speedtest Analyzer project knowledge: guardrails, validated behavior, and the shipped two-layer configuration-management architecture"
 ---
 # Speedtest Analyzer — Project Knowledge
 
@@ -18,10 +18,10 @@ them. If code and this file ever disagree, the code and app docs win; fix this f
 ## Current Baseline
 
 - Branch: `speedtest-analyzer-development` (established dev branch/workflow — verify `git status`/branch before development).
-- Version: `1.1.1` (from `apps/speedtest_analyzer/package.ini`). Release family `1.1.x`.
+- Version: `1.1.2` (from `apps/speedtest_analyzer/package.ini`). Release family `1.1.x`.
 - Firmware family: NCOS 7.26.x. Architecture: ARM64 (aarch64).
 - Product lineage: Speedtest Analyzer 1.0.0 was reset from the unreleased Speed Test 2.7.6 dev baseline. Full engineering history is in `TECHNICAL_GUIDE.md`.
-- Do NOT bump version, start the configuration architecture, or add Geo API-key handling until explicitly instructed.
+- The two-layer configuration architecture is SHIPPED and E400-validated (see "Two-Layer Configuration Management" below). Do NOT add Geo API-key/provider-secret handling until explicitly instructed.
 
 ## Development Guardrails (permanent)
 
@@ -75,15 +75,16 @@ removes primary/backup/temp/quarantined files then creates an empty history.
 
 Modules: `cellular_analysis.py` (normalization + interface/history-scoped analysis +
 `build_site_cell_inventory(history)` for site-wide GeoView), `cellular_geo.py`
-(provider-independent GeoView settings, appdata persistence; no external adapters),
-`speedtest_web.py` (HTTP transport, GeoView endpoints, explicit GPS request),
-`index.html` (vanilla schematic/UI).
+(provider-independent GeoView settings schema + validation; no external adapters),
+`configuration_manager.py` (two-layer config: merge, migration, reset, Update NCM Group,
+scheduler running derivation), `speedtest_web.py` (HTTP transport, config endpoints,
+runtime apply, GeoView endpoints, explicit GPS request), `index.html` (vanilla schematic/UI).
 
 ## GeoView (local-first; enrichment providers are future)
 
 - Without any external provider/API key, GeoView must remain useful: serving-cell counts, carrier/interface context, site coords if available, serving-cell identities, local observation schematic, distribution, radio analysis. The default view is a NON-geographic local observation schematic (marker positions are not lat/long, direction, distance, azimuth, or topology). No map runtime (Leaflet/Google Maps JS/etc.).
-- `geoview_settings` appdata is schema_version 2, with independent Device GPS / Manual Coordinates / Site Address stores and an `active_location_source`. GPS is queried only on explicit Refresh GPS; `0.0,0.0` is the no-fix sentinel (never persisted as a location). Writes are read-back verified; defaults are never auto-written to appdata.
-- Google and Unwired are "Research Pending" and disabled in the v1.1.1 UI. Do NOT implement provider API-key encryption/storage as part of the configuration-management work unless explicitly instructed later.
+- GeoView config is schema_version 2 with independent Device GPS / Manual Coordinates / Site Address stores and an `active_location_source`. As of 1.1.2 it is persisted as the `geoview` SECTION inside the canonical two-key documents (not the standalone `geoview_settings` key); `cellular_geo.py` still owns validation. Runtime device-GPS coordinates are stripped before persistence AND before Group promotion. GPS is queried only on explicit Refresh GPS; `0.0,0.0` is the no-fix sentinel (never persisted). Writes are read-back verified; defaults are never auto-written to appdata.
+- Google and Unwired are "Research Pending" and disabled in the UI. Do NOT implement provider API-key encryption/storage unless explicitly instructed later.
 
 ## v1.1.1 Timeline / Reporting (validated on E400 — do not remove/restyle in unrelated work)
 
@@ -102,168 +103,108 @@ configs during a test.
 
 ## Current SDK Appdata Keys (verified in code)
 
-The canonical `speedtest_analyzer` consolidated entry described below does NOT exist yet;
-current code uses these separate keys:
+Canonical configuration (two-key model, shipped in 1.1.2):
+- `speedtest_analyzer_group` — NCM Group standard. READ/validated only; the app NEVER writes/deletes it locally.
+- `speedtest_analyzer_device` — locally managed Device config + overrides. The ONLY canonical key the app writes/deletes.
 
-Persistent configuration:
-- `iperf_server_settings` — iPerf3 server source/mode preferences
-- `iperf3_servers` — User Server List
-- `netperf_servers` — saved Netperf servers
-- `speedtest_schedule` — scheduled-test configuration
-- `speedtest_outputs` — configured output targets
-- `geoview_settings` — GeoView config (schema_version 2)
+Both are schema-versioned, section-sparse, with independent `group_revision`/`device_revision`.
+Sections: `schedule`, `outputs`, `iperf3_server_settings`, `iperf3_user_servers`,
+`netperf_servers`, `geoview`. GeoView is embedded as the `geoview` section (schema_version 2),
+not a standalone key; `cellular_geo.py` still owns its validation.
 
 Runtime / stats / output (NOT normal config):
-- `iperf_server_stats` — iPerf3 Reliability stats (30-minute dirty-only checkpoint)
+- `iperf_server_stats` — iPerf3 Reliability stats (dirty-only checkpoint)
 - `speedtest_results` — written output target
+
+Migration inputs ONLY (never written by 1.1.2; read once to convert an older install):
+- `speedtest_analyzer` — abandoned experimental single-key document
+- `iperf_server_settings`, `iperf3_servers`, `netperf_servers`, `speedtest_schedule`,
+  `speedtest_outputs`, `geoview_settings` — fragmented legacy keys
 
 ---
 
-# LOCKED HLD — Configuration Management (FUTURE WORK — do NOT code yet)
+# Two-Layer Configuration Management (SHIPPED in 1.1.2 — do NOT regress)
 
-Recorded for understanding only. Implement later on explicit instruction. Do not start
-this architecture, and do not merge API-key/secret handling into it.
+The shipped architecture is the two-key model below (implemented in
+`configuration_manager.py`; full engineering detail in `TECHNICAL_GUIDE.md` §18). An earlier
+single-key design (`speedtest_analyzer` with `management.origin`/`management.mode` +
+`config_revision`) was explored but NEVER built — if those notes resurface anywhere, they are
+obsolete. The code and `TECHNICAL_GUIDE.md` §18 are authoritative.
 
-## Canonical entry
+## Canonical model
 
-One SDK App Data entry `speedtest_analyzer` holding one COMPLETE normalized JSON document
-(not sparse — defaults/blanks get explicit canonical representation).
+- `speedtest_analyzer_group` — NCM Group standard. READ/validated ONLY; ZERO local writes/deletes.
+- `speedtest_analyzer_device` — the ONLY canonical key the app writes/deletes.
+- Both are schema-versioned, `document_type`-tagged, section-SPARSE, with INDEPENDENT
+  `group_revision`/`device_revision`. No `config_revision`, no `management.origin`/`mode`.
+  Management state is DERIVED from key presence.
 
-INCLUDE: scheduled jobs; user-created iPerf3 server config; server-source/mode selections;
-non-secret GeoView config; global application settings; future non-secret settings.
+## Invariants (must not regress)
 
-DO NOT INCLUDE: API keys/secrets; test history; cellular telemetry/history; analysis
-results; logs; caches; last-run/temporary runtime state; the bundled public iPerf3 catalog
-(stays packaged/read-only, never copied into appdata).
+- App never writes/deletes `speedtest_analyzer_group`.
+- Effective config = whole-section `DEVICE > GROUP > DEFAULT` by section-key PRESENCE (falsey
+  values `[]`/`{}`/`false`/`""` are authoritative). Section-atomic; no field-level deep merge.
+- Sparse documents; absent sections inherit downward.
+- Exact-name appdata matching (never rely on loose/substring `get_appdata(name)` for canonical keys).
+- Read-back verified Device writes (verify document_type/schema/expected revision; fail closed).
+- Never write defaults to appdata on startup (would override Group inheritance).
+- Normalized no-op guard: identical proposed device body → zero writes, no revision bump, no
+  key create/delete, no hot reload. Runtime-only values (e.g. live GPS) are stripped before
+  persistence and never count as a change.
+- Secrets/provider API keys stay OUT of scope; never store in either canonical document.
 
-Metadata:
-```json
-{ "schema_version": 1, "config_revision": 0,
-  "management": { "origin": "device|group", "mode": "device|group|device_override" } }
-```
-Stable combinations: device/device, group/group, group/device_override. `origin` = where
-the lifecycle began; `mode` = current management behavior. No config UUID/hash. Never
-store NCM group name or ID.
+## Reset dependency
 
-## Day-1 / first persistent save
+Section reset builds the PROPOSED device doc, recomputes PROPOSED effective, and validates
+BEFORE persisting. Enforced dependency: an iPerf3 schedule's `params.server_source`
+(`public`/`user`) must match effective `iperf3_server_settings.server_mode`; Netperf/non-iperf3
+are never coupled. On conflict, return `dependency_reset_required` with `required_reset_sections`,
+reason, and `reset_target` (`group`/`default`) and write NOTHING. Confirmed coupled reset removes
+all coupled overrides in ONE transaction (one revision or one Device-key delete), re-validates
+before write, Group untouched. Reset All validates final GROUP+DEFAULT before deleting the Device
+key. Reset wording uses the backend `reset_target`. Shared helpers `check_effective_dependencies`
+and `compute_schedule_running` live in `configuration_manager.py`.
 
-App runs normally with NO `speedtest_analyzer` entry, using built-in code defaults. Do NOT
-write defaults to appdata on startup (that would override NCM group inheritance). No blank
-group placeholder is required. On the first normal Apply/Save with no canonical config:
-stage the change in memory, then ask "This Device" vs "NCM Group".
-- This Device: build complete JSON, origin=device, mode=device, revision=1, save via appdata.
-- NCM Group: build complete JSON, origin=group, mode=group, generate JSON for the user to paste into NCM, no local device write, user Validates until expected config/revision appears, then load into RAM.
+## Update NCM Group
 
-## Subsequent saves
+Offered ONLY in `group_with_device_overrides` (state flag `can_update_group`); never re-shows
+"Migrate to NCM Group" (Device→Group first migration, `can_migrate_to_group`, Device state only).
+Candidate = DEEP COPY of current group + only selected Device sections; `group_revision = current
++ 1`; unrelated Group sections and unselected overrides preserved; no defaults copied in; nothing
+written locally. Dependency validation runs against the PROPOSED revised group. GeoView:
+device_gps policy promotable with runtime coords stripped; manual/site sources non-promotable.
+Reconciliation token `(group_revision, device_revision)` aborts validate/cleanup
+(`reconcile_aborted`) if either layer changes mid-workflow → restart, never auto-merge.
+Validate-present THEN trim promoted Device sections; emptied Device doc is deleted; trim failure
+leaves Group intact, Device still wins, returns `cleanup_incomplete` (Retry). Validation proves
+payload present on device, NOT NCM provenance.
 
-- device/device: save directly to device; no repeated prompt.
-- group/group: on a persistent change, ask This Device vs NCM Group.
-  - This Device → local override, origin stays group, mode→device_override; future saves local without re-prompting.
-  - NCM Group → stage complete replacement JSON, increment revision, no local write, expose JSON, Validate until expected revision. Once the group path is chosen and JSON exposed, do NOT offer "Save to This Device Instead" if validation fails (avoids NCM conflict/suspension). On failure: keep running config, allow retryable Validate and Close/Cancel & Troubleshoot, no local write.
+## Scheduler enabled/autostart/running
 
-## NCM conflict behavior
+Persisted `enabled` and `autostart` are INDEPENDENT and never coerced. Runtime `running` is
+derived and non-persistent; the scheduler thread checks `running`, not `enabled`.
+`compute_schedule_running(enabled, autostart, is_startup)`: startup → `enabled AND autostart`;
+interactive save → `enabled`; `enabled=false` never runs. An explicit unchanged Save after a
+restart starts runtime even when persistence is `no_change` (no write, no revision bump);
+schedule-specific, does not change global no-op semantics. `GET /api/schedule` exposes
+`enabled`/`autostart`/`running`; UI states: Active / Enabled — Not Running / Disabled.
 
-If device-level SDK Data exists and a conflicting group-level entry of the same name is
-pushed, NCM can flag a conflict and suspend device configuration. Group Migration MUST
-remove the conflicting device-level config and validate its removal BEFORE creating/applying
-the group config. Do NOT use NCM "Clear" (too broad — removes other local config).
+## Migration / Factory Reset
 
-## config_revision / RAM sync
+Legacy fragmented keys and the experimental `speedtest_analyzer` key are migration INPUTS ONLY
+(never written). No canonical key + valid migration source → state `upgrade_required`, mutation
+blocked until Convert (builds schema-1 Device doc, rev 1; sources never modified/deleted).
+Factory Reset removes Device/experimental/legacy/runtime keys + local history; NEVER touches
+`speedtest_analyzer_group`.
 
-First persistent config = 1; increment on every successful persistent change; failed/
-cancelled do not increment; Restore/Rollback creates a new revision. It is a lightweight
-sync marker, not an audit log. Validation checks: JSON exists/parses, expected
-`management.origin`, expected `management.mode`, exact expected `config_revision` (no full
-JSON equality). No background watcher/poller. On the next Apply/Save, read persisted config
-and compare revision with RAM; if different, persisted is authoritative → load it into RAM
-FIRST, discard the staged change, tell the user to review/reapply. Applies whether persisted
-revision is higher or lower. Do not determine why it changed; do not auto-merge.
+## Validation posture
 
-## Group Migration Wizard
-
-One unified workflow for device/device → group/group and group/device_override →
-group/group. Before any destructive step: capture current effective config, normalize the
-future group target, increment revision for the target, store known-good original + prepared
-target in `tmp/`, verify recovery files before allowing removal. Sequence: prepare target +
-recovery → instruct removal of Device SDK Data in NCM → Validate Removal (do not unlock next
-step until it passes; preferred failure text: "Device-level configuration is still visible.
-The NCM change may still be synchronizing.") → expose the ALREADY PREPARED group JSON →
-user creates/updates group entry → Validate Group Configuration (origin=group, mode=group,
-expected revision) → on success hot-reload config + affected subsystems → restart app only
-if technically required. Do NOT reconstruct the target after local removal — it was captured
-before deletion.
-
-## Migration backup / rollback
-
-`tmp/` is only for migration/schema-conversion recovery, not normal edits. Do not create
-migration backups for ordinary Device/Group saves or for group/group → group/device_override.
-Keep the last successful migration/schema recovery snapshot in `tmp/` until cleared by app-
-version lifecycle. Valid rollback: restore captured USER CONFIGURATION, write in CURRENT
-schema, normalize management to origin=device/mode=device, increment revision, do not recreate
-fragmented legacy appdata, must not contain decrypted secrets, state-aware (do not blindly
-create a device entry while a conflicting group entry would cause suspension). No resumable-
-migration subsystem. Before Validate Removal passes: Cancel aborts, discard temp state,
-existing config untouched. After Validate Removal passes: in-app cancel/exit behaves as
-"Restore Previous Configuration & Exit". No browser-tab interception/resume logic.
-
-## Legacy / future schema migration
-
-Reusable schema migration framework (legacy fragmented appdata → schema 1 → 2 → 3 …), not a
-one-time hack. Legacy names historically observed: `iperf_server_settings`,
-`speedtest_schedule`, `iperf_server_stats`, `iperf3_servers`, `speedtest_outputs`,
-`geoview_settings`. Do NOT infer classification from names alone. Working expectation
-(VERIFY against code during LLD):
-- Likely configuration: `iperf_server_settings`, `speedtest_schedule`, `iperf3_servers`,
-  `netperf_servers`, `geoview_settings`, `speedtest_outputs`.
-- Likely runtime/output/history: `iperf_server_stats`, `speedtest_results`.
-(Code check for this pass confirmed `iperf_server_settings` and `netperf_servers` are active
-persistent config, `speedtest_outputs` is config, and `speedtest_results` is the runtime
-write target. The HLD shortlist should be reconciled at LLD.) Do not auto-delete legacy
-appdata after adoption; import what is appropriate, leave legacy cleanup manual/separate.
-An older schema may be converted in memory on startup, but the app must not silently persist
-ownership/config changes just because a new version started; adopting a converted schema
-follows the same Device vs NCM Group framework.
-
-## Config repair / reset
-
-Parses but has invalid sections: salvage valid sections, reset/discard only invalid ones,
-normalize to current schema, tell the user exactly what was rejected/repaired, successful
-repair = new revision, respect management scope. Syntactically unusable JSON: no speculative
-fragment reconstruction, no rollback-as-corruption-recovery — Reset and rebuild. Reset
-Configuration affects ONLY `speedtest_analyzer` (not history/cellular/results/logs).
-- device/device: delete local entry → true Day-1 built-in defaults.
-- group/group: no local override; generate smallest valid clean GROUP config; user replaces
-  corrupt group JSON in NCM; Validate; device stays group-managed.
-- group/device_override: delete local override; underlying group config becomes visible;
-  validate/load; return to group/group.
-
-## Settings page HLD (last left-nav item; global admin only)
-
-- A. Configuration Management: management state, schema version, config revision, Migrate to
-  NCM Group (visible ONLY for device/device and group/device_override — not for clean
-  group/group), Reset Configuration, Rollback Configuration (when a valid migration/schema
-  backup exists).
-- B. Application Information: app version, schema version, build/support info.
-- C. Data Management: test-history info, Clear Test History, future data controls.
-- D. Factory Reset: its OWN separate destructive section (NOT inside Configuration
-  Management). Red button, explains what is deleted, explicit "Are you sure?". Broader than
-  Reset Configuration: removes Speedtest Analyzer-owned persistent local data/history/settings,
-  leaves the app installed. device/device → built-in defaults; group/group → local data/history
-  reset then inherited group config used again; group/device_override → override removed,
-  underlying group config authoritative. Exact removed-data list derived from current app
-  storage at LLD so unrelated NCOS/device data is never touched.
-
-## Secrets are out of scope for this framework pass
-
-Do NOT merge API-key/provider-secret work into the initial canonical `speedtest_analyzer`
-implementation. Secrets must never be stored in plaintext there. Non-secret config framework
-is validated against real E400/NCM first; encryption/secret migration/provider credential UX
-get a separate design later.
-
-## Normal reboot lifecycle (agreed)
-
-Load persisted `speedtest_analyzer`, parse/validate, load supported schema into RAM, rebuild
-runtime objects (e.g., scheduled jobs) from persisted config; do NOT rewrite config just
-because the app started; do NOT increment revision; preserve origin/mode; reload normal
-persistent app data/history. `tmp/` migration recovery data is expected to survive an
-ordinary router reboot per current observed NCOS behavior.
+- Permanent off-router regression suite `test_configuration_manager.py` (299 tests as of 1.1.2):
+  merge, sparse/presence, revisions, no-op, migration, reset dependency + wording, Update NCM
+  Group (candidate/preserve/promote/trim/token/GeoView/dependency/button-visibility), scheduler
+  running semantics, and an appdata write/delete audit (zero lifetime Group/experimental/legacy
+  writes). Local gate also runs `py_compile` + `pyjsparser` over `index.html`.
+- E400-validated end-to-end: reset dependency modal + coupled reset; full Update NCM Group wizard
+  (Device key removed after Group validation); enabled/autostart/running across fresh app startups.
+- Dev caveat: in Developer Mode an SCP-installed build can be dropped by a device reboot (SDK
+  service shows `apps: []`); appdata survives. Reboot ≠ SDK reload. Redeploy to reinstall.
