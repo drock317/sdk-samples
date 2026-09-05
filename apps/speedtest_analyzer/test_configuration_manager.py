@@ -1773,6 +1773,61 @@ check('sched run 2p: persisted autostart=false after save',
 
 
 # ===========================================================================
+# LEGACY GEO PROVIDER MIGRATION (v1.1.3) -- provider=unwired normalizes to none
+# ===========================================================================
+# v1.1.3 ships Google as the only external Geo Provider. A legacy persisted
+# configuration that selected the removed 'unwired' provider must normalize
+# SAFELY to 'none' -- never silently converted to Google, and with NO external
+# provider request as a side effect. normalize_geo_settings is a pure, local
+# transform: it must not persist appdata or reach the network.
+reset_state()
+_writes_before_legacy = len(fake_cp.put_calls)
+legacy_unwired = cellular_geo.normalize_geo_settings({
+    'schema_version': 2,
+    'provider': 'unwired',
+    'active_location_source': 'manual_coordinates',
+    'configured': True,
+    'locations': {
+        'manual_coordinates': {'latitude': 39.0, 'longitude': -104.0},
+    },
+})
+check('geo migrate: legacy provider=unwired -> normalized none',
+      legacy_unwired['provider'] == 'none')
+check('geo migrate: unwired is NOT silently converted to google',
+      legacy_unwired['provider'] != 'google')
+check('geo migrate: normalize_geo_settings performs no appdata write',
+      len(fake_cp.put_calls) == _writes_before_legacy)
+# Case-insensitive / whitespace legacy value still normalizes to none.
+legacy_unwired_ci = cellular_geo.normalize_geo_settings({
+    'schema_version': 2, 'provider': '  Unwired  ',
+    'active_location_source': 'device_gps',
+})
+check('geo migrate: legacy provider="  Unwired  " -> none',
+      legacy_unwired_ci['provider'] == 'none')
+# Supported providers still normalize through unchanged.
+_none_ok = cellular_geo.normalize_geo_settings({
+    'schema_version': 2, 'provider': 'none',
+    'active_location_source': 'device_gps'})
+_google_ok = cellular_geo.normalize_geo_settings({
+    'schema_version': 2, 'provider': 'google',
+    'active_location_source': 'device_gps'})
+check('geo migrate: provider=none preserved', _none_ok['provider'] == 'none')
+check('geo migrate: provider=google preserved',
+      _google_ok['provider'] == 'google')
+# An unknown/unsupported provider still fails closed (not coerced to a valid
+# value), confirming only the explicit legacy 'unwired' value is migrated.
+_bad_rejected = False
+try:
+    cellular_geo.normalize_geo_settings({
+        'schema_version': 2, 'provider': 'mapbox',
+        'active_location_source': 'device_gps'})
+except ValueError:
+    _bad_rejected = True
+check('geo migrate: unknown provider still rejected (fails closed)',
+      _bad_rejected)
+
+
+# ===========================================================================
 # APPDATA WRITE AUDIT (§61) -- cumulative across the ENTIRE suite (runs last)
 # ===========================================================================
 group_writes = [c for c in fake_cp.put_calls if c[0] == GROUP]

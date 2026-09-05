@@ -2,3 +2,7 @@
 # make.py reads this file (named 'buildignore') to prune the package.
 # The Configuration Manager unit-test harness is not production runtime.
 test_configuration_manager.py
+# Developer scratch directory for throwaway validation harnesses.
+tmp/
+# Editor/backup scratch files must never ship in the package.
+*.bak
