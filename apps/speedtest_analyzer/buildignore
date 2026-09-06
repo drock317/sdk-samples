@@ -6,3 +6,4 @@ test_configuration_manager.py
 tmp/
 # Editor/backup scratch files must never ship in the package.
 *.bak
+script.js
