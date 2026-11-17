@@ -81,6 +81,7 @@ web_app_template/
 ├── index.html              # Style guide (full component library)
 ├── your_web_app.html       # Starter template for new apps
 ├── web_app_template.py     # HTTP server with API endpoints
+├── web_port.py             # Persistent dynamic web-port standard (shared, app-agnostic)
 ├── package.ini             # App metadata and version
 ├── start.sh                # Launch script
 ├── static/
@@ -89,6 +90,42 @@ web_app_template/
 │   └── libs/               # Font Awesome, jQuery
 └── readme.md
 ```
+
+---
+
+## Web Port (Application Data)
+
+On the router, the web server selects its listening port through the shared
+`web_port.py` helper rather than a hardcoded value. The effective port is
+namespaced in Application Data per the SDK standard:
+
+| Field | Type | Required | Purpose |
+|-------|------|----------|---------|
+| `<app_name>_web_port` | string (integer port) | No | Effective web listening port. For this template the field is `web_app_template_web_port`. Device-level App Data is shared, so the field is namespaced per app. |
+
+Behavior:
+
+- **If `<app_name>_web_port` is set**, it is authoritative: the app binds
+  exactly that port. It does not scan, does not silently relocate, and does
+  not overwrite the value if the port is occupied — it logs a clear error and
+  fails web startup safely. This determinism protects an NCM LAN Manager
+  connection pinned to that port. A malformed/out-of-range value fails closed.
+- **Failures never cause a restart loop.** A malformed value is logged once.
+  A valid but busy port is retried (same port only) every 5 s for about 60 s,
+  then logged once. In both cases the app **stops itself** via the SDK
+  (`web_port.stop_app()`) instead of exiting, because NCOS restarts an exited
+  app (`restart = true`) every few seconds but does not restart a stopped one.
+- **If it is not set** (first run), the app discovers a usable port by actual
+  socket bind starting at 8000 (bounded), then persists the result with
+  `cp.put_appdata`. On later restarts the persisted value is reused even if
+  8000 frees up. This is an intentional write of the discovered assignment,
+  not a code default.
+- **NCM** can set `<app_name>_web_port` at group/device level to standardize
+  the port across a fleet; the app consumes the effective value on next
+  startup. No NCM API credentials are used.
+
+The effective port and its source (`configured` | `discovered`) are logged at
+startup. Local (off-router) runs bind port 8000 directly for convenience.
 
 ### API Endpoints
 
