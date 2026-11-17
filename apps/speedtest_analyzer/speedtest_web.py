@@ -29,6 +29,9 @@ from cellular_geo import (
 
 import configuration_manager as config_mgr
 
+# Persistent dynamic web port (shared SDK standard, see web_port.py).
+import web_port
+
 # GeoView v1.1.3: Device-scoped provider credentials + bounded resolution job.
 # These modules own all provider/credential handling. speedtest_web only
 # performs thin HTTP orchestration and never holds a plaintext credential.
@@ -39,6 +42,12 @@ import geo_cache
 import geo_contributions
 
 # Constants
+# App name used to build the namespaced App Data field
+# (speedtest_analyzer_web_port). NOTE: this is a NEW, separate key; it does not
+# overlap the configuration_manager keys (speedtest_analyzer[_group|_device]).
+WEB_APP_NAME = 'speedtest_analyzer'
+# First-run discovery start port ONLY. The effective port is resolved at
+# startup by web_port.bind_web_socket (configured App Data value wins).
 PORT = 8000
 # GeoView has no user-facing provider selector: the cellular serving-location
 # service is fixed to OpenCellID. Enrichment reads, the resolve job, status,
@@ -18640,17 +18649,91 @@ class ResilientHTTPServer(HTTPServer):
 
         self.server_port = port
 
+    def adopt_bound_socket(self, sock):
+        """Adopt an already-bound, listening socket (web_port standard).
 
-# Start web server
+        The server is constructed with bind_and_activate=False, so
+        server_bind() never runs. This sets the same attributes server_bind()
+        would have, including the numeric hostname fallback for invalid NCOS
+        hostnames, so handler behavior is unchanged.
+        """
+        self.socket = sock
+        self.server_address = sock.getsockname()
+        host, port = self.server_address[:2]
+
+        try:
+            self.server_name = socket.getfqdn(host)
+        except UnicodeError as e:
+            self.server_name = host or '0.0.0.0'
+            cp.log(
+                'Web server hostname lookup unavailable; using '
+                f'{self.server_name}: {e}'
+            )
+
+        self.server_port = port
+
+
+# Start web server.
+# Port selection follows the shared web_port standard:
+#   * speedtest_analyzer_web_port in App Data, when set, is authoritative
+#     (bind exactly that port or fail closed - never relocate/overwrite), and
+#   * on first run a free port is discovered by real bind from PORT (8000),
+#     then persisted to App Data and reused on later starts.
+# The pre-bound socket is handed to the server, so the bind is the
+# availability test (no check-then-bind race).
+#
+# A web app with no port is useless, so a final failure STOPS THE APP via the
+# SDK (web_port.stop_app) rather than leaving it half-alive. It must not
+# sys.exit(): NCOS restarts an exited app (restart = true) every few seconds,
+# which would spam the log forever. A stopped app is not restarted.
+#   * malformed value (letters, out of range): logged once, app stopped;
+#   * valid but busy port: retried in-process for ~60s (covers a port briefly
+#     held during a redeploy), then logged once and the app is stopped.
+# If the SDK ignores the stop request, fall through and idle without the web
+# UI (still no exit, still no restart loop).
+def _stop_app_after_web_failure():
+    if web_port.stop_app(cp.put, cp.log):
+        # Give the SDK time to terminate this process.
+        time.sleep(30)
+    cp.log(
+        'SDK stop request was not honoured; staying up WITHOUT the web '
+        'interface (no exit, to avoid a restart loop).'
+    )
+
+
+WEB_PORT_RESULT = None
 try:
-    ResilientHTTPServer.allow_reuse_address = True
-    server = ResilientHTTPServer(('', PORT), SpeedtestHandler)
-    server_thread = Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-    cp.log(f'Web server started on port {PORT}')
+    WEB_PORT_RESULT = web_port.bind_web_socket_with_retry(
+        WEB_APP_NAME, cp.get_appdata, cp.put_appdata, cp.log,
+        start_port=PORT)
+    if WEB_PORT_RESULT.ok:
+        server = ResilientHTTPServer(
+            ('', WEB_PORT_RESULT.port), SpeedtestHandler,
+            bind_and_activate=False)
+        server.adopt_bound_socket(WEB_PORT_RESULT.sock)
+        server_thread = Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        cp.log(
+            f'Web server started on port {WEB_PORT_RESULT.port} '
+            f'(source: {WEB_PORT_RESULT.source})'
+        )
+    else:
+        cp.log(
+            f'Web server NOT started ({WEB_PORT_RESULT.error}). Stopping '
+            f'the app; correct '
+            f'{web_port.appdata_field(WEB_APP_NAME)} and start it again.'
+        )
+        _stop_app_after_web_failure()
 except Exception as e:
+    # Unexpected failure (e.g. server construction). Same policy: log once
+    # and stop the app rather than exit into an NCOS restart loop.
     cp.log(f'Failed to start web server: {e}')
-    sys.exit(1)
+    try:
+        if WEB_PORT_RESULT is not None and WEB_PORT_RESULT.sock is not None:
+            WEB_PORT_RESULT.sock.close()
+    except Exception:
+        pass
+    _stop_app_after_web_failure()
 
 # Main loop
 while True:
