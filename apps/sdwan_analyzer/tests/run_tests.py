@@ -2040,6 +2040,779 @@ def test_recording_http_api():
             httpd.server_close()
 
 
+# -------------------------------------------------------------------------
+# v0.3.3: web connection handling, current telemetry APIs, numeric RF
+# -------------------------------------------------------------------------
+import socket                              # noqa: E402
+
+_PRIVATE_VALUES = ('350000000000001', '310260000000000', '8901000000000',
+                   '5551234567', '37.0,-122.0', '123456789')
+_PRIVATE_KEYS = ('IMEI', 'IMSI', 'ICCID', 'MDN', 'GPS', 'CELL_ID',
+                 'NR_CELL_ID', 'cell_id', 'imei', 'imsi', 'iccid', 'mdn',
+                 'gps')
+
+
+def _tel_devices(scale=1, rsrp='-89', sinr='16.2'):
+    """WAN devices with stats on eth/wbond/mdm and an NSA modem."""
+    devs = _devices_with_stats(scale)
+    diag = dict(NSA_DIAG)
+    diag.update({'RSRP': rsrp, 'SINR': sinr, 'RSRQ': '-14',
+                 'RSRP_5G': '-72', 'RSRQ_5G': '-11', 'SINR_5G': '32.0'})
+    devs['mdm-1ea0ac']['diagnostics'] = diag
+    devs['mdm-1ea0ac']['stats'] = _stats(7000 * scale, 8000 * scale,
+                                         70 * scale, 80 * scale, 0, 0,
+                                         8031, 0)
+    return devs
+
+
+def _modem(snap, uid='mdm-1ea0ac'):
+    return [m for m in snap['cellular']['modems'] if m['uid'] == uid][0]
+
+
+def _iface(snap, uid):
+    return [i for i in snap['wan']['interfaces'] if i['uid'] == uid][0]
+
+
+# --- numeric RF ----------------------------------------------------------
+
+def test_rf_numeric_normalization():
+    print('test_rf_numeric_normalization')
+    rf = cellular.rf_number
+    check(rf('-89') == -89.0 and isinstance(rf('-89'), float),
+          'negative integer string -> float -89.0')
+    check(rf('16.2') == 16.2, 'decimal string -> float')
+    check(rf(' -11 ') == -11.0, 'whitespace tolerated')
+    check(rf(-90) == -90.0 and isinstance(rf(-90), float),
+          'int -> float')
+    check(rf(32.0) == 32.0, 'float stays float')
+    for bad in (None, '', '  ', 'abc', '--', 'n/a', 'NaN', 'inf', '-inf',
+                '12dBm', True, [], {}):
+        check(rf(bad) is None, 'unusable {!r} -> None'.format(bad))
+    check(rf('0') == 0.0, 'a real zero stays zero')
+    rec = cellular.normalize_cellular(
+        'mdm-1', dict(NSA_DIAG, RSRP='-89', RSRQ='-14', SINR='16.2',
+                      RSRP_5G='-72', RSRQ_5G='-11', SINR_5G='32.0'),
+        100, 100)
+    check((rec['rsrp'], rec['rsrq'], rec['sinr']) == (-89.0, -14.0, 16.2),
+          'LTE RF fields are numbers')
+    check((rec['rsrp_5g'], rec['rsrq_5g'], rec['sinr_5g']) ==
+          (-72.0, -11.0, 32.0), '5G RF fields are numbers')
+    check(all(isinstance(rec[k], float) for k in (
+        'rsrp', 'rsrq', 'sinr', 'rsrp_5g', 'rsrq_5g', 'sinr_5g')),
+        'RF values are JSON numbers (float), not strings')
+    bad = cellular.normalize_cellular(
+        'mdm-1', dict(NSA_DIAG, RSRP='garbage', RSRQ='', SINR=None,
+                      RSRP_5G='n/a', RSRQ_5G='x', SINR_5G='--'), 100, 100)
+    check(all(bad[k] is None for k in (
+        'rsrp', 'rsrq', 'sinr', 'rsrp_5g', 'rsrq_5g', 'sinr_5g')),
+        'malformed/empty/missing RF -> null, never zero')
+    check(bad['carrier_count'] == rec['carrier_count'] and
+          bad['ca_signature'] == rec['ca_signature'],
+          'malformed RF does not disturb CA parsing')
+    lte = cellular.normalize_cellular(
+        'mdm-2', {'CARRID': 'AT&T', 'SRVC_TYPE': 'LTE', 'RFBAND': 'Band 14',
+                  'RFCHANNEL': '5330', 'LTEBANDWIDTH': '10 MHz',
+                  'RSRP': '-92', 'RSRQ': '-18', 'SINR': '9.0'}, 1, 1)
+    check(lte['rsrp'] == -92.0 and lte['sinr'] == 9.0 and
+          lte['rsrp_5g'] is None and lte['sinr_5g'] is None,
+          'LTE-only modem: 5G RF stays null (not zero)')
+    check(json.loads(json.dumps(rec))['rsrp'] == -89.0,
+          'serializes as a JSON number')
+    check(rec['serving_bandwidth_mhz'] is not None and
+          isinstance(rec['carrier_count'], int),
+          'other numeric fields keep their existing types')
+
+
+# --- current-state WAN telemetry -----------------------------------------
+
+def test_current_wan_interface_telemetry():
+    print('test_current_wan_interface_telemetry')
+    clock = _Clock()
+    svc = _fresh(clock)
+    with _fake_collectors({'wan_devices': _tel_devices(1)}) as fc:
+        svc.collect_startup()
+        snap = svc.snapshot()
+        ifs = snap['wan']['interfaces']
+        check({i['uid'] for i in ifs} == {
+            'ethernet-wan', 'mdm-1ea0ac', 'sdwan-hub0_wan',
+            'wbond-wbond0_hub0'}, 'current WAN interfaces exposed')
+        e = _iface(snap, 'ethernet-wan')
+        for k in ('uid', 'kind', 'object_class', 'connection_state',
+                  'rx_bytes', 'tx_bytes', 'rx_packets', 'tx_packets',
+                  'rx_errors', 'tx_errors', 'rx_drops', 'tx_drops',
+                  'reset_suspected', 'metric_ts', 'collected_ts',
+                  'timestamp_source'):
+            check(k in e, 'interface field present: {}'.format(k))
+        check((e['rx_bytes'], e['tx_bytes'], e['rx_drops'],
+               e['tx_drops']) == (1000, 2000, 3, 4) and
+              e['kind'] == 'ethernet' and
+              e['timestamp_source'] == 'collector', 'values + kind')
+        check(_iface(snap, 'mdm-1ea0ac')['rx_drops'] == 8031,
+              'drop counters exposed as raw counters, untouched')
+        check(not any('mbps' in k or 'rate' in k for i in ifs for k in i),
+              'no rates computed')
+        check(not any(k in i for i in ifs for k in ('stats', 'diagnostics')),
+              'normalized records, not raw NCOS')
+        # /api/wan section serves the same data.
+        check(svc.section('wan')['interfaces'] == ifs,
+              'wan section == snapshot wan interfaces')
+        # Scheduled pass advances current counters.
+        clock.t += 900
+        fc.overrides['wan_devices'] = _tel_devices(3)
+        svc.collect_scheduled()
+        e2 = _iface(svc.snapshot(), 'ethernet-wan')
+        check(e2['rx_bytes'] == 3000 and e2['collected_ts'] == clock.t and
+              e2['reset_suspected'] is False,
+              'scheduled update visible in current state')
+        # Unrelated partial refresh keeps WAN telemetry.
+        before = copy.deepcopy(svc.snapshot()['wan']['interfaces'])
+        clock.t += 60
+        svc.refresh('traffic_classes')
+        check(svc.snapshot()['wan']['interfaces'] == before,
+              'traffic_classes refresh does not erase WAN telemetry')
+        clock.t += 60
+        svc.refresh('steering')
+        check(svc.snapshot()['wan']['interfaces'] == before,
+              'steering refresh does not erase WAN telemetry')
+        # Bonding refresh re-reads wan_devices -> advances.
+        clock.t += 60
+        fc.overrides['wan_devices'] = _tel_devices(5)
+        svc.refresh('bonding')
+        e3 = _iface(svc.snapshot(), 'ethernet-wan')
+        check(e3['rx_bytes'] == 5000 and e3['collected_ts'] == clock.t,
+              'manual bonding refresh updates WAN telemetry')
+        # Counter decrease still flagged in current state.
+        clock.t += 60
+        fc.overrides['wan_devices'] = _tel_devices(1)
+        svc.refresh('wan_paths')
+        check(_iface(svc.snapshot(), 'ethernet-wan')['reset_suspected'],
+              'reset_suspected visible in current state')
+
+
+def test_current_telemetry_failed_read_retained():
+    print('test_current_telemetry_failed_read_retained')
+    with _RecEnv() as env:
+        env.overrides['wan_devices'] = _tel_devices(2)
+        env.svc.collect_startup()
+        good = copy.deepcopy(env.svc.snapshot())
+        env.fail.add('wan_devices')
+        env.clock.t += 30
+        env.svc.refresh('wan_paths')
+        cur = env.svc.snapshot()
+        check(cur['wan']['interfaces'] == good['wan']['interfaces'] and
+              cur['cellular'] == good['cellular'],
+              'failed wan_devices read keeps last-known-good telemetry')
+
+
+def test_recording_updates_current_telemetry():
+    print('test_recording_updates_current_telemetry')
+    with _RecEnv() as env:
+        env.overrides['wan_devices'] = _tel_devices(1)
+        env.svc.collect_startup()
+        check(_iface(env.svc.snapshot(), 'ethernet-wan')['rx_bytes'] == 1000,
+              'startup counters visible')
+        env.overrides['wan_devices'] = _tel_devices(9, rsrp='-80')
+        env.svc.start_recording('t', max_duration_sec=60)
+        env.run(7)
+        snap = env.svc.snapshot()
+        check(_iface(snap, 'ethernet-wan')['rx_bytes'] == 9000,
+              'Recording update visible in current WAN telemetry')
+        check(_modem(snap)['rsrp'] == -80.0,
+              'Recording update visible in current cellular telemetry')
+        check(snap['section_freshness']['wan']['sample_source'] ==
+              'recording', 'freshness tagged recording')
+
+
+# --- /api/cellular -------------------------------------------------------
+
+def test_cellular_current_state_api():
+    print('test_cellular_current_state_api')
+    from http.server import HTTPServer
+    from analyzer import web
+    clock = _Clock()
+    svc = _fresh(clock)
+    with _fake_collectors({'wan_devices': _tel_devices(1)}) as fc:
+        svc.collect_startup()
+        m = _modem(svc.snapshot())
+        check(m['carrier'] == 'Verizon' and m['service_mode'] == '5G NSA',
+              'startup cellular state visible')
+        for k in ('uid', 'carrier', 'service_mode', 'serving_band',
+                  'serving_bandwidth_mhz', 'rsrp', 'rsrq', 'sinr',
+                  'rsrp_5g', 'rsrq_5g', 'sinr_5g', 'carrier_count',
+                  'total_active_mhz', 'zero_mhz_count', 'carriers',
+                  'ca_signature', 'cell_key_hash', 'metric_ts',
+                  'collected_ts', 'timestamp_source'):
+            check(k in m, 'cellular field present: {}'.format(k))
+        check(m['rsrp'] == -89.0 and m['sinr'] == 16.2 and
+              m['sinr_5g'] == 32.0, 'RF values numeric in current state')
+        check(m['carriers'] and all(
+            set(c) == {'role', 'rat', 'band', 'bandwidth_mhz', 'channel',
+                       'pci', 'active'} for c in m['carriers']),
+            'carrier entries carry the expected fields only')
+        check(m['cell_key_hash'] and len(m['cell_key_hash']) == 16,
+              'hashed cell key present')
+        # Scheduled update visible.
+        clock.t += 900
+        fc.overrides['wan_devices'] = _tel_devices(1, rsrp='-95')
+        svc.collect_scheduled()
+        check(_modem(svc.snapshot())['rsrp'] == -95.0 and
+              _modem(svc.snapshot())['collected_ts'] == clock.t,
+              'scheduled cellular update visible')
+        # Unrelated partial refresh keeps it.
+        keep = copy.deepcopy(svc.snapshot()['cellular'])
+        clock.t += 30
+        svc.refresh('traffic_classes')
+        check(svc.snapshot()['cellular'] == keep,
+              'traffic_classes refresh does not erase cellular state')
+        clock.t += 30
+        svc.refresh('steering')
+        check(svc.snapshot()['cellular'] == keep,
+              'steering refresh does not erase cellular state')
+        # Privacy: nothing sensitive anywhere in the cellular section.
+        text = json.dumps(svc.snapshot()['cellular'])
+        check(not any(v in text for v in _PRIVATE_VALUES),
+              'no IMEI/IMSI/ICCID/MDN/GPS/cell-id values exposed')
+        check(not any('"{}"'.format(k) in text for k in _PRIVATE_KEYS),
+              'no sensitive keys exposed')
+        # HTTP route + root page.
+        port = _free_port()
+        httpd = HTTPServer(('127.0.0.1', port), web._make_handler(svc))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            code, body = _http_json(port, '/api/cellular')
+            check(code == 200 and body == svc.snapshot()['cellular'] and
+                  body['modems'], 'GET /api/cellular serves current state')
+            import urllib.request
+            with urllib.request.urlopen(
+                    'http://127.0.0.1:{}/'.format(port), timeout=5) as r:
+                page = r.read().decode('utf-8')
+            check('/api/cellular' in page, 'root page lists /api/cellular')
+            code, wan = _http_json(port, '/api/wan')
+            check(code == 200 and wan['interfaces'],
+                  'GET /api/wan includes interfaces')
+            code, snap = _http_json(port, '/api/snapshot')
+            check(snap['cellular'] == body and
+                  snap['wan']['interfaces'] == wan['interfaces'],
+                  'snapshot carries the same current WAN + cellular')
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+    # Before any data: route is 503 like the other sections.
+    fresh = _fresh()
+    port = _free_port()
+    httpd = HTTPServer(('127.0.0.1', port), web._make_handler(fresh))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        check(_get(port, '/api/cellular')[0] == 503,
+              '/api/cellular before first collection -> 503')
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_cellular_recording_update_and_startup_only_modems():
+    print('test_cellular_recording_update_and_startup_only_modems')
+    with _RecEnv() as env:
+        env.overrides['wan_devices'] = _tel_devices(1)
+        env.svc.collect_startup()
+        check(_modem(env.svc.snapshot())['rsrp'] == -89.0, 'startup rsrp')
+        env.overrides['wan_devices'] = _tel_devices(1, rsrp='-70')
+        env.svc.start_recording('c', max_duration_sec=60)
+        env.run(6)
+        check(_modem(env.svc.snapshot())['rsrp'] == -70.0,
+              'Recording update visible in /api/cellular state')
+
+
+def test_snapshot_normalized_telemetry():
+    print('test_snapshot_normalized_telemetry')
+    svc = _fresh()
+    with _fake_collectors({'wan_devices': _tel_devices(1)}):
+        svc.collect_startup()
+    snap = svc.snapshot()
+    check('interfaces' in snap['wan'] and 'cellular' in snap,
+          'snapshot has current interface + cellular telemetry')
+    blob = json.dumps(snap['cellular']) + json.dumps(snap['wan'][
+        'interfaces'])
+    check('"diagnostics"' not in blob and '"stats"' not in blob and
+          '"IMEI"' not in blob and 'RSRP"' not in blob,
+          'snapshot telemetry is normalized, not a raw NCOS dump')
+    check(snap['wan']['paths'] and snap['bonding']['bonds'],
+          'existing sections unchanged')
+    # Observation (history) still carries the same normalized records.
+    obs = svc.history(limit=1)[0]
+    check(obs['interfaces'] == snap['wan']['interfaces'] or all(
+        {k: v for k, v in i.items() if k != 'kind'} == o
+        for i, o in zip(snap['wan']['interfaces'], obs['interfaces'])),
+        'observation and current state share the same records')
+    check(obs['cellular'] == snap['cellular']['modems'],
+          'observation cellular == current cellular')
+
+
+# --- web connection handling --------------------------------------------
+
+class _FakeConn(object):
+    def __init__(self):
+        self.timeouts = []
+
+    def settimeout(self, t):
+        self.timeouts.append(t)
+
+
+class _FakeListener(object):
+    def __init__(self):
+        self.conn = _FakeConn()
+
+    def accept(self):
+        return self.conn, ('127.0.0.1', 5555)
+
+
+def _raw_request(port, data, timeout=5):
+    """Send raw bytes, read until close. Returns (response_bytes, closed)."""
+    s = socket.create_connection(('127.0.0.1', port), timeout=timeout)
+    try:
+        s.sendall(data)
+        buf = b''
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                return buf, True
+            buf += chunk
+    except socket.timeout:
+        return buf, False
+    finally:
+        s.close()
+
+
+class _ShortTimeoutServer(object):
+    """Real single-threaded server with a tiny client timeout (no sleeps
+    in assertions: the timeout itself is what is being proven)."""
+
+    def __init__(self, svc, timeout=0.3):
+        from analyzer import web
+        self.web = web
+        self.saved = web.CLIENT_SOCKET_TIMEOUT_S
+        web.CLIENT_SOCKET_TIMEOUT_S = timeout
+        self.httpd = web._BoundedHTTPServer(
+            ('127.0.0.1', 0), web._make_handler(svc))
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever,
+                         daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.web.CLIENT_SOCKET_TIMEOUT_S = self.saved
+
+
+def test_web_accepted_socket_timeout():
+    print('test_web_accepted_socket_timeout')
+    from analyzer import web
+    check(web.CLIENT_SOCKET_TIMEOUT_S == 5, 'client timeout constant is 5 s')
+    check(web.CLIENT_SOCKET_TIMEOUT_S < 15,
+          'distinct from (shorter than) the 15 s collector timeout')
+    srv = web._BoundedHTTPServer(('127.0.0.1', 0),
+                                 web._make_handler(_fresh()),
+                                 bind_and_activate=False)
+    real = srv.socket
+    fake = _FakeListener()
+    srv.socket = fake
+    try:
+        conn, addr = srv.get_request()
+        check(conn is fake.conn and fake.conn.timeouts ==
+              [web.CLIENT_SOCKET_TIMEOUT_S],
+              'accepted client socket receives the configured timeout')
+    finally:
+        srv.socket = real
+        srv.server_close()
+    h = web._make_handler(_fresh())
+    check(h.timeout == web.CLIENT_SOCKET_TIMEOUT_S,
+          'handler class also bounds its connection')
+    check(not any(c.__name__ == 'ThreadingMixIn' for c in
+                  web._BoundedHTTPServer.__mro__),
+          'server stays single-threaded (no ThreadingMixIn)')
+    import inspect
+    check('ThreadingHTTPServer' not in inspect.getsource(web),
+          'web module does not use a threading server')
+    # DevWebServer uses the bounded server.
+    ad = _FakeAppData()
+    dws = web.DevWebServer(_fresh(), get_appdata=ad.get, put_appdata=ad.put)
+    try:
+        check(dws.start() and isinstance(dws._httpd,
+                                         web._BoundedHTTPServer),
+              'DevWebServer serves via the bounded server')
+    finally:
+        dws.stop()
+
+
+def test_web_get_post_and_connection_close():
+    print('test_web_get_post_and_connection_close')
+    with _RecEnv() as env:
+        srv = _ShortTimeoutServer(env.svc, timeout=2)
+        try:
+            resp, closed = _raw_request(
+                srv.port, b'GET /api/recordings HTTP/1.1\r\n'
+                          b'Host: x\r\nConnection: keep-alive\r\n\r\n')
+            head, _, body = resp.partition(b'\r\n\r\n')
+            check(head.startswith(b'HTTP/1.0 200') or
+                  head.startswith(b'HTTP/1.1 200'), 'GET works')
+            check(b'Connection: close' in head, 'GET sends Connection: close')
+            check(closed, 'server closes the connection after GET')
+            check(json.loads(body.decode()) == {'recordings': []},
+                  'GET body intact')
+            payload = json.dumps({'label': 'p', 'max_duration_sec': 60})
+            req = ('POST /api/recordings/start HTTP/1.1\r\nHost: x\r\n'
+                   'Content-Type: application/json\r\n'
+                   'Content-Length: {}\r\n\r\n{}'.format(
+                       len(payload), payload)).encode()
+            resp, closed = _raw_request(srv.port, req)
+            head, _, body = resp.partition(b'\r\n\r\n')
+            check(b' 200 ' in head.split(b'\r\n')[0] and
+                  json.loads(body.decode())['recording']['state'] ==
+                  'recording', 'POST works')
+            check(b'Connection: close' in head and closed,
+                  'POST sends Connection: close and closes')
+            resp, closed = _raw_request(
+                srv.port, b'GET / HTTP/1.1\r\nHost: x\r\n\r\n')
+            check(b'Connection: close' in resp.partition(b'\r\n\r\n')[0] and
+                  closed and b'/api/cellular' in resp,
+                  'HTML page also closes the connection')
+        finally:
+            srv.close()
+
+
+def test_web_idle_client_cannot_block():
+    print('test_web_idle_client_cannot_block')
+    with _RecEnv() as env:
+        srv = _ShortTimeoutServer(env.svc, timeout=0.3)
+        idle = []
+        try:
+            # A speculative browser connection: connects, sends nothing.
+            s1 = socket.create_connection(('127.0.0.1', srv.port))
+            idle.append(s1)
+            # Half-written request line, never finished.
+            s2 = socket.create_connection(('127.0.0.1', srv.port))
+            s2.sendall(b'GET /api/sta')
+            idle.append(s2)
+            t0 = time.time()
+            code, body = _http_json(srv.port, '/api/status')
+            waited = time.time() - t0
+            check(code == 200 and body['app'] == 'sdwan_analyzer',
+                  'later request is served despite idle clients')
+            check(waited < 4.0,
+                  'later request not blocked indefinitely')
+            # Connection cleanup: server closed the idle sockets.
+            for s in idle:
+                s.settimeout(3)
+            check(s1.recv(10) == b'', 'idle connection closed by server')
+            try:
+                tail = s2.recv(100)
+            except socket.timeout:
+                tail = None
+            check(tail is not None and b'200' not in tail,
+                  'half-written request dropped, not served')
+        finally:
+            for s in idle:
+                s.close()
+            srv.close()
+
+
+def test_recording_independent_of_stuck_http_client():
+    print('test_recording_independent_of_stuck_http_client')
+    with _RecEnv() as env:
+        srv = _ShortTimeoutServer(env.svc, timeout=0.3)
+        stuck = socket.create_connection(('127.0.0.1', srv.port))
+        try:
+            job = env.svc.start_recording('r', max_duration_sec=60)[
+                'recording']
+            # The main-loop tick drives the job; a hung HTTP client cannot
+            # affect it (web only reads cached state).
+            env.run(15)
+            rec = env.svc.active_recording()
+            check(rec is not None and rec['job_id'] == job['job_id'] and
+                  rec['sample_count'] > 0,
+                  'Recording keeps sampling while a client is stuck')
+            code, act = _get(srv.port, '/api/recordings/active')
+            check(code == 200 and act['recording']['job_id'] ==
+                  job['job_id'], 'HTTP serves the live job after the stall')
+        finally:
+            stuck.close()
+            srv.close()
+
+
+# -------------------------------------------------------------------------
+# Storage Inspector (GET /api/storage)
+# -------------------------------------------------------------------------
+import shutil                              # noqa: E402
+import tempfile                            # noqa: E402
+from analyzer import inspector             # noqa: E402
+
+_MARK = 'TOPSECRETMARKER-DO-NOT-LEAK'
+
+
+def _make_app_tree():
+    """Temp app root with allowed, sensitive, symlinked and data files."""
+    base = tempfile.mkdtemp(prefix='sdwan_insp_')
+    app = os.path.join(base, 'app')
+    outside = os.path.join(base, 'outside')
+    for d in (app, os.path.join(app, 'analyzer'),
+              os.path.join(app, '__pycache__'), os.path.join(app, 'data'),
+              os.path.join(app, 'certs'), outside):
+        os.makedirs(d)
+
+    def w(path, text=_MARK):
+        with open(path, 'w') as f:
+            f.write(text)
+    w(os.path.join(app, 'main.py'), _MARK * 3)
+    w(os.path.join(app, 'readme.md'))
+    w(os.path.join(app, 'package.ini'))
+    w(os.path.join(app, 'analyzer', 'web.py'))
+    w(os.path.join(app, 'analyzer', 'events.jsonl'))
+    # Sensitive / unlisted:
+    for name in ('sdk_settings.ini', 'server.pem', 'id_rsa', 'api_token.json',
+                 'credentials.json', 'private.key', 'blob.bin', '.env'):
+        w(os.path.join(app, name))
+    w(os.path.join(app, 'certs', 'ca.crt'))
+    w(os.path.join(app, '__pycache__', 'x.cpython-38.pyc'))
+    # Future durable telemetry dir:
+    w(os.path.join(app, 'data', 'obs-0001.jsonl'), 'x' * 10)
+    # Outside the root, reachable only via symlinks:
+    w(os.path.join(outside, 'outside.py'))
+    w(os.path.join(outside, 'sdk_settings.ini'))
+    os.symlink(outside, os.path.join(app, 'escape_dir'))
+    os.symlink(os.path.join(outside, 'outside.py'),
+               os.path.join(app, 'escape_file.py'))
+    return base, app, outside
+
+
+def _rel(files):
+    return {f['relative_path'] for f in files}
+
+
+def test_storage_inspector_files_allowlist():
+    print('test_storage_inspector_files_allowlist')
+    base, app, outside = _make_app_tree()
+    try:
+        svc = AnalyzerService(app_root=app)
+        rep = svc.storage_report()
+        af = rep['application_files']
+        names = _rel(af['files'])
+        check(names == {'main.py', 'readme.md', 'package.ini',
+                        'analyzer/web.py', 'analyzer/events.jsonl'},
+              'only allowed app files listed: {}'.format(sorted(names)))
+        f = [x for x in af['files'] if x['relative_path'] == 'main.py'][0]
+        check(set(f) == {'relative_path', 'size_bytes', 'modified_ts',
+                         'type'} and f['type'] == 'code' and
+              f['size_bytes'] == len(_MARK) * 3 and
+              isinstance(f['modified_ts'], int), 'file metadata fields')
+        check({x['relative_path']: x['type'] for x in af['files']}[
+            'analyzer/events.jsonl'] == 'data', 'type classification')
+        check(af['file_count'] == len(af['files']) and
+              af['total_bytes'] == sum(x['size_bytes'] for x in af['files']),
+              'file_count and total_bytes match the listed files')
+        text = json.dumps(rep)
+        check(_MARK not in text, 'file contents are never returned')
+        for bad in ('sdk_settings.ini', 'server.pem', 'id_rsa',
+                    'api_token', 'credentials', 'private.key', 'blob.bin',
+                    '.env', 'ca.crt', '.pyc', 'outside.py', 'escape_',
+                    'certs'):
+            check(bad not in text,
+                  'sensitive/unrelated path excluded: {}'.format(bad))
+        check(af['skipped_symlinks'] == 2,
+              'symlinks (dir + file) ignored, not followed')
+        check(af['excluded_count'] >= 7, 'excluded files only counted')
+        check(not any(p.startswith('data/') for p in names),
+              'data dir not double-counted under application_files')
+        check(os.path.abspath(app) not in text and base not in text,
+              'absolute paths are not exposed')
+        # A symlinked ROOT is refused outright.
+        link_root = os.path.join(base, 'rootlink')
+        os.symlink(outside, link_root)
+        res = inspector.scan_files(link_root)
+        check(not res['root_exists'] and res['files'] == [],
+              'symlinked root rejected')
+        check(inspector.scan_files(os.path.join(base, 'nope'))[
+            'root_exists'] is False, 'missing root reported cleanly')
+        # Only the app root is ever scanned: no path parameter on the API.
+        import inspect as _inspect
+        check(_inspect.signature(AnalyzerService.storage_report)
+              .parameters.keys() == {'self'},
+              'storage_report accepts no caller-supplied path')
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_storage_inspector_persistent_section():
+    print('test_storage_inspector_persistent_section')
+    base, app, outside = _make_app_tree()
+    try:
+        # Memory-only, no data dir yet.
+        shutil.rmtree(os.path.join(app, 'data'))
+        p = AnalyzerService(app_root=app).storage_report()['persistent']
+        check(p['enabled'] is False and p['root_exists'] is False and
+              p['total_bytes'] == 0 and p['file_count'] == 0 and
+              p['files'] == [], 'no data dir: explicit, empty, disabled')
+        check(p['root'] == 'data', 'future data root named')
+        # Future durable files show up here without changing the shape.
+        os.makedirs(os.path.join(app, 'data'))
+        with open(os.path.join(app, 'data', 'obs-1.jsonl'), 'w') as f:
+            f.write('x' * 25)
+        p2 = AnalyzerService(app_root=app).storage_report()['persistent']
+        check(p2['root_exists'] is True and p2['file_count'] == 1 and
+              p2['total_bytes'] == 25 and
+              p2['files'][0]['relative_path'] == 'obs-1.jsonl' and
+              set(p2) == set(p), 'data dir files reported; same shape')
+        check(p2['enabled'] is False,
+              'still reports enabled=false (memory-only telemetry)')
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_storage_inspector_real_app_dir():
+    print('test_storage_inspector_real_app_dir')
+    rep = AnalyzerService().storage_report()
+    names = _rel(rep['application_files']['files'])
+    check('analyzer/web.py' in names and 'package.ini' in names,
+          'default root is the app directory')
+    check(not any(n.endswith('.pyc') or 'sdk_settings' in n or
+                  n.startswith('tests/__pycache__') for n in names),
+          'no pyc / settings in the real listing')
+    check(rep['persistent']['enabled'] is False, 'persistent disabled')
+
+
+def test_storage_inspector_memory_counts():
+    print('test_storage_inspector_memory_counts')
+    with _RecEnv() as env:
+        svc = env.svc
+        m0 = svc.storage_report()['memory']
+        check(m0['history_observations'] == 0 and m0['recording_jobs'] == 0
+              and m0['recording_samples'] == 0 and
+              m0['active_recording'] is None and
+              m0['swans_dedupe_entries'] == 0, 'empty stores report zeros')
+        svc.collect_startup()
+        job = svc.start_recording('s', max_duration_sec=60)['recording']
+        env.run(12)
+        rep = svc.storage_report()
+        m = rep['memory']
+        rec = m['details']['recording']
+        n = svc._rec_store.sample_count(job['job_id'])
+        check(n > 0 and m['recording_samples'] == n and
+              rec['samples_by_job'] == {job['job_id']: n} and
+              rec['total_sample_count'] == n, 'Recording sample counts')
+        check(m['recording_jobs'] == 1 and rec['job_count'] == 1 and
+              m['active_recording'] == job['job_id'] and
+              rec['active_job_id'] == job['job_id'],
+              'job count + active job id')
+        check(rec['configured_max_jobs'] == 20 and
+              rec['configured_max_samples_per_job'] == 3000,
+              'configured Recording limits reported')
+        check(m['history_observations'] == len(svc.history(limit=None)) and
+              m['history_observations'] == 1, 'history observation count')
+        check(m['config_versions'] == sum(
+            len(svc._config_store.versions(k)) for k in
+            m['details']['config_versions']['by_name']) and
+            m['config_versions'] > 0, 'config version count')
+        check(m['swans_dedupe_entries'] == len(svc._swans_seen),
+              'SWANS dedupe entries')
+        check(m['details']['history']['durable'] is False and
+              m['details']['history']['max_observations'] == 720,
+              'history backend/limits')
+        text = json.dumps(rep)
+        check('rx_bytes' not in text and 'latency_ms' not in text,
+              'counts/metadata only, no telemetry payloads')
+        env.svc.stop_recording(job['job_id'])
+        env.run(2)
+        env.clock.t += 1
+        m2 = svc.storage_report()['memory']
+        check(m2['active_recording'] is None and m2['recording_jobs'] == 1
+              and m2['recording_samples'] >= n,
+              'finished job retained, no longer active')
+
+
+def test_storage_inspector_api_on_demand_no_side_effects():
+    print('test_storage_inspector_api_on_demand_no_side_effects')
+    from http.server import HTTPServer
+    from analyzer import web
+    base, app, outside = _make_app_tree()
+    clock = _Clock()
+    svc = AnalyzerService(clock=clock, app_root=app)
+    fc = _fake_collectors()
+    fc.__enter__()
+    port = None
+    httpd = None
+    try:
+        svc.collect_startup()
+        job = svc.start_recording('x', max_duration_sec=60)['recording']
+        for _ in range(8):
+            svc.recording_tick()
+            clock.t += 1
+        port = _free_port()
+        httpd = HTTPServer(('127.0.0.1', port), web._make_handler(svc))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        before = {
+            'history': len(svc.history(limit=None)),
+            'next_due': svc.next_scheduled_ts(),
+            'sched': svc.schedule_minutes(),
+            'rec': copy.deepcopy(svc.active_recording()),
+            'rec_samples': svc._rec_store.sample_count(job['job_id']),
+            'calls': len(fc.calls),
+            'fresh': copy.deepcopy(svc.snapshot()['section_freshness']),
+            'cfg': svc._config_store.info(),
+            'jobs': len(svc.list_recordings()),
+        }
+        code, rep = _http_json(port, '/api/storage')
+        check(code == 200 and rep['generated_ts'] == int(clock.t) and
+              {'memory', 'persistent', 'application_files'} <= set(rep),
+              '/api/storage exists and returns the report')
+        clock.t += 5
+        _, rep2 = _http_json(port, '/api/storage')
+        check(rep2['generated_ts'] == int(clock.t) and
+              rep2['generated_ts'] != rep['generated_ts'],
+              'response is generated on demand (fresh timestamp)')
+        with open(os.path.join(app, 'new_file.py'), 'w') as f:
+            f.write('abc')
+        _, rep3 = _http_json(port, '/api/storage')
+        check('new_file.py' in _rel(rep3['application_files']['files']) and
+              'new_file.py' not in _rel(rep['application_files']['files']),
+              'file changes are visible on the next call (no caching)')
+        for _ in range(3):
+            _http_json(port, '/api/storage')
+        after = {
+            'history': len(svc.history(limit=None)),
+            'next_due': svc.next_scheduled_ts(),
+            'sched': svc.schedule_minutes(),
+            'rec': copy.deepcopy(svc.active_recording()),
+            'rec_samples': svc._rec_store.sample_count(job['job_id']),
+            'calls': len(fc.calls),
+            'fresh': copy.deepcopy(svc.snapshot()['section_freshness']),
+            'cfg': svc._config_store.info(),
+            'jobs': len(svc.list_recordings()),
+        }
+        # The clock advanced 5 s, which only changes elapsed/remaining.
+        for k in ('elapsed_sec', 'remaining_sec'):
+            before['rec'].pop(k, None)
+            after['rec'].pop(k, None)
+        check(before == after,
+              'inspector creates no history/observation, schedule, '
+              'collection, freshness or Recording change')
+        import urllib.request
+        with urllib.request.urlopen(
+                'http://127.0.0.1:{}/'.format(port), timeout=5) as r:
+            check('/api/storage' in r.read().decode('utf-8'),
+                  'root page lists /api/storage')
+        import inspect as _inspect
+        src = _inspect.getsource(inspector)
+        check(not any(('import ' + m) in src for m in (
+            'threading', 'sched', 'signal', 'asyncio')) and
+            'Timer(' not in src and 'Thread(' not in src,
+            'inspector has no timer/scheduler')
+    finally:
+        if httpd is not None:
+            httpd.shutdown()
+            httpd.server_close()
+        fc.__exit__()
+        shutil.rmtree(base, ignore_errors=True)
+
+
 def main():
     tests = [
         test_logical_policy_branches,
@@ -2110,6 +2883,22 @@ def main():
         test_recording_partial_failure_and_infra_failure,
         test_recording_timeout_busy_no_overlap,
         test_recording_http_api,
+        test_rf_numeric_normalization,
+        test_current_wan_interface_telemetry,
+        test_current_telemetry_failed_read_retained,
+        test_recording_updates_current_telemetry,
+        test_cellular_current_state_api,
+        test_cellular_recording_update_and_startup_only_modems,
+        test_snapshot_normalized_telemetry,
+        test_web_accepted_socket_timeout,
+        test_web_get_post_and_connection_close,
+        test_web_idle_client_cannot_block,
+        test_recording_independent_of_stuck_http_client,
+        test_storage_inspector_files_allowlist,
+        test_storage_inspector_persistent_section,
+        test_storage_inspector_real_app_dir,
+        test_storage_inspector_memory_counts,
+        test_storage_inspector_api_on_demand_no_side_effects,
     ]
     for t in tests:
         t()

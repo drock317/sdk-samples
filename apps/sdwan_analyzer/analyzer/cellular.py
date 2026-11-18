@@ -623,6 +623,24 @@ def _diag(diagnostics, field):
     return None
 
 
+def rf_number(value):
+    """RF metric (RSRP/RSRQ/SINR, LTE or 5G) as a JSON number, else None.
+
+    NCOS reports these as strings ("-89", "16.2"). Valid numeric text and
+    numbers become float; missing/empty/unparseable/non-finite/bool become
+    None. A missing value is NEVER turned into 0. Never raises.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        num = float(value.strip() if isinstance(value, str) else value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if num != num or num in (float('inf'), float('-inf')):
+        return None
+    return num
+
+
 def cell_key_hash(carrier, service_mode, cell_id, pci, band):
     """Deterministic shortened SHA-256 of the serving-cell identity.
 
@@ -689,12 +707,12 @@ def normalize_cellular(uid, diagnostics, metric_ts, collected_ts,
         'uid': uid,
         'carrier': carrier,
         'service_mode': service_mode,
-        'rsrp': _diag(diagnostics, 'rsrp'),
-        'rsrq': _diag(diagnostics, 'rsrq'),
-        'sinr': _diag(diagnostics, 'sinr'),
-        'rsrp_5g': _diag(diagnostics, 'rsrp_5g'),
-        'rsrq_5g': _diag(diagnostics, 'rsrq_5g'),
-        'sinr_5g': _diag(diagnostics, 'sinr_5g'),
+        'rsrp': rf_number(_diag(diagnostics, 'rsrp')),
+        'rsrq': rf_number(_diag(diagnostics, 'rsrq')),
+        'sinr': rf_number(_diag(diagnostics, 'sinr')),
+        'rsrp_5g': rf_number(_diag(diagnostics, 'rsrp_5g')),
+        'rsrq_5g': rf_number(_diag(diagnostics, 'rsrq_5g')),
+        'sinr_5g': rf_number(_diag(diagnostics, 'sinr_5g')),
         'serving_band': serving.get('band') if serving else None,
         'serving_bandwidth_mhz': (serving.get('bandwidth_mhz')
                                   if serving else None),

@@ -67,6 +67,9 @@ class BoundedSeen(object):
     def __len__(self):
         return len(self._keys)
 
+    def cap(self):
+        return self._cap
+
 
 # --- WAN state + interface counters --------------------------------------
 

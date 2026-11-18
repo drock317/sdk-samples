@@ -5,12 +5,14 @@ NCOS routers: WAN paths, SD-WAN interfaces, WAN bonding (WBOND), member
 interfaces, traffic steering, underlay connectivity, cellular state, and how
 these change over time.
 
-> **Status: BACKEND build (v0.3.2).** Targeted collectors, normalization,
+> **Status: BACKEND build (v0.3.3).** Targeted collectors, normalization,
 > logical Traffic Steering grouping, semantic fingerprints, a cached snapshot,
 > section JSON endpoints, and (new in 0.3.0) the **data-acquisition model**
 > below: startup + scheduled + manual collection, source-tagged observations,
 > timestamp envelopes, interface and cellular/CA telemetry, SWANS dedupe and
-> change-versioned config. **Recording jobs (backend)** are new in 0.3.2. Durable
+> change-versioned config. **Recording jobs (backend)** are new in 0.3.2. v0.3.3 is a
+> hardening/API patch (bounded client sockets, current interface + cellular
+> telemetry APIs, numeric RF values). Durable
 > storage and the polished UI remain deferred; the in-memory store is
 > temporary.
 
@@ -35,6 +37,15 @@ NCOS collectors -> normalization -> historical storage -> application API -> pre
 - **web.py** — minimal `http.server` dev page + JSON API. Calls `service`
   only; never touches NCOS. The browser never reaches NCOS APIs.
 
+## Web server connection handling (0.3.3)
+The server is deliberately single threaded (shared service, Recording and
+store state has no locking design yet). Every accepted client socket gets a
+5 s timeout (`web.CLIENT_SOCKET_TIMEOUT_S`) so a browser that connects but
+never sends a request (speculative/idle connection) cannot hold the only
+handler: it is dropped and queued requests are served. Responses are
+HTTP/1.0 with `Connection: close`. The 15 s NCOS collector timeout is
+unrelated and unchanged.
+
 ## Backend endpoints
 
 Router collection happens only for startup, the selected schedule, a manual
@@ -46,7 +57,26 @@ not ready"}` until the first snapshot has been composed.
 - `GET /api/status`, `GET /api/health` — app + storage + collector health,
   effective web port, latest `system_summary`
 - `GET /api/snapshot` — full cached normalized snapshot (all sections)
-- `GET /api/wan` — `paths`, `physical`, `overlays`, `underlay_map`, `config`
+- `GET /api/wan` — `paths`, `physical`, `overlays`, `underlay_map`, `config`,
+  and (0.3.3) `interfaces`: the latest normalized per-interface counters
+  (`rx/tx_bytes`, `rx/tx_packets`, `rx/tx_errors`, `rx/tx_drops`,
+  `reset_suspected`, `metric_ts`, `collected_ts`, `timestamp_source`). Raw
+  counters only: no rates; the meaning of drop counters is not interpreted.
+- `GET /api/storage` (0.3.4) — Storage Inspector, generated live on every
+  call (nothing stored, no timer, no router I/O, no history entry).
+  `memory` (counts only: history observations, config versions, Recording
+  jobs/samples/active job, dedupe entries, configured limits), `persistent`
+  (`enabled: false` while telemetry is memory-only; `root` `data/`,
+  `root_exists`, `file_count`, `total_bytes`, `files[]` ready for future
+  durable storage) and `application_files` (metadata only: `relative_path`,
+  `size_bytes`, `modified_ts`, `type`). Strict allowlist rooted at the app's
+  own directory; symlinks are never followed; credentials, keys, certs,
+  `sdk_settings.ini` and unknown file types are excluded (counted only).
+- `GET /api/cellular` (0.3.3) — `modems[]`: latest merged cellular/CA
+  telemetry per modem (carrier, service mode, serving band/bandwidth,
+  RSRP/RSRQ/SINR LTE + 5G as JSON numbers or null, carrier count, total
+  active MHz, zero-MHz count, `carriers[]`, `ca_signature`, `cell_key_hash`,
+  timestamp envelope). No IMEI/IMSI/ICCID/MDN/GPS/cell ids.
 - `GET /api/swans` — SWANS per-path latency/jitter (Traffic Class measurement)
 - `GET /api/qoe` — SD-WAN transport QoE (distinct object from SWANS)
 - `GET /api/traffic_classes` — normalized Traffic Class definitions

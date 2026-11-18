@@ -22,6 +22,36 @@ from . import web_port
 # App name used for the namespaced appdata field (<app_name>_web_port).
 APP_NAME = 'sdwan_analyzer'
 
+# Per-connection socket timeout (seconds). The server is deliberately
+# SINGLE-THREADED (shared service/Recording/store state has no locking
+# design yet), so one client that connects but never sends a request would
+# otherwise hold the only handler indefinitely (seen with Chrome speculative
+# connections on a live R2400). Every accepted socket therefore gets this
+# short timeout: an idle client is dropped after it, and queued requests
+# are served. 5 s is long enough for a normal LAN browser/curl request line
+# and body, short enough that a stall is barely noticeable. Applies to this
+# web server only; the 15 s NCOS collector timeout is unrelated and unchanged.
+CLIENT_SOCKET_TIMEOUT_S = 5
+
+
+class _BoundedHTTPServer(HTTPServer):
+    """HTTPServer that bounds every accepted client socket with a timeout.
+
+    Still single-threaded (no ThreadingMixIn): requests run one at a time.
+    """
+
+    def get_request(self):
+        conn, addr = self.socket.accept()
+        try:
+            conn.settimeout(CLIENT_SOCKET_TIMEOUT_S)
+        except Exception:
+            pass
+        return conn, addr
+
+    def handle_error(self, request, client_address):
+        # Default prints a traceback to stderr; the router has no console.
+        cp.log('web: connection error from {}'.format(client_address[0]))
+
 
 def app_package_ini():
     """Path to this app's package.ini.
@@ -50,7 +80,8 @@ _DEV_PAGE = """<!DOCTYPE html>
 <li><a href="/api/status">/api/status</a> (includes effective web port)</li>
 <li><a href="/api/health">/api/health</a></li>
 <li><a href="/api/snapshot">/api/snapshot</a> (latest MERGED current state, not the last observation)</li>
-<li><a href="/api/wan">/api/wan</a> (paths, physical, overlays, underlay map)</li>
+<li><a href="/api/wan">/api/wan</a> (paths, physical, overlays, underlay map, current interface counters)</li>
+<li><a href="/api/cellular">/api/cellular</a> (current cellular/CA telemetry)</li>
 <li><a href="/api/swans">/api/swans</a> (SWANS latency/jitter)</li>
 <li><a href="/api/qoe">/api/qoe</a> (SD-WAN transport QoE)</li>
 <li><a href="/api/traffic_classes">/api/traffic_classes</a></li>
@@ -59,6 +90,7 @@ _DEV_PAGE = """<!DOCTYPE html>
 <li><a href="/api/bonding">/api/bonding</a> (WBOND detail)</li>
 <li><a href="/api/identities">/api/identities</a> (destinations)</li>
 <li><a href="/api/changes">/api/changes</a> (topology/config change flags)</li>
+<li><a href="/api/storage">/api/storage</a> (Storage Inspector: memory counts, app file metadata; generated on demand)</li>
 <li><a href="/api/history">/api/history</a> (source-tagged observations)</li>
 <li><a href="/api/recordings">/api/recordings</a>, <a href="/api/recordings/active">/active</a>, /api/recordings/&lt;id&gt;; POST /api/recordings/start, /api/recordings/&lt;id&gt;/stop (backend-owned, max 30 min)</li>
 <li>POST /api/refresh/&lt;group&gt; (manual: traffic_classes, steering, bonding, wan_paths, overview)</li>
@@ -70,11 +102,19 @@ _DEV_PAGE = """<!DOCTYPE html>
 
 def _make_handler(service):
     class Handler(BaseHTTPRequestHandler):
+        # StreamRequestHandler.setup() applies this to the connection, so
+        # the bound holds even if the handler is used with another server.
+        timeout = CLIENT_SOCKET_TIMEOUT_S
+        # One request per connection: finite, never kept alive.
+        protocol_version = 'HTTP/1.0'
+
         def _send_json(self, obj, code=200):
             body = json.dumps(obj).encode('utf-8')
             self.send_response(code)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body)))
+            self.send_header('Connection', 'close')
+            self.close_connection = True
             self.end_headers()
             self.wfile.write(body)
 
@@ -83,6 +123,8 @@ def _make_handler(service):
             self.send_response(code)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(body)))
+            self.send_header('Connection', 'close')
+            self.close_connection = True
             self.end_headers()
             self.wfile.write(body)
 
@@ -91,6 +133,7 @@ def _make_handler(service):
         # a web request NEVER triggers router collection.
         _SECTION_ROUTES = {
             '/api/wan': 'wan',
+            '/api/cellular': 'cellular',
             '/api/swans': 'swans',
             '/api/qoe': 'qoe',
             '/api/traffic_classes': 'traffic_classes',
@@ -122,6 +165,9 @@ def _make_handler(service):
                     else:
                         self._send_json(
                             service.section(self._SECTION_ROUTES[path]))
+                elif path == '/api/storage':
+                    # Generated live on every call; nothing stored/cached.
+                    self._send_json(service.storage_report())
                 elif path == '/api/recordings':
                     self._send_json({'recordings': service.list_recordings()})
                 elif path == '/api/recordings/active':
@@ -267,7 +313,7 @@ class DevWebServer(object):
         self._port = result.port
         try:
             # Hand the pre-bound socket to HTTPServer without re-binding.
-            self._httpd = HTTPServer(('0.0.0.0', result.port),
+            self._httpd = _BoundedHTTPServer(('0.0.0.0', result.port),
                                      _make_handler(self._service),
                                      bind_and_activate=False)
             # Close the unused placeholder socket HTTPServer created, then

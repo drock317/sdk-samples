@@ -110,6 +110,9 @@ class InMemoryHistoryStore(HistoryStore):
             'durable': False,
         }
 
+    def max_observations(self):
+        return self._buf.maxlen
+
 
 class ConfigVersionStore(object):
     """Change-versioned static/config objects (in-memory, bounded).
@@ -147,6 +150,14 @@ class ConfigVersionStore(object):
 
     def versions(self, name):
         return list(self._versions.get(name, ()))
+
+    def info(self):
+        """Counts only (Storage Inspector): never payloads."""
+        by_name = {n: len(b) for n, b in list(self._versions.items())}
+        return {'objects': len(by_name),
+                'versions_total': sum(by_name.values()),
+                'by_name': by_name,
+                'max_versions_per_object': self._max}
 
     def summary(self):
         return {n: {'version': b[-1]['version'],
@@ -221,6 +232,18 @@ class RecordingStore(object):
 
     def sample_count(self, job_id):
         return len(self._samples.get(job_id, ()))
+
+    def info(self):
+        """Counts only (Storage Inspector): no jobs' contents or samples."""
+        by_job = {j: len(b) for j, b in list(self._samples.items())}
+        active = self.active_recording()
+        return {'job_count': len(by_job),
+                'active_job_id': active['job_id'] if active else None,
+                'total_sample_count': sum(by_job.values()),
+                'samples_by_job': by_job,
+                'event_count': len(self._events),
+                'configured_max_jobs': self._max_jobs,
+                'configured_max_samples_per_job': self._max_samples}
 
 
 def default_store():

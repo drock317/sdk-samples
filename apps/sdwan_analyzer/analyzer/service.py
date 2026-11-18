@@ -30,6 +30,7 @@ snapshot or stops the app.
 Business logic lives here (and in normalize/telemetry), never in web.
 """
 
+import os
 import threading
 import time
 
@@ -37,6 +38,7 @@ import cp
 
 from . import VERSION
 from . import collectors
+from . import inspector
 from . import normalize
 from . import recording
 from . import storage
@@ -154,7 +156,7 @@ class _RawCache(object):
 
 class AnalyzerService(object):
     def __init__(self, store=None, schedule_minutes=DEFAULT_SCHEDULE_MINUTES,
-                 config_store=None, clock=None):
+                 config_store=None, clock=None, app_root=None):
         self._store = store if store is not None else storage.default_store()
         self._config_store = (config_store if config_store is not None
                               else storage.ConfigVersionStore())
@@ -162,6 +164,11 @@ class AnalyzerService(object):
         self._rec_store = storage.RecordingStore()
         self._recording = recording.RecordingController(self, self._rec_store)
         self._web_port_status = None
+        # Root of the files the Storage Inspector may describe (the app's own
+        # directory). Injectable for tests.
+        self._app_root = (app_root if app_root is not None else
+                          os.path.dirname(os.path.dirname(
+                              os.path.abspath(__file__))))
 
         if schedule_minutes not in SCHEDULE_CHOICES:
             schedule_minutes = DEFAULT_SCHEDULE_MINUTES
@@ -184,6 +191,11 @@ class AnalyzerService(object):
 
         # Cross-observation telemetry state (all bounded).
         self._prev_counters = {}
+        # Latest normalized runtime telemetry for CURRENT STATE (merged
+        # last-known-good): replaced only by a pass whose wan_devices read
+        # succeeded, retained otherwise (partial refresh / failed read).
+        self._cur_interfaces = []
+        self._cur_cellular = []
         self._swans_seen = telemetry.BoundedSeen()
         self._event_seen = telemetry.BoundedSeen()
         self._last_refresh = {}          # group -> ts of last accepted refresh
@@ -333,9 +345,10 @@ class AnalyzerService(object):
                                             'sample_source': source}
             if all(k in keys for k in collectors.CONFIG_KEYS):
                 self._last_config_ts = now
+            tel = self._wan_telemetry(keys, results, now)
             snap = self.recompose()
             obs = self._build_observation(source, keys, snap, now,
-                                          group, job_id)
+                                          group, job_id, tel)
             obs['collector_errors'] = errors
             obs['duration_ms'] = int((time.time() - t0) * 1000)
             if source == 'recording' and job_id:
@@ -366,7 +379,28 @@ class AnalyzerService(object):
             self._snapshot_ts = snap.get('timestamp')
         return snap
 
-    def _build_observation(self, source, keys, snap, now, group, job_id):
+    def _wan_telemetry(self, keys, results, now):
+        """Normalize interface + cellular telemetry ONCE per pass.
+
+        The same records feed the persisted observation and the current-state
+        cache, so there is a single parsing path (telemetry.py). Counter
+        reset detection state advances exactly once per pass. Returns
+        (interfaces, cellular) or None when wan_devices was not collected.
+        """
+        if 'wan_devices' not in keys:
+            return None
+        devices = self._raw().get('wan_devices')
+        interfaces, self._prev_counters = telemetry.interface_records(
+            devices, self._prev_counters, now)
+        cell = telemetry.cellular_records(devices, now)
+        res = results.get('wan_devices')
+        if res is not None and getattr(res, 'ok', True):
+            self._cur_interfaces = interfaces
+            self._cur_cellular = cell
+        return interfaces, cell
+
+    def _build_observation(self, source, keys, snap, now, group, job_id,
+                           tel=None):
         """Source-tagged compact observation. Never a raw API snapshot.
 
         Only sections whose collectors ran in this pass are populated (a
@@ -382,10 +416,10 @@ class AnalyzerService(object):
             devices = data.get('wan_devices')
             obs['wan'] = telemetry.wan_state(
                 devices, data.get('primary_device'), now)
-            obs['interfaces'], self._prev_counters = (
-                telemetry.interface_records(devices, self._prev_counters,
-                                            now))
-            obs['cellular'] = telemetry.cellular_records(devices, now)
+            if tel is None:
+                tel = self._wan_telemetry(('wan_devices',),
+                                          {'wan_devices': None}, now)
+            obs['interfaces'], obs['cellular'] = tel
         if 'swans' in have:
             obs['swans_samples'] = telemetry.swans_new_samples(
                 data.get('swans'), self._swans_seen, now)
@@ -510,6 +544,10 @@ class AnalyzerService(object):
         if isinstance(compiled_rules, dict):
             compiled_rules = list(compiled_rules.values())
 
+        kinds = {p.get('uid'): p.get('kind') for p in wan_paths}
+        interfaces = [dict(r, kind=kinds.get(r.get('uid')))
+                      for r in self._cur_interfaces]
+
         snapshot = {
             'timestamp': int(time.time()),
             'system_summary': {
@@ -527,6 +565,14 @@ class AnalyzerService(object):
                 'overlays': overlays,
                 'underlay_map': sdwan_underlays,
                 'config': wan_rules2,
+                # Latest normalized counters per interface (raw counters
+                # only: no rates, no interpretation of errors/drops).
+                'interfaces': interfaces,
+            },
+            'cellular': {
+                'modems': [dict(r, carriers=[dict(c) for c in
+                                             r.get('carriers', [])])
+                           for r in self._cur_cellular],
             },
             'swans': swans,
             'traffic_classes': traffic_classes,
@@ -754,6 +800,49 @@ class AnalyzerService(object):
         return {
             'uid': device_id,
             'cellular': normalize_cellular_safe(diag),
+        }
+
+    def storage_report(self):
+        """Storage Inspector: a FRESH counts/metadata report per call.
+
+        Read-only and side-effect free: no observation is stored, no router
+        I/O, no schedule/Recording change, nothing is cached or persisted.
+        """
+        memory = None
+        for _ in range(3):      # stores are mutated by the main-loop thread
+            try:
+                memory = self._storage_memory()
+                break
+            except RuntimeError:
+                continue
+        if memory is None:
+            memory = {'error': 'memory counts unavailable'}
+        return inspector.build_report(memory, self._app_root,
+                                      now=self._clock())
+
+    def _storage_memory(self):
+        hist = self._store.stats()
+        max_obs = getattr(self._store, 'max_observations', None)
+        cfg = self._config_store.info()
+        rec = self._rec_store.info()
+        return {
+            'history_observations': hist.get('count'),
+            'config_versions': cfg['versions_total'],
+            'recording_jobs': rec['job_count'],
+            'recording_samples': rec['total_sample_count'],
+            'active_recording': rec['active_job_id'],
+            'swans_dedupe_entries': len(self._swans_seen),
+            'steering_event_dedupe_entries': len(self._event_seen),
+            'details': {
+                'history': {'backend': hist.get('backend'),
+                            'durable': hist.get('durable'),
+                            'max_observations': (max_obs() if max_obs
+                                                 else None)},
+                'config_versions': cfg,
+                'recording': rec,
+                'dedupe': {'swans_cap': self._swans_seen.cap(),
+                           'steering_events_cap': self._event_seen.cap()},
+            },
         }
 
     def history(self, limit=100):
