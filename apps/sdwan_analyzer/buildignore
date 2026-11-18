@@ -1,0 +1,4 @@
+# Files/dirs excluded from the app package (make.py build).
+# Local test harness + fixtures are development-only and must not ship to
+# the router (keeps the package small and avoids packaging test data).
+tests/
