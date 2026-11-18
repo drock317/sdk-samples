@@ -89,6 +89,8 @@ DST_YT_COM = 'c1000001-0000-0000-0000-0000000000y1'
 DST_YT_HD = 'c1000002-0000-0000-0000-0000000000y2'
 DST_YT_MUSIC = 'c1000003-0000-0000-0000-0000000000y3'
 DST_YT_KIDS = 'c1000004-0000-0000-0000-0000000000y4'
+DST_TEAMS = 'd1000001-0000-0000-0000-0000000000t1'
+TC_INTERACTIVE = '00000002-0e93-4371-a6a5-2648354310cc'
 
 
 def _dev(*ids):
@@ -276,6 +278,83 @@ STEERING_RULES = [
             'dst_ip_network': '',
         },
     },
+    # Lab01 - Teams: ONE logical policy compiled into TWO runtime branches
+    # (Best Effort @5, Interactive @6). Stats/events name only 'Lab01 - Teams'.
+    {
+        'id': 'teams-be', 'name': 'Lab01 - Teams teams-be',
+        'intent': 'Best Effort (Data traffic)', 'loadbalance_algo': 'none',
+        'matched_devs': _dev('sdwan-hub0_1ea0ac', 'sdwan-hub0_wan'),
+        'steering_to': _dev('sdwan-hub0_1ea0ac'),
+        'xpolicy': {
+            '_id_': 'teams-be', 'name': 'Lab01 - Teams',
+            'src_lans': [{'lan_name': 'Primary LAN'}],
+            'trigger_priority': 5, 'wan_priority_enabled': False,
+            'trigger_strings': [
+                {'_id_': 'ts', 'trigger_priority': 5,
+                 'trigger_string': 'type|is|sdwan'}],
+            'intent': TC_BEST_EFFORT, 'dst_ip_network': DST_TEAMS,
+        },
+    },
+    {
+        'id': 'teams-int', 'name': 'Lab01 - Teams teams-int',
+        'intent': 'Interactive (Real-time traffic)', 'loadbalance_algo': 'none',
+        'matched_devs': _dev('sdwan-hub0_1ea0ac', 'sdwan-hub0_wan'),
+        'steering_to': _dev('sdwan-hub0_1ea0ac'),
+        'xpolicy': {
+            '_id_': 'teams-int', 'name': 'Lab01 - Teams',
+            'src_lans': [{'lan_name': 'Primary LAN'}],
+            'trigger_priority': 6, 'wan_priority_enabled': False,
+            'trigger_strings': [
+                {'_id_': 'ts', 'trigger_priority': 6,
+                 'trigger_string': 'type|is|sdwan'}],
+            'intent': TC_INTERACTIVE, 'dst_ip_network': DST_TEAMS,
+        },
+    },
+    {
+        'id': 'gaming-1', 'name': 'Lab01 - Gaming gaming-1',
+        'intent': 'Best Effort (Data traffic)', 'loadbalance_algo': 'none',
+        'matched_devs': _dev('sdwan-hub0_1ea0ac', 'sdwan-hub0_wan'),
+        'steering_to': _dev('sdwan-hub0_1ea0ac'),
+        'xpolicy': {
+            '_id_': 'gaming-1', 'name': 'Lab01 - Gaming',
+            'src_lans': [{'lan_name': 'Primary LAN'}],
+            'trigger_priority': 9, 'wan_priority_enabled': False,
+            'trigger_strings': [
+                {'_id_': 'ts', 'trigger_priority': 9,
+                 'trigger_string': 'type|is|sdwan'}],
+            'intent': TC_BEST_EFFORT, 'dst_ip_network': DST_GAMING,
+        },
+    },
+    {
+        'id': 'mm-1', 'name': 'Lab01 - Multimedia mm-1',
+        'intent': 'Best Effort (Data traffic)', 'loadbalance_algo': 'none',
+        'matched_devs': _dev('sdwan-hub0_1ea0ac', 'sdwan-hub0_wan'),
+        'steering_to': _dev('sdwan-hub0_1ea0ac'),
+        'xpolicy': {
+            '_id_': 'mm-1', 'name': 'Lab01 - Multimedia',
+            'src_lans': [{'lan_name': 'Primary LAN'}],
+            'trigger_priority': 10, 'wan_priority_enabled': False,
+            'trigger_strings': [
+                {'_id_': 'ts', 'trigger_priority': 10,
+                 'trigger_string': 'type|is|sdwan'}],
+            'intent': TC_BEST_EFFORT, 'dst_ip_network': DST_MULTIMEDIA,
+        },
+    },
+    {
+        'id': 'nflx-1', 'name': 'Lab01 - Netflix nflx-1',
+        'intent': 'Best Effort (Data traffic)', 'loadbalance_algo': 'none',
+        'matched_devs': _dev('sdwan-hub0_1ea0ac', 'sdwan-hub0_wan'),
+        'steering_to': _dev('sdwan-hub0_1ea0ac'),
+        'xpolicy': {
+            '_id_': 'nflx-1', 'name': 'Lab01 - Netflix',
+            'src_lans': [{'lan_name': 'Primary LAN'}],
+            'trigger_priority': 11, 'wan_priority_enabled': False,
+            'trigger_strings': [
+                {'_id_': 'ts', 'trigger_priority': 11,
+                 'trigger_string': 'type|is|sdwan'}],
+            'intent': TC_BEST_EFFORT, 'dst_ip_network': DST_NETFLIX,
+        },
+    },
 ]
 
 # --- status/wan/steering/stats (steering_rule = LOGICAL NAME) -------------
@@ -295,6 +374,10 @@ STEERING_STATS = {
          'apps': {'a000015A8': {'preferred_flows': 18, 'nonpreferred_flows': 4,
                                 'appname': 'YouTube', 'catname': 'None',
                                 'was_flow_matched': True}}},
+        {'steering_rule': 'Lab01 - Teams',
+         'preferred_wan': 'sdwan-mdm-Internal 5GB (SIM1)-T-Mobile',
+         'preferred_flows': 12, 'nonpreferred_flows': 3,
+         'was_flow_matched': True, 'apps': {}},
         {'steering_rule': 'TEST - Applications',
          'preferred_wan': 'sdwan-hub0_1ea0ac',
          'preferred_flows': 6, 'nonpreferred_flows': 1,
@@ -312,13 +395,16 @@ STEERING_STATS = {
 
 STEERING_EVENTS = {
     'began_capture': 1772148824.45,
-    'total_perf_events': 3,
+    'total_perf_events': 4,
     'event_overflow': False,
     'steering_events': [
         {'epoch': 1772148900.0, 'steering_rule': 'Lab01 - Youtube',
          'reason': 'WANs equal, chose default',
          'wan_to_uid': 'sdwan-hub0_1ea0ac', 'total_flows_moved': 4,
          'destinations': [], 'src_lans': ['Primary LAN']},
+        {'epoch': 1772148920.0, 'steering_rule': 'Lab01 - Teams',
+         'reason': 'WANs equal, chose default',
+         'wan_to_uid': 'sdwan-hub0_1ea0ac', 'total_flows_moved': 2},
         {'epoch': 1772148950.0, 'steering_rule': 'LAB01-Best Effort',
          'reason': 'Single selected WAN is connected',
          'wan_to_uid': 'wbond-wbond0_hub0', 'total_flows_moved': 60},
@@ -342,24 +428,26 @@ STEERING_PARENT = {
 
 IDENTITIES_IP = {
     DST_YT_COM: {'_id_': DST_YT_COM, 'friendly_name': 'Youtube.com',
-                 'internal_name': 'a00001AAA', 'type': 'application'},
+                 'name': 'a00001AAA'},
     DST_YT_HD: {'_id_': DST_YT_HD, 'friendly_name': 'Youtube HD',
-                'internal_name': 'a00001BBB', 'type': 'application'},
+                'name': 'a00001BBB'},
     DST_YT_MUSIC: {'_id_': DST_YT_MUSIC, 'friendly_name': 'Youtube Music',
-                   'internal_name': 'a00001CCC', 'type': 'application'},
+                   'name': 'a00001CCC'},
     DST_YT_KIDS: {'_id_': DST_YT_KIDS, 'friendly_name': 'YouTube Kids',
-                  'internal_name': 'a00001DDD', 'type': 'application'},
+                  'name': 'a00001DDD'},
     DST_NETFLIX: {'_id_': DST_NETFLIX, 'friendly_name': 'Netflix.com',
-                  'internal_name': 'a000012DE', 'type': 'application'},
+                  'name': 'a000012DE'},
     DST_HULU: {'_id_': DST_HULU, 'friendly_name': 'Hulu',
-               'internal_name': 'a00001496', 'type': 'application'},
+               'name': 'a00001496'},
     DST_ONLYFANS: {'_id_': DST_ONLYFANS, 'friendly_name': 'OnlyFans',
-                   'internal_name': 'a00001F30', 'type': 'application'},
+                   'name': 'a00001F30'},
     DST_GAMING: {'_id_': DST_GAMING, 'friendly_name': 'Gaming',
-                 'internal_name': 'c0116', 'type': 'category'},
+                 'name': 'c0116'},
+    DST_TEAMS: {'_id_': DST_TEAMS, 'friendly_name': 'Microsoft Teams',
+                'name': 'a00002001'},
     DST_MULTIMEDIA: {'_id_': DST_MULTIMEDIA,
                      'friendly_name': 'Multimedia streaming',
-                     'internal_name': 'c0119', 'type': 'category'},
+                     'name': 'c0119'},
 }
 
 # --- status/wan/loadbalancers (spillover example) -------------------------

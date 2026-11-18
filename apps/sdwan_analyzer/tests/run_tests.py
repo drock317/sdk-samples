@@ -176,7 +176,7 @@ def test_test_applications():
     check(names == {'Netflix.com', 'Hulu', 'OnlyFans'},
           'Netflix + Hulu + OnlyFans merged from dst_ip_network')
     check(t['destination_type'] == 'application',
-          'destination_type application via identity (no prefix inference)')
+          'destination_type application via stats appname (not id prefix)')
 
 
 # -------------------------------------------------------------------------
@@ -297,7 +297,7 @@ def test_bonding_detail():
 
 def test_no_bare_sdwan_adv_collected():
     print('test_no_bare_sdwan_adv_collected')
-    # Record every path collect_heavy_snapshot reads and assert none is the
+    # Record every path the runtime/config passes read and assert none is the
     # bare status/sdwan_adv tree.
     saved = collectors._get_result
     seen = []
@@ -308,8 +308,8 @@ def test_no_bare_sdwan_adv_collected():
 
     collectors._get_result = fake
     try:
-        collectors.collect_heavy_snapshot()
-        collectors.collect_base_snapshot()
+        collectors.collect_config_snapshot()
+        collectors.collect_runtime_snapshot()
     finally:
         collectors._get_result = saved
     check('status/sdwan_adv' not in seen,
@@ -483,8 +483,8 @@ def test_steering_single_read_split():
 
 def _service_with_fixtures():
     svc = AnalyzerService()
-    svc._base_raw.data = fixtures.base_raw()
-    svc._heavy_raw.data = fixtures.heavy_raw()
+    svc._runtime_raw.data = fixtures.base_raw()
+    svc._config_raw.data = fixtures.heavy_raw()
     return svc
 
 
@@ -497,10 +497,12 @@ def test_service_compose_schema():
                 'bonding', 'qoe', 'identities', 'fingerprints', 'changes'):
         check(key in snap, 'snapshot has section: {}'.format(key))
     ts = snap['traffic_steering']
-    # LAB01, YouTube, TEST, Management = 4 logical rules.
-    check(len(ts['logical_rules']) == 4,
-          'four logical rules composed (got {})'.format(
+    # LAB01, YouTube, TEST, Management, Teams, Gaming, Multimedia, Netflix.
+    check(len(ts['logical_rules']) == 8,
+          'eight logical rules composed (got {})'.format(
               len(ts['logical_rules'])))
+    check(snap['system_summary']['logical_rule_count'] == 8,
+          'logical_rule_count == 8 (Teams branches not double-counted)')
     check(len(wan_overlays(snap)) == 2, 'two SD-WAN overlays')
 
 
@@ -510,27 +512,27 @@ def wan_overlays(snap):
 
 def test_compact_history():
     print('test_compact_history')
-    svc = _service_with_fixtures()
-    svc.recompose()
-    samples = svc.history(limit=10)
-    check(len(samples) == 1, 'one compact history sample stored')
-    sample = samples[0]
-    # Compact sample must NOT carry raw passthrough or compiled_rules.
-    check('compiled_rules' not in str(sample.keys()),
-          'no compiled_rules key in compact sample')
-    rules = sample.get('logical_rules', [])
-    check(rules and all('raw' not in r for r in rules),
-          'no raw passthrough in compact logical rules')
-    check(all('fingerprint' in r for r in rules),
-          'compact rule carries fingerprint')
-    check('wan_states' in sample and 'swans' in sample and 'qoe' in sample,
-          'compact sample has analysis-useful sections')
-    # Ensure the compact sample is materially smaller than the full snapshot.
     import json
+    svc = _service_with_fixtures()
+    with _fake_collectors():
+        svc.collect_startup()
+    samples = svc.history(limit=10)
+    check(len(samples) == 1, 'one observation stored')
+    sample = samples[0]
+    check('compiled_rules' not in str(sample.keys()),
+          'no compiled_rules key in observation')
+    check(all('raw' not in r for r in sample.get('steering', [])),
+          'no raw passthrough in steering runtime')
+    check(all(k in sample for k in ('wan', 'interfaces', 'swans_samples',
+                                    'qoe', 'wbond', 'steering',
+                                    'config_versions')),
+          'observation has runtime sections + config version refs')
+    check('branches' not in json.dumps(sample.get('steering')),
+          'static rule definitions not duplicated into the sample')
     full = svc.snapshot()
     check(len(json.dumps(sample, default=str)) <
           len(json.dumps(full, default=str)),
-          'compact history sample smaller than full snapshot')
+          'observation smaller than full snapshot')
 
 
 def test_service_change_detection():
@@ -557,7 +559,7 @@ def test_service_change_detection():
         churned.append(c)
     base = fixtures.base_raw()
     base['steering_rules'] = churned
-    svc._base_raw.data = base
+    svc._runtime_raw.data = base
     snap3 = svc.recompose()
     check(any('logical_rule' in c for c in snap3['changes']['config']),
           'selector change detected as config change')
@@ -574,8 +576,1478 @@ def test_cellular_privacy_filter():
               'sensitive field filtered out: {}'.format(forbidden))
 
 
+class _FakeAppData(object):
+    """Injected stand-in for cp.get_appdata / cp.put_appdata."""
+
+    def __init__(self, **initial):
+        self.store = dict(initial)
+        self.puts = []
+
+    def get(self, name):
+        return self.store.get(name)
+
+    def put(self, name, value):
+        self.puts.append((name, value))
+        self.store[name] = value
+
+
+def _free_port():
+    import socket
+    s = socket.socket()
+    s.bind(('0.0.0.0', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _http_json(port, path):
+    import json
+    import urllib.request
+    with urllib.request.urlopen(
+            'http://127.0.0.1:{}{}'.format(port, path), timeout=5) as r:
+        return r.status, json.loads(r.read().decode('utf-8'))
+
+
+def test_web_port_module_is_the_current_standard():
+    print('test_web_port_module_is_the_current_standard')
+    from analyzer import web_port
+    check(callable(getattr(web_port, 'bind_web_socket_with_retry', None)),
+          'bind_web_socket_with_retry present (retry wrapper)')
+    check(callable(getattr(web_port, 'stop_app', None)),
+          'stop_app present (final-failure stop)')
+    r = web_port.PortResult(ok=False)
+    check(hasattr(r, 'retryable'), 'PortResult.retryable present')
+
+
+def test_app_package_ini_is_found_from_subpackage():
+    print('test_app_package_ini_is_found_from_subpackage')
+    # web_port.py lives in analyzer/, package.ini is one level up. The
+    # module's default lookup (beside itself) would miss it, so the app passes
+    # app_package_ini() explicitly. Both halves are asserted on purpose.
+    from analyzer import web_port
+    from analyzer.web import app_package_ini
+    path = app_package_ini()
+    check(os.path.isfile(path), 'app_package_ini() points at a real file')
+    uuid = web_port.read_app_uuid(path)
+    check(bool(uuid), 'uuid read from the app-root package.ini')
+    check(web_port.read_app_uuid() is None,
+          'default lookup (beside web_port.py) finds nothing in this layout')
+
+
+def test_stop_app_uses_app_root_package_ini():
+    print('test_stop_app_uses_app_root_package_ini')
+    from analyzer import web_port
+    from analyzer.web import app_package_ini
+    calls, logs = [], []
+    ok = web_port.stop_app(lambda p, v: calls.append((p, v)), logs.append,
+                           package_ini=app_package_ini())
+    check(ok, 'stop_app reports the request was sent')
+    uuid = web_port.read_app_uuid(app_package_ini())
+    check(calls == [('control/system/sdk/action', 'stop ' + uuid)],
+          'sends control/system/sdk/action = "stop <app uuid>"')
+    # The failure mode the explicit path prevents:
+    check(web_port.stop_app(lambda p, v: None, logs.append) is False,
+          'without the explicit path stop_app cannot find the uuid')
+
+
+def test_web_server_first_run_and_override():
+    print('test_web_server_first_run_and_override')
+    from analyzer.web import DevWebServer
+    svc = _service_with_fixtures()
+    # First run: no value -> discover, persist, serve.
+    ad = _FakeAppData()
+    srv = DevWebServer(svc, get_appdata=ad.get, put_appdata=ad.put)
+    # Same wiring sdwan_analyzer.main() does, so /api/status reports the port.
+    svc.set_web_port_provider(srv.port_status)
+    started = srv.start()
+    try:
+        check(started, 'first run starts')
+        st = srv.port_status()
+        check(st['source'] == 'discovered', 'source is discovered')
+        check(ad.store.get('sdwan_analyzer_web_port') == str(st['effective_port']),
+              'discovered port persisted to sdwan_analyzer_web_port')
+        code, body = _http_json(st['effective_port'], '/api/status')
+        check(code == 200 and 'web' in body, '/api/status served over HTTP')
+        check(body['web']['effective_port'] == st['effective_port'],
+              '/api/status reports the effective port')
+    finally:
+        srv.stop()
+    # Override: an admin-set port is authoritative and bound exactly.
+    want = _free_port()
+    ad2 = _FakeAppData(sdwan_analyzer_web_port=str(want))
+    srv2 = DevWebServer(svc, get_appdata=ad2.get, put_appdata=ad2.put)
+    started2 = srv2.start()
+    try:
+        check(started2, 'configured port starts')
+        st2 = srv2.port_status()
+        check((st2['effective_port'], st2['source']) == (want, 'configured'),
+              'binds exactly the configured port (source=configured)')
+        check(ad2.puts == [], 'a configured value is never rewritten')
+    finally:
+        srv2.stop()
+
+
+def test_web_server_malformed_value_fails_fast():
+    print('test_web_server_malformed_value_fails_fast')
+    import time
+    from analyzer.web import DevWebServer
+    ad = _FakeAppData(sdwan_analyzer_web_port='abc')
+    srv = DevWebServer(_service_with_fixtures(), get_appdata=ad.get,
+                       put_appdata=ad.put)
+    t0 = time.time()
+    started = srv.start()
+    elapsed = time.time() - t0
+    st = srv.port_status()
+    check(started is False, 'start() reports failure')
+    check(elapsed < 2, 'fails at once, no retry wait ({:.2f}s)'.format(elapsed))
+    check(str(st['error']).startswith('non-numeric'), 'error is non-numeric')
+    check(st['running'] is False and st['effective_port'] is None,
+          'not running, no port')
+    check(ad.puts == [] and ad.store['sdwan_analyzer_web_port'] == 'abc',
+          'bad value left untouched, nothing written')
+
+
+def _wan_paths():
+    umap = {'sdwan-hub0_wan': 'ethernet-wan', 'sdwan-hub0_1ea0ac': 'mdm-1ea0ac'}
+    return normalize.wan_paths(fixtures.WAN_DEVICES, fixtures.PRIMARY_DEVICE,
+                               umap)
+
+
+def _logical(rules=None, wan_paths=True):
+    dest_index = normalize.destination_index(fixtures.IDENTITIES_IP)
+    return normalize.logical_rules(
+        rules if rules is not None else fixtures.STEERING_RULES,
+        fixtures.STEERING_STATS, fixtures.STEERING_EVENTS, dest_index,
+        _wan_paths() if wan_paths else None)
+
+
+def test_logical_policy_branches():
+    print('test_logical_policy_branches')
+    logical = _logical()
+    teams = [lr for lr in logical if lr['logical_name'] == 'Lab01 - Teams']
+    check(len(teams) == 1, 'two compiled Teams branches -> ONE logical policy')
+    t = teams[0]
+    check(len(logical) == 8, 'logical_rule_count == 8 (not 9)')
+    check(len(t['branches']) == 2, 'Teams has TWO branch records')
+    check([b['traffic_class_name'] for b in t['branches']] ==
+          ['Best Effort (Data traffic)', 'Interactive (Real-time traffic)'],
+          'branches: Best Effort then Interactive')
+    check([b['trigger_priority'] for b in t['branches']] == [5, 6],
+          'branch trigger priorities 5 and 6 preserved')
+    check(t['branches'][0]['compiled_rule_ids'] == ['teams-be'] and
+          t['branches'][1]['compiled_rule_ids'] == ['teams-int'],
+          'compiled ids live in their own branch')
+    for k in ('traffic_class_id', 'runtime_algorithm', 'configured_algorithm',
+              'matched_devs', 'steering_to', 'source_lans',
+              'wan_selector_type', 'wan_priority_enabled',
+              'wan_priority_order', 'failover', 'primary_wandev'):
+        if k not in t['branches'][0]:
+            check(False, 'branch carries field {}'.format(k))
+    check(t['branches'][1]['traffic_class_id'] == fixtures.TC_INTERACTIVE,
+          'branch carries its own Traffic Class id')
+    check(t['preferred_flows'] == 12 and t['nonpreferred_flows'] == 3,
+          'preferred/nonpreferred attach ONCE (not 24/6)')
+    check(t['latest_event_reason'] == 'WANs equal, chose default' and
+          t['latest_flows_moved'] == 2, 'event attaches once at logical level')
+    check('preferred_flows' not in t['branches'][0],
+          'flow counts are not copied into branches')
+    check(len(t['compiled_rule_ids']) == 2, 'logical lists both compiled ids')
+
+
+def test_logical_fingerprint_branches():
+    print('test_logical_fingerprint_branches')
+    base = {lr['logical_name']: lr['semantic_fingerprint']
+            for lr in _logical()}
+    churned = []
+    for i, r in enumerate(fixtures.STEERING_RULES):
+        c = dict(r)
+        c['id'] = 'regen-{}'.format(i)
+        xp = dict(r['xpolicy'])
+        xp['_id_'] = 'regen-xp-{}'.format(i)
+        c['xpolicy'] = xp
+        churned.append(c)
+    again = {lr['logical_name']: lr['semantic_fingerprint']
+             for lr in _logical(churned)}
+    check(base['Lab01 - Teams'] == again['Lab01 - Teams'],
+          'Teams fingerprint survives compiled UUID churn')
+    check(base == again, 'all logical fingerprints survive UUID churn')
+
+    # Meaningful change inside ONE branch changes the logical fingerprint.
+    changed = []
+    for r in fixtures.STEERING_RULES:
+        c = dict(r)
+        if c['id'] == 'teams-int':
+            xp = dict(c['xpolicy'])
+            xp['trigger_priority'] = 7
+            c['xpolicy'] = xp
+        changed.append(c)
+    chg = {lr['logical_name']: lr for lr in _logical(changed)}
+    check(chg['Lab01 - Teams']['semantic_fingerprint'] !=
+          base['Lab01 - Teams'], 'branch config change changes fingerprint')
+    check(len(chg['Lab01 - Teams']['branches']) == 2 and
+          [b['trigger_priority'] for b in
+           chg['Lab01 - Teams']['branches']] == [5, 7],
+          'branch differences remain represented after grouping')
+    check(chg['Lab01 - Youtube']['semantic_fingerprint'] ==
+          base['Lab01 - Youtube'], 'unrelated policy fingerprint unchanged')
+
+
+def test_preferred_wan_correlation():
+    print('test_preferred_wan_correlation')
+    by_name = {lr['logical_name']: lr for lr in _logical()}
+    t = by_name['Lab01 - Teams']
+    check(t['preferred_wan_raw'] == 'sdwan-mdm-Internal 5GB (SIM1)-T-Mobile',
+          'preferred_wan_raw preserves exact NCOS value')
+    check(t['preferred_wan'] == t['preferred_wan_raw'],
+          'legacy preferred_wan is the raw value')
+    check(t['preferred_wan_uid'] == 'sdwan-hub0_1ea0ac',
+          'cellular SD-WAN resolves to sdwan-hub0_1ea0ac')
+    inv = {p['uid']: p for p in _wan_paths()}
+    check(t['preferred_wan_name'] ==
+          inv['sdwan-hub0_1ea0ac']['display_name'] and t['preferred_wan_name'],
+          'canonical name is the normalized WAN display name')
+    check(t['preferred_wan_match'] == 'steering_to', 'match method recorded')
+    lab = by_name['LAB01-Best Effort']
+    check(lab['preferred_wan_uid'] == 'wbond-wbond0_hub0' and
+          lab['preferred_wan_match'] == 'uid',
+          'WBOND resolves to wbond-wbond0_hub0')
+    # Unresolvable: no inventory supplied -> raw kept, nothing guessed.
+    nolookup = {lr['logical_name']: lr
+                for lr in _logical(wan_paths=False)}['Lab01 - Teams']
+    check(nolookup['preferred_wan_raw'] == t['preferred_wan_raw'] and
+          nolookup['preferred_wan_uid'] is None and
+          nolookup['preferred_wan_name'] is None,
+          'no inventory -> raw kept, canonical null')
+    # Ambiguous: two distinct steering_to uids.
+    amb = []
+    for r in fixtures.STEERING_RULES:
+        c = dict(r)
+        if c['id'] == 'teams-int':
+            c['steering_to'] = fixtures._dev('sdwan-hub0_wan')
+        amb.append(c)
+    a = {lr['logical_name']: lr for lr in _logical(amb)}['Lab01 - Teams']
+    check(a['preferred_wan_uid'] is None and a['preferred_wan_name'] is None
+          and a['preferred_wan_raw'] == t['preferred_wan_raw'],
+          'ambiguous steering_to -> not guessed, raw retained')
+    # Class mismatch: raw says sdwan but only candidate is a wbond.
+    mism = []
+    for r in fixtures.STEERING_RULES:
+        c = dict(r)
+        if r['xpolicy']['name'] == 'Lab01 - Teams':
+            c['steering_to'] = fixtures._dev('wbond-wbond0_hub0')
+        mism.append(c)
+    m = {lr['logical_name']: lr for lr in _logical(mism)}['Lab01 - Teams']
+    check(m['preferred_wan_uid'] is None, 'class mismatch -> not guessed')
+    # Raw value unrelated to any uid and no candidate.
+    check(all(lr['preferred_wan_uid'] is None
+              for lr in _logical() if lr['preferred_wan_raw'] is None),
+          'no raw value -> no canonical value')
+
+
+def test_destination_internal_name():
+    print('test_destination_internal_name')
+    idx = normalize.destination_index(fixtures.IDENTITIES_IP)
+    check(idx[fixtures.DST_NETFLIX]['internal_name'] == 'a000012DE',
+          'internal_name == identity name (Netflix a000012DE)')
+    check(idx[fixtures.DST_GAMING]['internal_name'] == 'c0116',
+          'internal_name == identity name (Gaming c0116)')
+    check(idx[fixtures.DST_YT_COM]['friendly_name'] == 'Youtube.com' and
+          idx[fixtures.DST_YT_COM]['uuid'] == fixtures.DST_YT_COM and
+          'raw' in idx[fixtures.DST_YT_COM] and
+          'type' in idx[fixtures.DST_YT_COM],
+          'uuid/friendly_name/type/raw preserved')
+    check(idx[fixtures.DST_NETFLIX]['type'] is None and
+          idx[fixtures.DST_GAMING]['type'] is None,
+          'type NOT inferred from a.../c... prefix')
+    by_name = {lr['logical_name']: lr for lr in _logical()}
+    g = by_name['Lab01 - Gaming']
+    check(g['destinations'][0]['internal_name'] == 'c0116' and
+          g['destination_type'] is None,
+          'logical destination keeps internal_name; type stays unknown')
+
+
+def test_sdwan_wbond_kind():
+    print('test_sdwan_wbond_kind')
+    by_uid = {p['uid']: p for p in _wan_paths()}
+    check(by_uid['sdwan-hub0_1ea0ac']['kind'] == 'sdwan', 'sdwan kind == sdwan')
+    check(by_uid['sdwan-hub0_wan']['kind'] == 'sdwan', 'sdwan eth kind == sdwan')
+    check(by_uid['wbond-wbond0_hub0']['kind'] == 'wbond', 'wbond kind == wbond')
+    check(by_uid['mdm-1ea0ac']['kind'] == 'cellular' and
+          by_uid['ethernet-wan']['kind'] == 'ethernet',
+          'physical kinds unchanged')
+
+
+def test_history_logical_once():
+    print('test_history_logical_once')
+    svc = _service_with_fixtures()
+    with _fake_collectors():
+        svc.collect_startup()
+    sample = svc.history(limit=1)[0]
+    names = [r['logical_name'] for r in sample['steering']]
+    check(len(names) == 8 and names.count('Lab01 - Teams') == 1,
+          'observation stores each logical policy once')
+    t = [r for r in sample['steering'] if r['logical_name'] == 'Lab01 - Teams'][0]
+    check(t['preferred_wan_uid'] == 'sdwan-hub0_1ea0ac' and
+          t['preferred_flows'] == 12,
+          'observation carries canonical WAN + flows once')
+    defs = svc._config_store.current('steering_definitions')['payload']
+    teams = [d for d in defs if d['logical_name'] == 'Lab01 - Teams'][0]
+    check([b['traffic_class'] for b in teams['branches']] ==
+          ['Best Effort (Data traffic)', 'Interactive (Real-time traffic)'],
+          'branch summary lives in the versioned steering definition')
+
+
+# -------------------------------------------------------------------------
+# v0.3.0: telemetry, cellular, SWANS dedupe, acquisition model
+# -------------------------------------------------------------------------
+
+import copy                                # noqa: E402
+import hashlib                             # noqa: E402
+import json                                # noqa: E402
+import time                                # noqa: E402
+import threading                           # noqa: E402
+from analyzer import cellular, telemetry, service as service_mod  # noqa: E402,E501
+from analyzer import storage               # noqa: E402
+
+
+class _fake_collectors(object):
+    """Patch collectors.collect_keys: serve fixtures, record every call."""
+
+    def __init__(self, overrides=None):
+        self.calls = []
+        self.overrides = overrides if overrides is not None else {}
+
+    def __enter__(self):
+        self._saved = collectors.collect_keys
+        data = dict(fixtures.base_raw())
+        data.update(fixtures.heavy_raw())
+
+        def fake(keys):
+            keys = tuple(keys)
+            self.calls.append(keys)
+            data.update(self.overrides)
+            return {k: collectors.CollectResult(True, value=data.get(k))
+                    for k in keys}
+        collectors.collect_keys = fake
+        return self
+
+    def __exit__(self, *exc):
+        collectors.collect_keys = self._saved
+
+
+class _Clock(object):
+    def __init__(self, t=1790380800):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def _stats(i, o, ip, op, ie=0, oe=0, idr=0, odr=0):
+    return {'in': i, 'out': o, 'ipackets': ip, 'opackets': op,
+            'ierrors': ie, 'oerrors': oe, 'idrops': idr, 'odrops': odr,
+            'multicast': 0, 'collisions': 0}
+
+
+def _devices_with_stats(scale=1):
+    devs = copy.deepcopy(fixtures.WAN_DEVICES)
+    devs['ethernet-wan']['stats'] = _stats(1000 * scale, 2000 * scale,
+                                           10 * scale, 20 * scale, 1, 2, 3, 4)
+    devs['sdwan-hub0_wan']['stats'] = _stats(500 * scale, 600 * scale,
+                                             5 * scale, 6 * scale)
+    devs['wbond-wbond0_hub0']['stats'] = _stats(900 * scale, 800 * scale,
+                                                9 * scale, 8 * scale)
+    return devs
+
+
+NSA_DIAG = {
+    'CARRID': 'Verizon', 'SRVC_TYPE': '5G', 'SRVC_TYPE_DETAILS': 'NSA',
+    'RFBAND': 'Band 66', 'RFCHANNEL': '66486', 'LTEBANDWIDTH': '20 MHz',
+    'RSRP': -90, 'RSRQ': -11, 'SINR': 10, 'PHY_CELL_ID': '101',
+    'CELL_ID': '123456789',
+    'RFBAND_5G': 'n77', 'RFBANDWIDTH_5G': '100 MHz', 'RFCHANNEL_5G': '650000',
+    'RSRP_5G': -95, 'RSRQ_5G': -12, 'SINR_5G': 8, 'PHY_CELL_ID_5G': '202',
+    'BAND_SCELL0': 'Band 2', 'BANDWIDTH_SCELL0': '10 MHz',
+    'CHANNEL_SCELL0': '900', 'ACTIVE_SCELL0': 'active',
+    'BAND_5G_SCELL0': 'n41', 'BANDWIDTH_5G_SCELL0': '0 MHz',
+    'CHANNEL_5G_SCELL0': '500000', 'ACTIVE_5G_SCELL0': 'active',
+    'IMEI': '350000000000001', 'IMSI': '310260000000000',
+    'ICCID': '8901000000000', 'MDN': '5551234567', 'GPS': '37.0,-122.0',
+}
+
+
+def test_interface_stats_normalization():
+    print('test_interface_stats_normalization')
+    recs, counters = telemetry.interface_records(
+        _devices_with_stats(), {}, 1790380800)
+    by = {r['uid']: r for r in recs}
+    check(set(by) == {'ethernet-wan', 'sdwan-hub0_wan', 'wbond-wbond0_hub0'},
+          'only devices exposing stats are reported')
+    check(by['ethernet-wan']['object_class'] == 'physical' and
+          by['sdwan-hub0_wan']['object_class'] == 'sdwan' and
+          by['wbond-wbond0_hub0']['object_class'] == 'wbond',
+          'physical/sdwan/wbond object classes')
+    e = by['ethernet-wan']
+    check((e['rx_bytes'], e['tx_bytes'], e['rx_packets'], e['tx_packets'])
+          == (1000, 2000, 10, 20), 'in/out/ipackets/opackets mapped')
+    check((e['rx_errors'], e['tx_errors'], e['rx_drops'], e['tx_drops'])
+          == (1, 2, 3, 4), 'errors/drops mapped by documented name')
+    check(e['connection_state'] == 'connected', 'connection_state carried')
+    check(by['wbond-wbond0_hub0']['rx_bytes'] == 900 and
+          by['sdwan-hub0_wan']['tx_packets'] == 6,
+          'sdwan + wbond counters normalized')
+    check(all(r['metric_ts'] == 1790380800 == r['collected_ts'] and
+              r['timestamp_source'] == 'collector' for r in recs),
+          'collector timestamp envelope')
+    check(not any('mbps' in k or 'rate' in k for r in recs for k in r),
+          'no rates computed')
+    check(all(r['reset_suspected'] is False for r in recs),
+          'first observation: no reset suspected')
+    check(counters['ethernet-wan']['rx_bytes'] == 1000, 'counters returned')
+
+
+def test_counter_decrease_reset_suspected():
+    print('test_counter_decrease_reset_suspected')
+    _, prev = telemetry.interface_records(
+        _devices_with_stats(2), {}, 100)
+    recs, _ = telemetry.interface_records(_devices_with_stats(1), prev, 200)
+    check(all(r['reset_suspected'] is True for r in recs),
+          'decreased counters -> reset_suspected = true')
+    check(all(r['rx_bytes'] >= 0 for r in recs) and
+          not any('delta' in k for r in recs for k in r),
+          'no negative deltas exposed')
+    recs2, _ = telemetry.interface_records(_devices_with_stats(3), prev, 300)
+    check(all(r['reset_suspected'] is False for r in recs2),
+          'increasing counters -> not suspected')
+
+
+def test_cellular_ca_parsing():
+    print('test_cellular_ca_parsing')
+    rec = cellular.normalize_cellular('mdm-1', NSA_DIAG, 50, 60, 'collector')
+    check(rec['service_mode'] == '5G NSA', 'service mode 5G NSA')
+    check(rec['carrier'] == 'Verizon', 'carrier')
+    check(rec['carrier_count'] == 4, 'NSA component carriers: 4 (got {})'.format(
+        rec['carrier_count']))
+    rats = sorted(c['rat'] for c in rec['carriers'])
+    check(rats == ['LTE', 'LTE', 'NR', 'NR'], 'LTE anchor + NR components')
+    check(rec['total_active_mhz'] == 130.0,
+          'total active MHz = 130 (got {})'.format(rec['total_active_mhz']))
+    check(rec['zero_mhz_count'] == 1, 'zero-MHz placeholder counted')
+    zero = [c for c in rec['carriers'] if c['bandwidth_mhz'] == 0]
+    check(len(zero) == 1 and zero[0]['band'] == 'n41',
+          'zero-MHz carrier kept, contributes no MHz')
+    check(rec['serving_band'] == 'Band 66' and
+          rec['serving_bandwidth_mhz'] == 20.0, 'serving band from pcell')
+    check((rec['rsrp'], rec['rsrq'], rec['sinr']) == (-90, -11, 10) and
+          (rec['rsrp_5g'], rec['rsrq_5g'], rec['sinr_5g']) == (-95, -12, 8),
+          'LTE and 5G signal fields')
+    check(set(rec['carriers'][0]) == {'role', 'rat', 'band', 'bandwidth_mhz',
+                                      'channel', 'pci', 'active'},
+          'carrier entry fields')
+    check(rec['timestamp_source'] == 'collector' and rec['metric_ts'] == 50
+          and rec['collected_ts'] == 60, 'timestamp envelope')
+
+
+def test_ca_signature_ignores_roles():
+    print('test_ca_signature_ignores_roles')
+    carriers = cellular._parse_active_carriers(NSA_DIAG)
+    swapped = [dict(c, role='x{}'.format(i)) for i, c in
+               enumerate(reversed(carriers))]
+    check(cellular.ca_signature(carriers) == cellular.ca_signature(swapped),
+          'signature independent of role names and order')
+    fewer = carriers[:-1]
+    check(cellular.ca_signature(fewer) != cellular.ca_signature(carriers),
+          'signature changes when the carrier set changes')
+
+
+def test_cell_hash_deterministic():
+    print('test_cell_hash_deterministic')
+    h1 = cellular.cell_key_hash('Verizon', '5G NSA', '123456789', '101',
+                                'Band 66')
+    h2 = cellular.cell_key_hash('Verizon', '5G NSA', '123456789', '101',
+                                'Band 66')
+    expect = hashlib.sha256(
+        b'Verizon|5G NSA|123456789|101|Band 66').hexdigest()[:16]
+    check(h1 == h2 == expect, 'deterministic SHA-256 prefix')
+    check(h1 != cellular.cell_key_hash('Verizon', '5G NSA', '123456780',
+                                       '101', 'Band 66'),
+          'different cell -> different hash')
+    check(cellular.cell_key_hash('Verizon', 'LTE', None, '1', 'B2') is None,
+          'no cell id -> no hash')
+    rec = cellular.normalize_cellular('mdm-1', NSA_DIAG, 1, 1)
+    check(rec['cell_key_hash'] == h1, 'record carries the hash')
+
+
+def test_cellular_sensitive_fields_excluded():
+    print('test_cellular_sensitive_fields_excluded')
+    rec = cellular.normalize_cellular('mdm-1', NSA_DIAG, 1, 1)
+    blob = json.dumps(rec)
+    for secret in ('350000000000001', '310260000000000', '8901000000000',
+                   '5551234567', '37.0,-122.0', '123456789'):
+        check(secret not in blob, 'value not persisted: {}'.format(secret[:4]))
+    for key in ('IMEI', 'IMSI', 'ICCID', 'MDN', 'GPS', 'CELL_ID',
+                'NR_CELL_ID', 'cell_id'):
+        check(key not in blob, 'field not persisted: {}'.format(key))
+    bare = copy.deepcopy(fixtures.WAN_DEVICES)
+    for d in bare.values():
+        d.pop('diagnostics', None)
+    check(telemetry.cellular_records(bare, 5) == [],
+          'devices without diagnostics produce no record')
+    devs = copy.deepcopy(fixtures.WAN_DEVICES)
+    devs['mdm-1ea0ac']['diagnostics'] = dict(NSA_DIAG)
+    recs = telemetry.cellular_records(devs, 5)
+    check(len(recs) == 2 and all(r['uid'].startswith('mdm') for r in recs),
+          'cellular records for mdm devices with diagnostics')
+
+
+def _swans(entries):
+    return {'history': [
+        {'epoch': ep, 'upd_status': [
+            {'wandev': uid, 'criteria': {'Latency': lat, 'Jitter': 1.0}}
+            for uid, lat in ups]} for ep, ups in entries]}
+
+
+def test_swans_dedupe():
+    print('test_swans_dedupe')
+    seen = telemetry.BoundedSeen()
+    resp = _swans([(30, [('a', 10.0)]), (10, [('a', 9.0), ('b', 5.0)]),
+                   (30, [('a', 10.0)]),            # dup within response
+                   (20, [('a', 9.5)])])
+    out = telemetry.swans_new_samples(resp, seen, 999)
+    check([(r['uid'], r['metric_ts']) for r in out] ==
+          [('a', 10), ('b', 10), ('a', 20), ('a', 30)],
+          'within-response duplicates removed, all history walked, sorted')
+    check(all(r['timestamp_source'] == 'ncos' and r['collected_ts'] == 999
+              for r in out), 'ncos timestamp envelope')
+    check(telemetry.swans_new_samples(resp, seen, 1000) == [],
+          'same response again -> nothing new (across polls)')
+    resp2 = _swans([(30, [('a', 10.0)]), (40, [('a', 8.0), ('b', 6.0)])])
+    out2 = telemetry.swans_new_samples(resp2, seen, 1001)
+    check([(r['uid'], r['metric_ts']) for r in out2] ==
+          [('a', 40), ('b', 40)], 'only unseen (uid, epoch) persisted')
+    check(out2[0]['latency_ms'] == 8.0 and 'jitter_ms' in out2[0],
+          'latency/jitter normalized')
+
+
+def test_qoe_wbond_telemetry():
+    print('test_qoe_wbond_telemetry')
+    q = telemetry.qoe_records(fixtures.QOE, 77)
+    check(len(q) == 2 and all(r['timestamp_source'] == 'collector' and
+                              r['metric_ts'] == 77 for r in q),
+          'QoE uses collector timestamp')
+    check(q[0]['pkt_loss_stats_raw'] is not None, 'packet-loss kept raw')
+    bonds = normalize.wan_bonding_detail(fixtures.WAN_BONDING)
+    w = telemetry.wbond_runtime(bonds, 77)
+    check(len(w) >= 1 and w[0]['members'], 'wbond runtime with members')
+    m = w[0]['members'][0]
+    check(set(m) == {'member_uid', 'configured_weight',
+                     'current_download_weight', 'current_upload_weight',
+                     'download_flows', 'upload_flows', 'has_loss',
+                     'link_state', 'attach_state'}, 'member fields')
+    blob = json.dumps(w)
+    check('ds_curr_bw' not in blob and 'last_bw_sample' not in blob and
+          'trend' not in blob, 'raw BW fields not persisted as throughput')
+
+
+def _fresh(clock=None):
+    return AnalyzerService(clock=clock or _Clock())
+
+
+def test_startup_collection_and_sources():
+    print('test_startup_collection_and_sources')
+    svc = _fresh()
+    check(svc.snapshot() is None, 'no data before startup')
+    with _fake_collectors() as fc:
+        obs = svc.collect_startup()
+        check(obs['sample_source'] == 'startup', 'startup source tag')
+        check(svc.snapshot() is not None, 'startup makes snapshot available')
+        check(len(fc.calls) == 1 and 'identities_ip' in fc.calls[0] and
+              'wan_devices' in fc.calls[0],
+              'startup reads runtime + config once')
+        check(svc.next_scheduled_ts() is not None, 'schedule armed')
+        sched = svc.collect_scheduled()
+        check(sched['sample_source'] == 'scheduled', 'scheduled source tag')
+        started = svc.start_recording('t', max_duration_sec=60)
+        svc.recording_tick()
+        rec = svc.recording_samples(started['recording']['job_id'])[-1]
+        check(rec['sample_source'] == 'recording' and
+              rec['job_id'] == started['recording']['job_id'],
+              'recording source tag + job_id')
+    srcs = [o['sample_source'] for o in svc.history()]
+    check(srcs == ['startup', 'scheduled'] and
+          set(srcs) <= set(service_mod.SAMPLE_SOURCES),
+          'all persisted observations carry a source tag')
+
+
+def test_schedule_selection():
+    print('test_schedule_selection')
+    clock = _Clock(1790380800 + 7 * 60)
+    svc = _fresh(clock)
+    check(svc.schedule_minutes() == 15, 'default 15 minutes')
+    check(service_mod.SCHEDULE_CHOICES == (5, 15, 30, 60),
+          'choices are 5/15/30/60')
+    for m in (5, 15, 30, 60):
+        check(svc.set_schedule_minutes(m) is True and
+              svc.schedule_minutes() == m, '{} min accepted'.format(m))
+    for bad in (1, 2, 10, 120, 0, None, '15'):
+        check(svc.set_schedule_minutes(bad) is False,
+              'rejected: {!r}'.format(bad))
+    check(svc.schedule_minutes() == 60, 'rejected values leave schedule')
+    svc.set_schedule_minutes(15)
+    nxt = svc.next_scheduled_ts()
+    off = time.localtime(clock.t).tm_gmtoff or 0
+    check(nxt > clock.t and (nxt + off) % (15 * 60) == 0 and
+          nxt - clock.t <= 15 * 60, 'next run aligned to the 15-min boundary')
+    check(not svc.scheduled_due(nxt - 1) and svc.scheduled_due(nxt),
+          'due exactly at the boundary')
+    check(AnalyzerService(schedule_minutes=1).schedule_minutes() == 15,
+          'invalid constructor interval falls back to default')
+
+
+def test_no_legacy_polling():
+    print('test_no_legacy_polling')
+    svc = _fresh()
+    for name in ('fast_interval', 'slow_interval', 'refresh_base',
+                 'refresh_heavy', 'build_snapshot', 'record_snapshot'):
+        check(not hasattr(svc, name), 'legacy API removed: {}'.format(name))
+    check(not hasattr(collectors, 'collect_base_snapshot') and
+          not hasattr(collectors, 'collect_heavy_snapshot'),
+          'legacy fast/slow collector passes removed')
+    clock = _Clock()
+    svc = _fresh(clock)
+    with _fake_collectors() as fc:
+        svc.collect_startup()
+        n = len(fc.calls)
+        for dt in (15, 30, 300, 840):
+            clock.t += dt
+            svc.snapshot(); svc.section('wan'); svc.status(); svc.history()
+            check(not svc.scheduled_due(clock.t) or dt >= 840,
+                  'not due {}s after startup'.format(dt))
+        check(len(fc.calls) == n,
+              'reads (snapshot/section/status/history) never collect')
+    src = open(os.path.join(_APP_DIR, 'sdwan_analyzer.py')).read()
+    check('refresh_base' not in src and 'fast_interval' not in src and
+          'slow_interval' not in src, 'main loop has no fast/slow cadence')
+
+
+def test_scheduled_config_reconcile():
+    print('test_scheduled_config_reconcile')
+    clock = _Clock()
+    svc = _fresh(clock)
+    with _fake_collectors() as fc:
+        svc.collect_startup()
+        svc.collect_scheduled()
+        check('identities_ip' not in fc.calls[1],
+              'scheduled sample skips static config reads')
+        clock.t += 3600
+        svc.collect_scheduled()
+        check('identities_ip' in fc.calls[2],
+              'config re-read on ~60 min reconciliation')
+
+
+def test_manual_refresh_targeted():
+    print('test_manual_refresh_targeted')
+    clock = _Clock()
+    svc = _fresh(clock)
+    with _fake_collectors() as fc:
+        svc.collect_startup()
+        due = svc.next_scheduled_ts()
+        r = svc.refresh('traffic_classes')
+        check(r['ok'] and r['refresh_group'] == 'traffic_classes' and
+              set(('refresh_ts', 'duration_ms', 'collector_errors')) <= set(r),
+              'refresh metadata returned')
+        check(set(fc.calls[-1]) == {'identities_intent',
+                                    'traffic_class_config'},
+              'traffic_classes reads only its endpoints')
+        obs = svc.history()[-1]
+        check(obs['sample_source'] == 'manual' and
+              obs['refresh_group'] == 'traffic_classes',
+              'manual source tagging')
+        check('interfaces' not in obs and 'swans_samples' not in obs,
+              'targeted refresh yields a partial observation')
+        check(svc.next_scheduled_ts() == due and
+              svc.schedule_minutes() == 15,
+              'manual refresh does not alter the schedule')
+        again = svc.refresh('traffic_classes')
+        check(not again['ok'] and again['error'] == 'cooldown' and
+              len(fc.calls) == 2, 'cooldown rejects repeat within 5 s')
+        check(svc.refresh('steering')['ok'], 'cooldown is per group')
+        check(set(fc.calls[-1]) == {'steering_rules', 'steering_events',
+                                    'steering_stats', 'steering_intents',
+                                    'identities_ip'}, 'steering group keys')
+        clock.t += 6
+        check(svc.refresh('traffic_classes')['ok'], 'allowed after cooldown')
+        svc.refresh('bonding')
+        check(set(fc.calls[-1]) == {'wan_devices', 'wan_bonding'},
+              'bonding group keys')
+        svc.refresh('wan_paths')
+        check({'wan_devices', 'primary_device', 'swans', 'qoe'} ==
+              set(fc.calls[-1]), 'wan_paths group keys')
+        svc.refresh('overview')
+        check('wan_devices' in fc.calls[-1] and 'qoe' in fc.calls[-1],
+              'overview reads current-state endpoints')
+        bad = svc.refresh('nope')
+        check(not bad['ok'] and 'error' in bad, 'unknown group rejected')
+
+
+def test_config_version_change_only():
+    print('test_config_version_change_only')
+    clock = _Clock()
+    svc = _fresh(clock)
+    with _fake_collectors() as fc:
+        o1 = svc.collect_startup()
+        o2 = svc.collect_scheduled()
+        v1 = o1['config_versions']['traffic_classes']
+        v2 = o2['config_versions']['traffic_classes']
+        check(v1['version'] == v2['version'] == 1 and v1['changed'] and
+              not v2['changed'], 'identical config -> no new version')
+        check(len(svc._config_store.versions('traffic_classes')) == 1 and
+              len(svc._config_store.versions('steering_definitions')) == 1,
+              'static objects stored once, not per sample')
+        check(set(o2['config_versions']) >= {
+            'traffic_classes', 'destinations', 'wan_rules',
+            'steering_definitions', 'wbond_config', 'overlay_underlay',
+            'capabilities'}, 'all static object kinds versioned')
+        intents = copy.deepcopy(fixtures.IDENTITIES_INTENT)
+        for c in intents[fixtures.INTENT_RT_ID]['criteria']:
+            if c['criterion'] == 'Latency':
+                c['threshold'] = 500
+        fc.overrides['identities_intent'] = intents
+        clock.t += 3600
+        o3 = svc.collect_scheduled()
+        v3 = o3['config_versions']['traffic_classes']
+        check(v3['changed'] and v3['version'] == 2,
+              'semantic change -> new version')
+        check(o3['config_versions']['wbond_config']['version'] == 1,
+              'unrelated config versions unchanged')
+
+
+def test_steering_events_once():
+    print('test_steering_events_once')
+    svc = _fresh()
+    with _fake_collectors():
+        o1 = svc.collect_startup()
+        o2 = svc.collect_scheduled()
+    n1 = len(o1['steering_events'])
+    check(n1 >= 1 and all(e['timestamp_source'] == 'ncos' for e in
+                          o1['steering_events']),
+          'events stored with ncos epoch (got {})'.format(n1))
+    check(o2['steering_events'] == [], 'events stored only once')
+    check('raw' not in json.dumps(o1['steering_events']),
+          'event records are compact')
+
+
+def test_cache_updated_by_collection_only():
+    print('test_cache_updated_by_collection_only')
+    clock = _Clock()
+    svc = _fresh(clock)
+    with _fake_collectors() as fc:
+        svc.collect_startup()
+        t1 = svc.snapshot()['timestamp']
+        clock.t += 1
+        before = len(fc.calls)
+        check(svc.snapshot()['timestamp'] == t1 and len(fc.calls) == before,
+              'UI reads latest saved state without collecting')
+        svc.refresh('wan_paths')
+        check(svc.snapshot() is not None and len(fc.calls) == before + 1,
+              'manual refresh updates the cache')
+
+
+def test_collector_timeout_bound():
+    print('test_collector_timeout_bound')
+    saved_get, saved_to = collectors.cp.get, collectors.READ_TIMEOUT_S
+    release = []
+
+    def slow_get(path, *a, **k):
+        t0 = time.time()
+        while not release and time.time() - t0 < 2:
+            time.sleep(0.02)
+        return {'ok': 1}
+    collectors.cp.get = slow_get
+    collectors.READ_TIMEOUT_S = 0.2
+    try:
+        t0 = time.time()
+        res = collectors._get_result('status/wan/devices')
+        check(not res.ok and 'timeout' in res.error and time.time() - t0 < 1,
+              'hung read bounded by wall-clock timeout')
+        res2 = collectors._get_result('status/wan/primary_device')
+        check(not res2.ok and 'busy' in res2.error,
+              'follow-up reads fail fast while one is hung')
+        release.append(1)
+        time.sleep(0.2)
+        collectors.cp.get = lambda path, *a, **k: {'ok': 2}
+        res3 = collectors._get_result('status/wan/devices')
+        check(res3.ok and res3.value == {'ok': 2},
+              'reads recover after the hung call finishes')
+    finally:
+        release.append(1)
+        collectors.cp.get, collectors.READ_TIMEOUT_S = saved_get, saved_to
+        time.sleep(0.1)
+
+
+# -------------------------------------------------------------------------
+# v0.3.1: current state vs observation, freshness, health
+# -------------------------------------------------------------------------
+
+_SECTIONS = ('wan', 'cellular', 'swans', 'qoe', 'bonding',
+             'traffic_steering', 'traffic_classes')
+
+
+def _intents_changed():
+    intents = copy.deepcopy(fixtures.IDENTITIES_INTENT)
+    for c in intents[fixtures.INTENT_RT_ID]['criteria']:
+        if c['criterion'] == 'Latency':
+            c['threshold'] = 500
+    return intents
+
+
+def _scheduled_then_manual(group='traffic_classes', overrides=None):
+    clock = _Clock()
+    svc = _fresh(clock)
+    fc = _fake_collectors()
+    fc.__enter__()
+    svc.collect_startup()
+    clock.t += 1080                      # 18:00 -> 18:18
+    svc.collect_scheduled()
+    full = svc.snapshot()
+    clock.t += 420                       # +7 min
+    fc.overrides.update(overrides or {})
+    r = svc.refresh(group)
+    return svc, fc, clock, full, r
+
+
+def test_scheduled_establishes_current_state():
+    print('test_scheduled_establishes_current_state')
+    clock = _Clock()
+    svc = _fresh(clock)
+    with _fake_collectors():
+        svc.collect_startup()
+        clock.t += 900
+        svc.collect_scheduled()
+    snap = svc.snapshot()
+    fr = snap['section_freshness']
+    check(all(k in fr for k in _SECTIONS), 'freshness for every major section')
+    check(all(v['sample_source'] == 'scheduled' and
+              v['collected_ts'] == clock.t for k, v in fr.items()
+              if k != 'traffic_classes' and k != 'loadbalancers'),
+          'runtime sections stamped by the scheduled pass')
+    check(fr['traffic_classes']['sample_source'] == 'startup',
+          'static section keeps the startup stamp (not re-read)')
+    check(snap['wan']['paths'] and snap['bonding']['bonds'] and
+          snap['qoe']['paths'], 'current state populated')
+    check(svc.status()['section_freshness'] == fr, 'status exposes freshness')
+
+
+def test_partial_manual_refresh_keeps_current_state():
+    print('test_partial_manual_refresh_keeps_current_state')
+    svc, fc, clock, full, r = _scheduled_then_manual(
+        'traffic_classes', {'identities_intent': _intents_changed()})
+    try:
+        check(r['ok'], 'refresh accepted')
+        obs = svc.history()[-1]
+        check(obs['sample_source'] == 'manual' and
+              not any(k in obs for k in ('wan', 'interfaces', 'cellular',
+                                         'wbond', 'steering', 'qoe',
+                                         'swans_samples')),
+              'persisted observation stays partial')
+        check('config_versions' in obs, 'partial observation has config refs')
+        cur = svc.snapshot()
+        for sec in ('wan', 'bonding', 'qoe', 'traffic_steering'):
+            check(cur[sec] == full[sec],
+                  'current {} unchanged by traffic_classes refresh'.format(sec))
+        check(cur['traffic_classes'] != full['traffic_classes'],
+              'current traffic classes reflect the newer refresh')
+        fr = cur['section_freshness']
+        check(fr['traffic_classes'] == {'collected_ts': clock.t,
+                                        'sample_source': 'manual'},
+              'traffic_classes freshness advanced, source=manual')
+        for sec in ('wan', 'cellular', 'swans', 'qoe', 'bonding',
+                    'traffic_steering'):
+            check(fr[sec]['collected_ts'] == clock.t - 420 and
+                  fr[sec]['sample_source'] == 'scheduled',
+                  '{} freshness not advanced (source scheduled)'.format(sec))
+    finally:
+        fc.__exit__()
+
+
+def test_bonding_refresh_leaves_unrelated_intact():
+    print('test_bonding_refresh_leaves_unrelated_intact')
+    svc, fc, clock, full, r = _scheduled_then_manual('bonding')
+    try:
+        cur = svc.snapshot()
+        check(cur['traffic_classes'] == full['traffic_classes'] and
+              cur['identities'] == full['identities'] and
+              cur['wan']['config'] == full['wan']['config'],
+              'config-derived sections intact after bonding refresh')
+        check(cur['traffic_steering'] == full['traffic_steering'] and
+              cur['qoe'] == full['qoe'], 'steering/QoE intact')
+        fr = cur['section_freshness']
+        check(fr['bonding']['sample_source'] == 'manual' and
+              fr['bonding']['collected_ts'] == clock.t and
+              fr['qoe']['sample_source'] == 'scheduled' and
+              fr['traffic_classes']['sample_source'] == 'startup',
+              'only bonding (and its devices) freshness advanced')
+        obs = svc.history()[-1]
+        check('wbond' in obs and 'qoe' not in obs and 'steering' not in obs,
+              'bonding observation partial')
+    finally:
+        fc.__exit__()
+
+
+def test_failed_section_does_not_advance_freshness():
+    print('test_failed_section_does_not_advance_freshness')
+    clock = _Clock()
+    svc = _fresh(clock)
+    with _fake_collectors():
+        svc.collect_startup()
+    t0 = clock.t
+    clock.t += 60
+    saved = collectors.collect_keys
+    collectors.collect_keys = lambda keys: {
+        k: collectors.CollectResult(False, error='x', error_type='timeout')
+        for k in keys}
+    try:
+        svc.collect_scheduled()
+    finally:
+        collectors.collect_keys = saved
+    fr = svc.snapshot()['section_freshness']
+    check(all(v['collected_ts'] == t0 for v in fr.values()),
+          'failed collection does not manufacture freshness')
+    check(svc.snapshot()['wan']['paths'], 'last-known-good state retained')
+
+
+def test_api_after_partial_refresh():
+    print('test_api_after_partial_refresh')
+    import threading
+    import urllib.request
+    from http.server import HTTPServer
+    from analyzer import web
+    svc, fc, clock, full, _ = _scheduled_then_manual('bonding')
+    port = _free_port()
+    httpd = HTTPServer(('127.0.0.1', port), web._make_handler(svc))
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        clock.t += 6
+        fc.overrides['identities_intent'] = _intents_changed()
+        req = urllib.request.Request(
+            'http://127.0.0.1:{}/api/refresh/traffic_classes'.format(port),
+            method='POST')
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode('utf-8'))
+        check(body['ok'] and body['refresh_group'] == 'traffic_classes',
+              'POST /api/refresh/traffic_classes ok')
+        for path, sec in (('/api/wan', 'wan'), ('/api/bonding', 'bonding'),
+                          ('/api/qoe', 'qoe'),
+                          ('/api/traffic_steering', 'traffic_steering')):
+            code, data = _http_json(port, path)
+            check(code == 200 and data == full[sec] or
+                  (sec == 'bonding' and code == 200 and data['bonds']),
+                  'GET {} still returns prior content'.format(path))
+        code, tcs = _http_json(port, '/api/traffic_classes')
+        check(tcs != full['traffic_classes'], 'traffic classes updated')
+        code, snap = _http_json(port, '/api/snapshot')
+        check(snap['section_freshness']['traffic_classes']['sample_source']
+              == 'manual' and snap['wan']['paths'],
+              '/api/snapshot is the merged current state')
+        code, hist = _http_json(port, '/api/history')
+        check(hist['samples'][-1]['sample_source'] == 'manual' and
+              'wan' not in hist['samples'][-1],
+              '/api/history serves the partial persisted observation')
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        fc.__exit__()
+
+
+def test_loadbalancer_expensive_runtime():
+    print('test_loadbalancer_expensive_runtime')
+    check(collectors.key_class('loadbalancers') ==
+          'expensive_runtime', 'loadbalancers classified expensive_runtime')
+    check(collectors.key_class('wan_rules2') == 'static_config' and
+          collectors.key_class('wan_devices') == 'runtime',
+          'other classes unchanged')
+    check('loadbalancers' not in collectors.RUNTIME_KEYS,
+          'not in the per-observation runtime set')
+    check('loadbalancers' in collectors.CONFIG_KEYS,
+          'still read at startup/reconciliation only')
+    check('loadbalancers' not in collectors.STATIC_CONFIG_KEYS,
+          'not treated as static configuration')
+    clock = _Clock()
+    svc = _fresh(clock)
+    with _fake_collectors() as fc:
+        svc.collect_startup()
+        svc.collect_scheduled()
+        check('loadbalancers' not in fc.calls[1],
+              'not read by a normal scheduled sample')
+        check(svc.refresh('loadbalancers')['ok'] and
+              fc.calls[-1] == ('loadbalancers',),
+              'targeted manual refresh available')
+
+
+def test_health_error_types():
+    print('test_health_error_types')
+    cache = service_mod._RawCache()
+    R = collectors.CollectResult
+    cache.update(lambda: {'a': R(True, value=1), 'b': R(True, value=1),
+                          'c': R(True, value=1)})
+    cache.update(lambda: {
+        'a': R(False, error='timeout after 15s', error_type='timeout'),
+        'b': R(False, error='collector busy', error_type='busy'),
+        'c': R(False, error='boom', error_type='api_error')})
+    h = cache.health()
+    check((h['a']['error_type'], h['b']['error_type'], h['c']['error_type'])
+          == ('timeout', 'busy', 'api_error'),
+          'timeout / busy / api_error distinguished')
+    check(h['a']['last_success_ts'] is not None and
+          h['a']['last_error_ts'] is not None and
+          h['a']['last_error'] == 'timeout after 15s',
+          'last_success/last_error fields')
+    cache.update(lambda: {'a': R(True, value=2)})
+    h = cache.health()
+    check(h['a']['error'] is None and h['a']['error_type'] is None and
+          h['a']['last_error_type'] == 'timeout',
+          'current error clears, last_error history retained')
+
+
+def test_timeout_busy_types_and_single_worker():
+    print('test_timeout_busy_types_and_single_worker')
+    saved_get, saved_to = collectors.cp.get, collectors.READ_TIMEOUT_S
+    release, calls = [], []
+
+    def slow_get(path, *a, **k):
+        calls.append(path)
+        t0 = time.time()
+        while not release and time.time() - t0 < 2:
+            time.sleep(0.02)
+        return {}
+    collectors.cp.get = slow_get
+    collectors.READ_TIMEOUT_S = 0.15
+    try:
+        base = threading.active_count()
+        r1 = collectors._get_result('status/wan/devices')
+        check(r1.error_type == 'timeout', 'timeout typed as timeout')
+        rs = [collectors._get_result('status/wan/swans') for _ in range(5)]
+        check(all(r.error_type == 'busy' for r in rs),
+              'later reads typed as busy')
+        check(len(calls) == 1 and threading.active_count() <= base + 1,
+              'no overlapping worker threads while one call is pending')
+        k = collectors.collect_keys(('wan_devices', 'qoe'))
+        check(all(r.error_type == 'busy' for r in k.values()) and
+              len(calls) == 1, 'whole passes fail fast, no new threads')
+        collectors.cp.get = lambda p, *a, **kw: (_ for _ in ()).throw(
+            RuntimeError('x'))
+        release.append(1)
+        time.sleep(0.3)
+        r2 = collectors._get_result('status/wan/devices')
+        check(r2.error_type == 'api_error', 'raised error typed api_error')
+    finally:
+        release.append(1)
+        collectors.cp.get, collectors.READ_TIMEOUT_S = saved_get, saved_to
+        time.sleep(0.1)
+
+
+# -------------------------------------------------------------------------
+# v0.3.2: Recording jobs
+# -------------------------------------------------------------------------
+
+from analyzer import recording as rec_mod  # noqa: E402
+
+_STATIC = collectors.STATIC_CONFIG_KEYS
+
+
+class _RecEnv(object):
+    """Service + fake collectors that log (clock, keys) and concurrency."""
+
+    def __init__(self, fail=(), t0=1790380800):
+        self.clock = _Clock(t0)
+        self.svc = _fresh(self.clock)
+        self.log = []
+        self.overrides = {}
+        self.fail = set(fail)
+        self.active = 0
+        self.max_active = 0
+        self._saved = None
+
+    def __enter__(self):
+        self._saved = collectors.collect_keys
+        data = dict(fixtures.base_raw())
+        data.update(fixtures.heavy_raw())
+
+        def fake(keys):
+            keys = tuple(keys)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.log.append((self.clock.t, keys))
+            data.update(self.overrides)
+            out = {}
+            for k in keys:
+                if k in self.fail:
+                    out[k] = collectors.CollectResult(
+                        False, error='boom', error_type='api_error')
+                else:
+                    out[k] = collectors.CollectResult(True, value=data.get(k))
+            self.active -= 1
+            return out
+        collectors.collect_keys = fake
+        return self
+
+    def __exit__(self, *exc):
+        collectors.collect_keys = self._saved
+
+    def run(self, seconds):
+        for _ in range(seconds):
+            self.svc.recording_tick()
+            self.clock.t += 1
+
+    def calls(self, keys):
+        return [t for t, k in self.log if k == tuple(keys)]
+
+
+def test_recording_start_validation():
+    print('test_recording_start_validation')
+    with _RecEnv() as env:
+        svc = env.svc
+        r = svc.start_recording('speed test', 'notes', 600, created_by_ui=True)
+        job = r['recording']
+        check(r['ok'] and job['state'] == 'recording' and
+              job['max_duration_sec'] == 600 and job['label'] == 'speed test'
+              and job['created_by_ui'] is True and job['ended_ts'] is None and
+              job['sample_profile'] == 'default_v1' and
+              job['stop_reason'] is None and job['job_id'].startswith('rec-'),
+              'valid start creates a recording job')
+        dup = svc.start_recording('x', max_duration_sec=60)
+        check(not dup['ok'] and dup['error'] == 'active_exists',
+              'second simultaneous Recording rejected')
+        svc.stop_recording(job['job_id'])
+        for bad in (0, -1, 1801, 99999, 'abc', True, None.__class__):
+            res = svc.start_recording('x', max_duration_sec=bad)
+            check(not res['ok'] and res['error'] == 'invalid',
+                  'rejected duration {!r}'.format(bad))
+        check(svc.start_recording('x', max_duration_sec=1800)['ok'],
+              'exactly 30 minutes accepted')
+        check(rec_mod.MAX_DURATION_SEC == 1800, 'hard cap is 1800 s')
+        ids = [j['job_id'] for j in svc.list_recordings()]
+        check(len(ids) == len(set(ids)) == 2, 'job ids unique')
+
+
+def test_recording_backend_owns_clock():
+    print('test_recording_backend_owns_clock')
+    with _RecEnv() as env:
+        svc = env.svc
+        job = svc.start_recording('t', max_duration_sec=300)['recording']
+        a0 = svc.active_recording()
+        env.clock.t += 120              # client gone; no tick needed for time
+        a1 = svc.active_recording()
+        env.clock.t += 60
+        a2 = svc.active_recording()
+        check(a0['elapsed_sec'] == 0 and a1['elapsed_sec'] == 120 and
+              a2['elapsed_sec'] == 180, 'elapsed advances with backend clock')
+        check(a1['remaining_sec'] == 180 and a2['remaining_sec'] == 120,
+              'remaining decreases')
+        check(a2['job_id'] == job['job_id'] and a2['state'] == 'recording',
+              'job survives client disappearance')
+        env.run(1)
+        check(svc.active_recording() is not None, 'still active after tick')
+        st = svc.status()['recording']
+        check(st['active'] and st['job_id'] == job['job_id'] and
+              set(('state', 'started_ts', 'elapsed_sec', 'remaining_sec',
+                   'max_duration_sec', 'sample_count',
+                   'collector_errors')) <= set(st),
+              '/api/status recording block while active')
+        svc.stop_recording(job['job_id'])
+        check(svc.status()['recording']['active'] is False,
+              'status recording block when idle')
+
+
+def test_recording_stop_expiry_events():
+    print('test_recording_stop_expiry_events')
+    with _RecEnv() as env:
+        svc = env.svc
+        j1 = svc.start_recording('a', max_duration_sec=60)['recording']
+        env.run(3)
+        check(svc.stop_recording('nope')['error'] == 'not_found',
+              'stop unknown job rejected')
+        r = svc.stop_recording(j1['job_id'])
+        check(r['ok'] and r['recording']['state'] == 'stopped' and
+              r['recording']['stop_reason'] == 'user' and
+              r['recording']['ended_ts'] is not None, 'manual stop')
+        check(svc.stop_recording(j1['job_id'])['error'] == 'not_active',
+              'stop only an active job')
+        env.run(1)
+        j2 = svc.start_recording('b', max_duration_sec=30)['recording']
+        env.run(29)
+        check(svc.active_recording() is not None, 'active before expiry')
+        env.run(2)
+        d = svc.get_recording(j2['job_id'])
+        check(d['state'] == 'expired' and d['stop_reason'] == 'max_duration'
+              and svc.active_recording() is None, 'automatic expiry')
+        ev1 = [e['event_type'] for e in svc.get_recording(
+            j1['job_id'])['events']]
+        ev2 = [e['event_type'] for e in d['events']]
+        check(ev1 == ['recording_started', 'recording_stopped'] and
+              ev2 == ['recording_started', 'recording_expired'],
+              'lifecycle events persisted')
+        e = d['events'][-1]
+        check(set(('job_id', 'event_ts', 'event_type', 'reason')) <= set(e)
+              and e['reason'] == 'max_duration', 'event record fields')
+        check(d['remaining_sec'] == 0 and d['elapsed_sec'] <= 31,
+              'ended job timing frozen')
+
+
+def test_recording_cadence_tagging_dedupe():
+    print('test_recording_cadence_tagging_dedupe')
+    with _RecEnv() as env:
+        svc = env.svc
+        job = svc.start_recording('c', max_duration_sec=300)['recording']
+        t0 = env.clock.t
+        env.run(31)
+
+        def gaps(keys):
+            ts = env.calls(keys)
+            return [b - a for a, b in zip(ts, ts[1:])]
+        check(set(gaps(('wan_devices',))) == {5} and
+              len(env.calls(('wan_devices',))) == 7, 'WAN cadence 5 s')
+        check(set(gaps(('wan_bonding',))) == {5}, 'WBOND cadence 5 s')
+        steer = ('steering_rules', 'steering_events', 'steering_stats',
+                 'steering_intents')
+        check(set(gaps(steer)) == {10} and len(env.calls(steer)) == 4,
+              'steering cadence 10 s (one parent read)')
+        check(set(gaps(('qoe',))) == {10}, 'QoE cadence 10 s')
+        check(set(gaps(('swans',))) == {10}, 'SWANS cadence 10 s')
+        check(env.calls(_STATIC) == [t0], 'static config read once at start')
+        check(not any('loadbalancers' in k for _, k in env.log),
+              'loadbalancers never polled during Recording')
+        check(env.max_active == 1, 'reads strictly serial')
+        samples = svc.recording_samples(job['job_id'])
+        check(samples and all(s['sample_source'] == 'recording' and
+                              s['job_id'] == job['job_id']
+                              for s in samples),
+              'every sample: sample_source=recording + job_id')
+        check(svc.history() == [], 'recording samples not mixed into history')
+        sw = [s for s in samples if s.get('recording_group') == 'swans']
+        check(len(sw) == 4 and len(sw[0]['swans_samples']) == 4 and
+              all(s['swans_samples'] == [] for s in sw[1:]),
+              'SWANS unseen (uid, epoch) only')
+        d = svc.get_recording(job['job_id'])
+        check(d['sample_counts']['wan_samples'] == 7 and
+              d['sample_counts']['steering_samples'] == 4 and
+              d['sample_count'] == len(samples), 'sample counts exposed')
+        check('samples' not in d and 'interfaces' not in json.dumps(d),
+              'details do not dump telemetry')
+        check(svc.refresh('loadbalancers')['error'].startswith('not allowed'),
+              'loadbalancer refresh blocked during Recording')
+
+
+def test_recording_config_start_end_and_schedule():
+    print('test_recording_config_start_end_and_schedule')
+    with _RecEnv() as env:
+        svc = env.svc
+        svc.collect_startup()
+        sched, due = svc.schedule_minutes(), svc.next_scheduled_ts()
+        hist = len(svc.history())
+        n0 = len(env.log)
+        job = svc.start_recording('c', max_duration_sec=300)['recording']
+        env.run(8)
+        n1 = len(env.log)
+        env.clock.t = due + 1
+        check(svc.scheduled_due() and svc.collect_scheduled() is None and
+              len(env.log) == n1 and len(svc.history()) == hist,
+              'scheduled collection skipped while Recording (no duplicate '
+              'reads)')
+        check(svc.schedule_minutes() == sched and
+              svc.next_scheduled_ts() > due, 'schedule setting unchanged')
+        env.clock.t = env.clock.t - 1 + 0
+        env.overrides['identities_intent'] = _intents_changed()
+        svc.stop_recording(job['job_id'])
+        env.run(1)
+        check(env.calls(_STATIC)[-1] >= env.clock.t - 2 and
+              len(env.calls(_STATIC)) == 2,
+              'static config read at start and at end')
+        d = svc.get_recording(job['job_id'])
+        check(d['config_versions_start']['traffic_classes'] == 1 and
+              d['config_versions_end']['traffic_classes'] == 2,
+              'config version refs at start and end')
+        check([c['name'] for c in d['config_changes']] == ['traffic_classes']
+              and d['events'][-1]['event_type'] ==
+              'recording_config_changed', 'config change event emitted')
+        check(len(svc._config_store.versions('traffic_classes')) == 2 and
+              len(svc._config_store.versions('wan_rules')) == 1,
+              'changed config versioned; unchanged not duplicated')
+        check('payload' not in json.dumps(
+            svc.recording_samples(job['job_id'])),
+            'static payloads not copied into samples')
+        check(svc.collect_scheduled()['sample_source'] == 'scheduled',
+              'scheduled collection resumes after Recording')
+    with _RecEnv() as env:
+        job = env.svc.start_recording('c', max_duration_sec=60)['recording']
+        env.run(2)
+        env.svc.stop_recording(job['job_id'])
+        env.run(1)
+        d = env.svc.get_recording(job['job_id'])
+        check(d['config_changes'] == [] and not any(
+            e['event_type'] == 'recording_config_changed'
+            for e in d['events']), 'unchanged config -> no change event')
+
+
+def test_recording_partial_failure_and_infra_failure():
+    print('test_recording_partial_failure_and_infra_failure')
+    with _RecEnv(fail=('qoe',)) as env:
+        svc = env.svc
+        job = svc.start_recording('f', max_duration_sec=300)['recording']
+        env.run(21)
+        d = svc.get_recording(job['job_id'])
+        check(d['state'] == 'recording' and d['collector_errors'] >= 3 and
+              d['collector_health']['qoe']['last_error_type'] ==
+              'api_error', 'collector failure does not kill the job')
+        check(d['sample_counts']['wan_samples'] >= 4,
+              'other collectors keep recording')
+        def boom(*a, **k):
+            raise RuntimeError('store down')
+        svc.collect = boom
+        env.run(6)
+        d = svc.get_recording(job['job_id'])
+        check(d['state'] == 'failed' and
+              d['events'][-1]['event_type'] == 'recording_failed',
+              'infrastructure failure -> failed + event')
+    with _RecEnv() as env:
+        svc = env.svc
+        svc._rec_store._max_samples = 6
+        job = svc.start_recording('cap', max_duration_sec=300)['recording']
+        env.run(20)
+        d = svc.get_recording(job['job_id'])
+        check(d['state'] == 'expired' and d['stop_reason'] == 'sample_cap' and
+              d['sample_count'] <= 7, 'sample cap bounds memory')
+
+
+def test_recording_timeout_busy_no_overlap():
+    print('test_recording_timeout_busy_no_overlap')
+    saved_get, saved_to = collectors.cp.get, collectors.READ_TIMEOUT_S
+    release, calls = [], []
+
+    def slow_get(path, *a, **k):
+        calls.append(path)
+        t0 = time.time()
+        while not release and time.time() - t0 < 2:
+            time.sleep(0.02)
+        return {}
+    collectors.cp.get = slow_get
+    collectors.READ_TIMEOUT_S = 0.1
+    try:
+        svc = _fresh(_Clock())
+        job = svc.start_recording('t', max_duration_sec=300)['recording']
+        base = threading.active_count()
+        svc.recording_tick()
+        d = svc.get_recording(job['job_id'])
+        types = {h['last_error_type'] for h in d['collector_health'].values()}
+        check(d['state'] == 'recording' and 'timeout' in types and
+              'busy' in types, 'timeout + busy recorded, job continues')
+        check(len(calls) == 1 and threading.active_count() <= base + 1,
+              'no overlapping workers during Recording')
+        svc._clock.t += 5
+        svc.recording_tick()
+        check(len(calls) == 1 and
+              svc.get_recording(job['job_id'])['state'] == 'recording',
+              'still no new worker while the call is pending')
+    finally:
+        release.append(1)
+        collectors.cp.get, collectors.READ_TIMEOUT_S = saved_get, saved_to
+        time.sleep(0.2)
+
+
+def _post(port, path, body=None):
+    import urllib.error
+    import urllib.request
+    data = json.dumps(body).encode('utf-8') if body is not None else b''
+    req = urllib.request.Request(
+        'http://127.0.0.1:{}{}'.format(port, path), data=data, method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode('utf-8'))
+
+
+def _get(port, path):
+    import urllib.error
+    try:
+        return _http_json(port, path)
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode('utf-8'))
+
+
+def test_recording_http_api():
+    print('test_recording_http_api')
+    from http.server import HTTPServer
+    from analyzer import web
+    with _RecEnv() as env:
+        svc = env.svc
+        port = _free_port()
+        httpd = HTTPServer(('127.0.0.1', port), web._make_handler(svc))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            check(_get(port, '/api/recordings') == (200, {'recordings': []}),
+                  'GET /api/recordings (empty)')
+            check(_get(port, '/api/recordings/active') ==
+                  (200, {'recording': None}), 'GET active -> null')
+            code, body = _post(port, '/api/recordings/start',
+                               {'label': 'L', 'notes': 'N',
+                                'max_duration_sec': 1801})
+            check(code == 400 and body['error'] == 'invalid',
+                  'POST start >30 min -> 400')
+            code, body = _post(port, '/api/recordings/start',
+                               {'max_duration_sec': 0})
+            check(code == 400, 'POST start duration 0 -> 400')
+            code, body = _post(port, '/api/recordings/start',
+                               {'label': 'L', 'notes': 'N',
+                                'max_duration_sec': 120})
+            job = body['recording']
+            check(code == 200 and job['state'] == 'recording' and
+                  job['created_by_ui'] is True, 'POST start')
+            check(_post(port, '/api/recordings/start',
+                        {'max_duration_sec': 60})[0] == 409,
+                  'second start -> 409')
+            env.run(6)
+            env.clock.t += 40             # "browser closed" for a while
+            code, act = _get(port, '/api/recordings/active')
+            check(code == 200 and act['recording']['job_id'] ==
+                  job['job_id'] and act['recording']['elapsed_sec'] >= 46,
+                  'active job still there; elapsed advanced')
+            code, st = _get(port, '/api/status')
+            check(st['recording']['active'] and st['recording'][
+                'sample_count'] > 0, '/api/status recording block')
+            code, det = _get(port, '/api/recordings/' + job['job_id'])
+            check(code == 200 and 'sample_counts' in det and
+                  'collector_health' in det and det['events'], 'details')
+            code, lst = _get(port, '/api/recordings')
+            check(len(lst['recordings']) == 1 and
+                  'events' not in lst['recordings'][0],
+                  'list returns metadata only')
+            check(_get(port, '/api/recordings/rec-nope')[0] == 404,
+                  'unknown job -> 404')
+            check(_post(port, '/api/recordings/rec-nope/stop')[0] == 404,
+                  'stop unknown -> 404')
+            code, body = _post(port, '/api/recordings/{}/stop'.format(
+                job['job_id']))
+            check(code == 200 and body['recording']['state'] == 'stopped',
+                  'POST stop')
+            check(_post(port, '/api/recordings/{}/stop'.format(
+                job['job_id']))[0] == 409, 'stop again -> 409')
+            check(_get(port, '/api/recordings/active')[1] ==
+                  {'recording': None}, 'no active after stop')
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 def main():
     tests = [
+        test_logical_policy_branches,
+        test_logical_fingerprint_branches,
+        test_preferred_wan_correlation,
+        test_destination_internal_name,
+        test_sdwan_wbond_kind,
+        test_history_logical_once,
         test_wan_paths,
         test_selector_from_xpolicy,
         test_dev_dicts,
@@ -600,6 +2072,44 @@ def main():
         test_compact_history,
         test_service_change_detection,
         test_cellular_privacy_filter,
+        test_web_port_module_is_the_current_standard,
+        test_app_package_ini_is_found_from_subpackage,
+        test_stop_app_uses_app_root_package_ini,
+        test_web_server_first_run_and_override,
+        test_web_server_malformed_value_fails_fast,
+        test_interface_stats_normalization,
+        test_counter_decrease_reset_suspected,
+        test_cellular_ca_parsing,
+        test_ca_signature_ignores_roles,
+        test_cell_hash_deterministic,
+        test_cellular_sensitive_fields_excluded,
+        test_swans_dedupe,
+        test_qoe_wbond_telemetry,
+        test_startup_collection_and_sources,
+        test_schedule_selection,
+        test_no_legacy_polling,
+        test_scheduled_config_reconcile,
+        test_manual_refresh_targeted,
+        test_config_version_change_only,
+        test_steering_events_once,
+        test_cache_updated_by_collection_only,
+        test_collector_timeout_bound,
+        test_scheduled_establishes_current_state,
+        test_partial_manual_refresh_keeps_current_state,
+        test_bonding_refresh_leaves_unrelated_intact,
+        test_failed_section_does_not_advance_freshness,
+        test_api_after_partial_refresh,
+        test_loadbalancer_expensive_runtime,
+        test_health_error_types,
+        test_timeout_busy_types_and_single_worker,
+        test_recording_start_validation,
+        test_recording_backend_owns_clock,
+        test_recording_stop_expiry_events,
+        test_recording_cadence_tagging_dedupe,
+        test_recording_config_start_end_and_schedule,
+        test_recording_partial_failure_and_infra_failure,
+        test_recording_timeout_busy_no_overlap,
+        test_recording_http_api,
     ]
     for t in tests:
         t()

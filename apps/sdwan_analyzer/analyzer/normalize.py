@@ -22,7 +22,7 @@ Internal record shapes (documented contract):
   WanPathRecord = {
     'uid': str,                 # NCOS device UID (routing identity)
     'iface': str,               # raw NCOS iface (routing identity)
-    'kind': str,                # 'cellular'|'ethernet'|'wifi'|'satellite'|'unknown'
+    'kind': str,                # 'cellular'|'ethernet'|'wifi'|'satellite'|'sdwan'|'wbond'|'unknown'
     'display_name': str,        # friendly, display-only
     'connection_state': str,    # e.g. 'connected'
     'ip_address': str|None,
@@ -274,7 +274,11 @@ def wan_paths(raw_devices, primary_uid, underlay_map=None):
             'iface': _s(info.get('iface')),
             'info_uid': _s(info.get('uid')),
             'object_class': oclass,
-            'kind': classify_wan_kind(uid, device),
+            # SD-WAN overlays / WBOND are topology objects, not a physical
+            # medium: kind mirrors object_class for them. Physical kinds are
+            # unchanged.
+            'kind': (oclass if oclass in (OBJ_SDWAN, OBJ_WBOND)
+                     else classify_wan_kind(uid, device)),
             'is_overlay': oclass in (OBJ_SDWAN,) or _s(info.get('type')).lower() in _OVERLAY_TYPES,
             'display_name': display,
             'connection_state': _s(status.get('connection_state')) or 'unknown',
@@ -638,8 +642,10 @@ def destination_index(raw_identities_ip):
                 or str(key))
         friendly = (_s(obj.get('friendly_name')) or _s(obj.get('name'))
                     or _s(obj.get('display_name')))
-        internal = (_s(obj.get('internal_name')) or _s(obj.get('app'))
-                    or _s(obj.get('appid')) or _s(obj.get('id')))
+        # config/identities/ip carries the internal id in 'name'
+        # (e.g. 'a000012DE', 'c0116'); friendly_name is the display label.
+        internal = (_s(obj.get('name')) or _s(obj.get('internal_name'))
+                    or _s(obj.get('app')) or _s(obj.get('appid')))
         dtype = _s(obj.get('type')) or None
         out[uuid] = {
             'uuid': uuid,
@@ -1331,8 +1337,8 @@ def _rule_field(rule, keys, default=None):
 
 
 def logical_rules(raw_steering_rules, raw_steering_stats=None,
-                  raw_steering_events=None, dest_index=None):
-    """Group compiled runtime steering rules into normalized logical rules.
+                  raw_steering_events=None, dest_index=None, wan_paths=None):
+    """Group compiled runtime steering rules into normalized logical policies.
 
     Real compiled rules have TWO layers -- a top-level runtime object and a
     nested 'xpolicy' compiled-policy object (validated on the R1900). Each
@@ -1345,16 +1351,19 @@ def logical_rules(raw_steering_rules, raw_steering_stats=None,
         wan_priority_enabled, intent (Traffic Class UUID), dst_ip_network
         (destination identity UUID), configured loadbalance_algo.
 
-    One logical NCM rule may compile into several children; children are
-    grouped by a semantic key (logical name + trigger_priority + selector +
-    source LANs + Traffic Class name), NOT by compiled UUID. Destinations
-    (xpolicy.dst_ip_network) from all children merge into one list resolved
-    via dest_index.
+    ONE logical policy == ONE NCM rule NAME (stats/events identify policies
+    only by that name). A logical policy may compile into several runtime
+    BRANCHES (e.g. 'Lab01 - Teams' -> Best Effort @5 and Interactive @6).
+    Children are grouped into a branch by (trigger_priority, selector, source
+    LANs, Traffic Class name) -- never by compiled UUID -- and branches are
+    grouped under the logical name. Destinations from every child merge into
+    one logical list resolved via dest_index.
 
-    stats/events correlate by LOGICAL RULE NAME (their steering_rule field
-    holds the logical name on real hardware, not the compiled UUID). Stats
-    are already logical-rule-level, so exactly ONE stats record attaches per
-    logical rule -- counts are never multiplied by the number of children.
+    Stats/events attach to the LOGICAL policy exactly once; flow counts are
+    never duplicated across, or summed over, branches.
+
+    wan_paths (optional, normalize.wan_paths output) enables canonical
+    preferred-WAN resolution; without it preferred_wan_uid/name stay None.
     """
     rules = raw_steering_rules
     if isinstance(rules, dict):
@@ -1365,7 +1374,7 @@ def logical_rules(raw_steering_rules, raw_steering_stats=None,
     stats_by_name = _index_stats_by_logical_name(raw_steering_stats)
     event_by_name = _index_latest_event_by_logical_name(raw_steering_events)
 
-    groups = {}
+    logicals = {}
     order = []
     for child in rules:
         if not isinstance(child, dict):
@@ -1389,24 +1398,34 @@ def logical_rules(raw_steering_rules, raw_steering_stats=None,
         tc_name = _s(child.get('intent')) or None
         tc_id = _s(xp.get('intent')) or None
 
-        gkey = _semantic_group_key(lname, trigger_priority, selector,
+        lkey = _s(lname).lower()
+        lr = logicals.get(lkey)
+        if lr is None:
+            lr = _new_logical_policy(lname)
+            logicals[lkey] = lr
+            order.append(lkey)
+        bkey = _semantic_group_key(lname, trigger_priority, selector,
                                    src_lans, tc_name)
-        if gkey not in groups:
-            groups[gkey] = _new_logical_rule(
-                lname, trigger_priority, selector, src_lans, tc_name, tc_id)
-            order.append(gkey)
-        _merge_child_into_logical(groups[gkey], child)
+        branch = lr['_branch_index'].get(bkey)
+        if branch is None:
+            branch = _new_branch(trigger_priority, selector, src_lans,
+                                 tc_name, tc_id)
+            lr['_branch_index'][bkey] = branch
+            lr['branches'].append(branch)
+        _merge_child_into_branch(branch, child)
 
     out = []
-    for gkey in order:
-        lr = groups[gkey]
+    for lkey in order:
+        lr = logicals[lkey]
+        _finalize_logical_policy(lr)
         lr['destinations'] = resolve_destinations(
             lr.pop('_dest_uuids'), dest_index)
         lr['destination_type'] = _infer_destination_type(
             lr['destinations'], lr.get('logical_name'), stats_by_name)
         _correlate_stats_events(lr, stats_by_name, event_by_name)
+        _resolve_preferred_wan(lr, wan_paths)
         lr['semantic_fingerprint'] = logical_rule_fingerprint(lr)
-        lr.pop('_compiled_ids', None)
+        lr.pop('_branch_index', None)
         out.append(lr)
     return out
 
@@ -1437,10 +1456,51 @@ def _normalize_src_lans(src_lans):
     return out
 
 
-def _new_logical_rule(lname, trigger_priority, selector, src_lans,
-                      tc_name, tc_id):
+def _new_logical_policy(lname):
+    """Logical policy shell. Branch-specific data lives in 'branches'; the
+    common/aggregate fields are filled by _finalize_logical_policy()."""
     return {
         'logical_name': lname or None,
+        'branches': [],
+        # Aggregate / compatibility fields (derived from branches).
+        'trigger_priority': None,        # first branch (lowest number)
+        'trigger_priorities': [],
+        'traffic_class_id': None,        # first branch
+        'traffic_class_name': None,      # first branch
+        'traffic_class_names': [],
+        'source_lans': [],
+        'wan_selector_type': None,       # common value, or 'mixed'
+        'wan_priority_enabled': False,
+        'wan_priority_order': [],
+        'matched_devs': [],
+        'steering_to': [],
+        'runtime_algorithm': None,
+        'configured_algorithm': None,
+        'primary_wandev': None,
+        'failover': None,
+        'compiled_rule_ids': [],
+        # Logical-level stats/events (attached ONCE).
+        # preferred_wan keeps the RAW NCOS value (alias of preferred_wan_raw).
+        'preferred_wan': None,
+        'preferred_wan_raw': None,
+        'preferred_wan_uid': None,
+        'preferred_wan_name': None,
+        'preferred_wan_match': None,
+        'preferred_flows': None,
+        'nonpreferred_flows': None,
+        'was_flow_matched': None,
+        'latest_event_reason': None,
+        'latest_flows_moved': None,
+        'destination_type': None,
+        'destinations': [],
+        '_dest_uuids': [],
+        '_branch_index': {},
+    }
+
+
+def _new_branch(trigger_priority, selector, src_lans, tc_name, tc_id):
+    """One compiled/runtime branch of a logical policy."""
+    return {
         'trigger_priority': trigger_priority,
         'traffic_class_id': tc_id,          # xpolicy.intent UUID
         'traffic_class_name': tc_name,      # top-level intent (friendly)
@@ -1454,29 +1514,79 @@ def _new_logical_rule(lname, trigger_priority, selector, src_lans,
         'configured_algorithm': None,       # xpolicy loadbalance_algo
         'primary_wandev': None,
         'failover': None,
-        'preferred_wan': None,
-        'preferred_flows': None,
-        'nonpreferred_flows': None,
-        'was_flow_matched': None,
-        'latest_event_reason': None,
-        'latest_flows_moved': None,
-        'destination_type': None,
-        'destinations': [],
         'compiled_rule_ids': [],
-        '_compiled_ids': [],
         '_dest_uuids': [],
     }
 
 
-def _merge_child_into_logical(lr, child):
-    """Fold one compiled child (top-level + xpolicy) into its logical rule."""
+def _first_non_none(values):
+    for v in values:
+        if v is not None:
+            return v
+    return None
+
+
+def _finalize_logical_policy(lr):
+    """Order branches and derive the logical-level aggregate fields."""
+    branches = lr['branches']
+    branches.sort(key=lambda b: (
+        b.get('trigger_priority') is None,
+        b.get('trigger_priority') if isinstance(
+            b.get('trigger_priority'), (int, float)) else 0,
+        _s(b.get('traffic_class_name')).lower()))
+
+    def union(key):
+        out = []
+        for b in branches:
+            for v in b.get(key, []):
+                if v not in out:
+                    out.append(v)
+        return out
+
+    lr['trigger_priorities'] = [b['trigger_priority'] for b in branches
+                                if b.get('trigger_priority') is not None]
+    first = branches[0] if branches else {}
+    lr['trigger_priority'] = first.get('trigger_priority')
+    lr['traffic_class_id'] = first.get('traffic_class_id')
+    lr['traffic_class_name'] = first.get('traffic_class_name')
+    for b in branches:
+        n = b.get('traffic_class_name')
+        if n and n not in lr['traffic_class_names']:
+            lr['traffic_class_names'].append(n)
+    lr['source_lans'] = union('source_lans')
+    selectors = []
+    for b in branches:
+        if b.get('wan_selector_type') not in selectors:
+            selectors.append(b.get('wan_selector_type'))
+    lr['wan_selector_type'] = (selectors[0] if len(selectors) == 1
+                               else ('mixed' if selectors else None))
+    lr['wan_priority_enabled'] = any(
+        b.get('wan_priority_enabled') for b in branches)
+    for b in branches:
+        for entry in b.get('wan_priority_order', []):
+            if entry not in lr['wan_priority_order']:
+                lr['wan_priority_order'].append(entry)
+    lr['matched_devs'] = union('matched_devs')
+    lr['steering_to'] = union('steering_to')
+    lr['compiled_rule_ids'] = union('compiled_rule_ids')
+    for key in ('runtime_algorithm', 'configured_algorithm',
+                'primary_wandev', 'failover'):
+        lr[key] = _first_non_none([b.get(key) for b in branches])
+    for b in branches:
+        for u in b.get('_dest_uuids', []):
+            if u not in lr['_dest_uuids']:
+                lr['_dest_uuids'].append(u)
+        b.pop('_dest_uuids', None)
+
+
+def _merge_child_into_branch(lr, child):
+    """Fold one compiled child (top-level + xpolicy) into its branch."""
     xp = _xpolicy(child)
 
     # Compiled id (UUID) -- supplemental metadata only, never the identity.
     cid = _s(_first_present(child, ('id', '_id_'))) or _s(xp.get('_id_'))
     if cid and cid not in lr['compiled_rule_ids']:
         lr['compiled_rule_ids'].append(cid)
-        lr['_compiled_ids'].append(cid)
 
     # Explicit WAN priority order comes from xpolicy triggers.
     if xp.get('wan_priority_enabled') is True:
@@ -1677,12 +1787,64 @@ def _correlate_stats_events(lr, stats_by_name, event_by_name):
         lr['preferred_flows'] = srec.get('preferred_flows')
         lr['nonpreferred_flows'] = srec.get('nonpreferred_flows')
         lr['was_flow_matched'] = srec.get('was_flow_matched')
+        # RAW NCOS value, verbatim. 'preferred_wan' is kept as a
+        # backward-compatible alias of preferred_wan_raw.
+        lr['preferred_wan_raw'] = srec.get('preferred_wan')
         lr['preferred_wan'] = srec.get('preferred_wan')
 
     ev = event_by_name.get(key)
     if ev is not None:
         lr['latest_event_reason'] = ev.get('reason')  # verbatim
         lr['latest_flows_moved'] = ev.get('total_flows_moved')
+
+
+def _resolve_preferred_wan(lr, wan_paths):
+    """Resolve stats preferred_wan (raw) to a canonical WAN inventory object.
+
+    NCOS names the same path differently across trees (stats may say
+    'sdwan-mdm-Internal 5GB (SIM1)-T-Mobile' while steering_to/inventory say
+    'sdwan-hub0_1ea0ac'). Deterministic, no fuzzy matching:
+
+      1. raw equals an inventory uid exactly         -> match 'uid'
+      2. raw is not a uid, the logical policy has exactly ONE distinct
+         steering_to uid, that uid is in the inventory, and raw has the same
+         object-class prefix ('sdwan-' / 'wbond-') as that uid
+                                                    -> match 'steering_to'
+      3. anything else (no inventory, none/several candidates, class
+         mismatch)                                  -> unresolved, uid/name None
+
+    preferred_wan_raw is never modified.
+    """
+    raw = lr.get('preferred_wan_raw')
+    lr['preferred_wan_uid'] = None
+    lr['preferred_wan_name'] = None
+    lr['preferred_wan_match'] = None
+    raw_s = _s(raw)
+    if not raw_s or not isinstance(wan_paths, list):
+        return
+    inv = {}
+    for p in wan_paths:
+        if isinstance(p, dict) and _s(p.get('uid')):
+            inv[_s(p.get('uid'))] = p
+
+    uid = None
+    match = None
+    if raw_s in inv:
+        uid, match = raw_s, 'uid'
+    else:
+        cands = [u for u in (lr.get('steering_to') or []) if _s(u)]
+        distinct = sorted(set(cands))
+        if len(distinct) == 1 and distinct[0] in inv:
+            cand = distinct[0]
+            prefix = cand.split('-', 1)[0].lower()
+            if (prefix in ('sdwan', 'wbond') and
+                    raw_s.lower().startswith(prefix + '-')):
+                uid, match = cand, 'steering_to'
+    if uid is None:
+        return
+    lr['preferred_wan_uid'] = uid
+    lr['preferred_wan_name'] = inv[uid].get('display_name') or None
+    lr['preferred_wan_match'] = match
 
 
 # =========================================================================
@@ -1711,13 +1873,19 @@ def logical_rule_fingerprint(lr):
     dest_ids = sorted(
         _s(d.get('internal_name') or d.get('uuid'))
         for d in lr.get('destinations', []))
+    branches = []
+    for b in lr.get('branches', []):
+        branches.append({
+            'trigger_priority': b.get('trigger_priority'),
+            'traffic_class': _s(b.get('traffic_class_name')).lower(),
+            'source_lans': sorted(_s(x) for x in b.get('source_lans', [])),
+            'selector': _s(b.get('wan_selector_type')),
+            'wan_priority_enabled': bool(b.get('wan_priority_enabled')),
+        })
+    branches.sort(key=lambda x: json.dumps(x, sort_keys=True, default=str))
     payload = {
         'name': _s(lr.get('logical_name')).lower(),
-        'trigger_priority': lr.get('trigger_priority'),
-        'traffic_class': _s(lr.get('traffic_class_name')).lower(),
-        'source_lans': sorted(_s(x) for x in lr.get('source_lans', [])),
-        'selector': _s(lr.get('wan_selector_type')),
-        'wan_priority_enabled': bool(lr.get('wan_priority_enabled')),
+        'branches': branches,
         'destinations': dest_ids,
     }
     return _stable_hash(payload)

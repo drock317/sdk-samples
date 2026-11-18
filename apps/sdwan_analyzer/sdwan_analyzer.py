@@ -1,6 +1,6 @@
 # Ericsson Cradlepoint NCOS SDK Application
 #
-# SD-WAN Analyzer -- BACKEND build (v0.2.x).
+# SD-WAN Analyzer -- BACKEND build (v0.3.x): startup + scheduled + manual collection.
 #
 # Scope of this build: full backend. Targeted collectors, normalization with
 # real compiled-rule (xpolicy) parsing, cross-object correlation, logical
@@ -20,15 +20,10 @@ import time
 
 import cp
 
-from analyzer import VERSION
+from analyzer import VERSION, web_port
 from analyzer.service import AnalyzerService
-from analyzer.web import DevWebServer
+from analyzer.web import DevWebServer, app_package_ini
 
-# Background collector cadence. Two intervals so heavy/slow trees
-# (loadbalancers, bonding, QoE, config) poll far less often than lightweight
-# topology/state. The service owns polling; the web layer only serves the
-# cached snapshot (COLLECTION PERFORMANCE / SAFETY). Values are the service
-# defaults; kept here as the single place the loop reads them.
 _running = True
 
 
@@ -36,6 +31,19 @@ def _handle_signal(signum, frame):
     global _running
     cp.log('sdwan_analyzer: signal {} received, shutting down'.format(signum))
     _running = False
+
+
+def _configured_schedule_minutes():
+    """Optional App Data sdwan_analyzer_interval_minutes (5/15/30/60).
+
+    Read-only: defaults are applied in code and never written to appdata.
+    Anything missing/invalid falls back to the service default.
+    """
+    try:
+        raw = cp.get_appdata('sdwan_analyzer_interval_minutes')
+        return int(str(raw).strip()) if raw not in (None, '') else None
+    except Exception:
+        return None
 
 
 def main():
@@ -50,59 +58,79 @@ def main():
             cp.log('sdwan_analyzer: could not set handler for {}: {}'.format(
                 sig, e))
 
-    service = AnalyzerService()
+    service = AnalyzerService(schedule_minutes=_configured_schedule_minutes())
     server = DevWebServer(service)
     # Let /api/status report the effective listening port.
     service.set_web_port_provider(server.port_status)
 
-    # Web startup may fail safely (e.g. a pinned configured port is
-    # occupied). The rest of the app keeps collecting either way.
+    # Web startup: a configured port that is malformed fails at once; one
+    # that is valid but busy is retried (same port only) for ~60 s inside
+    # start(). If there is still no port, this app has nothing to offer (its
+    # snapshot and history are only reachable through the web API), so it
+    # STOPS ITSELF via the SDK. It must not sys.exit(): restart = true would
+    # make NCOS relaunch it every few seconds and flood the log. A stopped app
+    # is not restarted. The reason has already been logged by web_port.
     if not server.start():
-        cp.log('sdwan_analyzer: continuing without web interface '
-               '(see web_port log above)')
+        cp.log('sdwan_analyzer: web interface NOT started ({}); stopping the '
+               'app. Fix sdwan_analyzer_web_port and start it again.'.format(
+                   server.port_status().get('error')))
+        # package.ini is one level above the analyzer/ package web_port lives in.
+        if web_port.stop_app(cp.put, cp.log, package_ini=app_package_ini()):
+            # The SDK sends SIGTERM, which clears _running. Wait in 1s slices
+            # so a successful stop ends the app promptly and cleanly.
+            for _ in range(30):
+                if not _running:
+                    break
+                time.sleep(1)
+        if not _running:
+            # Stop honoured: leave now, before any collection work starts.
+            cp.log('sdwan_analyzer: stopped (no web interface)')
+            return
+        # The SDK did not honour the stop. Keep collecting without the web
+        # interface (never exit: that would start a restart loop).
+        cp.log('sdwan_analyzer: SDK stop request was not honoured; '
+               'continuing without the web interface.')
 
-    # Background collector: the service owns all router polling. It runs the
-    # lightweight (fast) topology pass every fast_interval and the heavy
-    # (slow) runtime+config pass every slow_interval, then recomposes and
-    # caches one normalized snapshot. Web requests read only the cache.
-    fast_interval = service.fast_interval()
-    slow_interval = service.slow_interval()
-
-    # Prime both caches once at startup so the first snapshot is complete.
+    # Data acquisition (no separate cache poller, no 15 s/120 s loops):
+    #   1. one STARTUP observation so the UI is never empty,
+    #   2. one SCHEDULED observation every N minutes (5/15/30/60),
+    #   3. manual refresh (web-triggered, handled inside the service).
+    # Between observations the process only sleeps; it does not touch NCOS.
     try:
-        service.refresh_heavy()
-        service.refresh_base()
-        first = service.recompose()
-        cp.log('sdwan_analyzer: initial snapshot composed '
-               '(paths={}, logical_rules={})'.format(
-                   first.get('system_summary', {}).get('wan_path_count'),
-                   first.get('system_summary', {}).get('logical_rule_count')))
+        first = service.collect_startup()
+        cp.log('sdwan_analyzer: startup observation saved '
+               '(wan={}, interfaces={}, cellular={}, errors={})'.format(
+                   len((first.get('wan') or {}).get('paths', [])),
+                   len(first.get('interfaces', [])),
+                   len(first.get('cellular', [])),
+                   len(first.get('collector_errors', []))))
     except Exception as e:
-        cp.log('sdwan_analyzer: initial compose error: {}'.format(e))
+        cp.log('sdwan_analyzer: startup collection error: {}'.format(e))
 
-    last_slow = time.time()
+    cp.log('sdwan_analyzer: scheduled collection every {} min'.format(
+        service.schedule_minutes()))
+
     # time.sleep avoids a spin-wait (coding-standards memory rules); sleep in
     # 1s slices so SIGTERM shutdown stays responsive.
     while _running:
+        time.sleep(1)
+        # Backend-owned Recording job (no-op when idle).
+        service.recording_tick()
+        if not _running or not service.scheduled_due():
+            continue
         try:
-            service.refresh_base()
-            now = time.time()
-            if now - last_slow >= slow_interval:
-                service.refresh_heavy()
-                last_slow = now
-            snap = service.recompose()
-            summ = snap.get('system_summary', {}) if snap else {}
-            cp.log('sdwan_analyzer: snapshot recomposed '
-                   '(paths={}, bonds={}, logical_rules={})'.format(
-                       summ.get('wan_path_count'), summ.get('bond_count'),
-                       summ.get('logical_rule_count')))
+            obs = service.collect_scheduled()
+            if obs is None:
+                cp.log('sdwan_analyzer: scheduled sample skipped '
+                       '(Recording active)')
+                continue
+            cp.log('sdwan_analyzer: scheduled observation saved '
+                   '(interfaces={}, swans_new={}, errors={})'.format(
+                       len(obs.get('interfaces', [])),
+                       len(obs.get('swans_samples', [])),
+                       len(obs.get('collector_errors', []))))
         except Exception as e:
-            cp.log('sdwan_analyzer: collector loop error: {}'.format(e))
-
-        slept = 0
-        while _running and slept < fast_interval:
-            time.sleep(1)
-            slept += 1
+            cp.log('sdwan_analyzer: scheduled collection error: {}'.format(e))
 
     server.stop()
     cp.log('sdwan_analyzer: stopped')

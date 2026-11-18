@@ -2,7 +2,8 @@
 
 Deliberately minimal — this is a development/status page, NOT the eventual
 UI. Per web-standards: Python's built-in http.server only (no Flask/Node),
-port 8000, SO_REUSEADDR, runs in a daemon thread.
+port chosen by the web_port helper (App Data sdwan_analyzer_web_port, else
+discovered from 8000), SO_REUSEADDR, runs in a daemon thread.
 
 The handler calls ONLY AnalyzerService. It never imports cp or touches NCOS
 directly, so the browser never talks to NCOS. All data crosses the
@@ -10,6 +11,7 @@ service boundary as plain JSON.
 """
 
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -19,6 +21,18 @@ from . import web_port
 
 # App name used for the namespaced appdata field (<app_name>_web_port).
 APP_NAME = 'sdwan_analyzer'
+
+
+def app_package_ini():
+    """Path to this app's package.ini.
+
+    web_port.py lives in the analyzer/ subpackage, but package.ini (which
+    holds the app uuid web_port.stop_app() needs) is one level up in the app
+    folder. web_port.py must stay byte-identical across apps, so its default
+    lookup (beside the module) is not changed; callers pass this path instead.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(here), 'package.ini')
 
 # Minimal dev page. Intentionally plain — the polished UI (and the template
 # static/ design system) is DEFERRED to the presentation phase.
@@ -35,7 +49,7 @@ _DEV_PAGE = """<!DOCTYPE html>
 <ul>
 <li><a href="/api/status">/api/status</a> (includes effective web port)</li>
 <li><a href="/api/health">/api/health</a></li>
-<li><a href="/api/snapshot">/api/snapshot</a> (latest cached normalized snapshot)</li>
+<li><a href="/api/snapshot">/api/snapshot</a> (latest MERGED current state, not the last observation)</li>
 <li><a href="/api/wan">/api/wan</a> (paths, physical, overlays, underlay map)</li>
 <li><a href="/api/swans">/api/swans</a> (SWANS latency/jitter)</li>
 <li><a href="/api/qoe">/api/qoe</a> (SD-WAN transport QoE)</li>
@@ -45,7 +59,9 @@ _DEV_PAGE = """<!DOCTYPE html>
 <li><a href="/api/bonding">/api/bonding</a> (WBOND detail)</li>
 <li><a href="/api/identities">/api/identities</a> (destinations)</li>
 <li><a href="/api/changes">/api/changes</a> (topology/config change flags)</li>
-<li><a href="/api/history">/api/history</a></li>
+<li><a href="/api/history">/api/history</a> (source-tagged observations)</li>
+<li><a href="/api/recordings">/api/recordings</a>, <a href="/api/recordings/active">/active</a>, /api/recordings/&lt;id&gt;; POST /api/recordings/start, /api/recordings/&lt;id&gt;/stop (backend-owned, max 30 min)</li>
+<li>POST /api/refresh/&lt;group&gt; (manual: traffic_classes, steering, bonding, wan_paths, overview)</li>
 </ul>
 </body>
 </html>
@@ -106,8 +122,75 @@ def _make_handler(service):
                     else:
                         self._send_json(
                             service.section(self._SECTION_ROUTES[path]))
+                elif path == '/api/recordings':
+                    self._send_json({'recordings': service.list_recordings()})
+                elif path == '/api/recordings/active':
+                    self._send_json({'recording': service.active_recording()})
+                elif path.startswith('/api/recordings/'):
+                    rec = service.get_recording(
+                        path[len('/api/recordings/'):])
+                    if rec is None:
+                        self._send_json({'error': 'not found'}, code=404)
+                    else:
+                        self._send_json(rec)
                 elif path.startswith('/api/history'):
                     self._send_json({'samples': service.history(limit=100)})
+                else:
+                    self._send_json({'error': 'not found'}, code=404)
+            except Exception as e:
+                cp.log('web: request error on {}: {}'.format(self.path, e))
+                try:
+                    self._send_json({'error': 'internal error'}, code=500)
+                except Exception:
+                    pass
+
+        def _read_json(self):
+            """Parse a JSON-object request body ({} if empty), else None."""
+            try:
+                n = int(self.headers.get('Content-Length') or 0)
+                raw = self.rfile.read(min(n, 4096)) if n > 0 else b'{}'
+                body = json.loads(raw.decode('utf-8'))
+                return body if isinstance(body, dict) else None
+            except Exception:
+                return None
+
+        @staticmethod
+        def _rec_code(result):
+            if result.get('ok'):
+                return 200
+            return {'invalid': 400, 'not_found': 404,
+                    'active_exists': 409, 'not_active': 409}.get(
+                        result.get('error'), 400)
+
+        def do_POST(self):
+            # The only web-triggered collection: an explicit manual refresh
+            # of one group, POST /api/refresh/<group> (5 s cooldown/group).
+            try:
+                path = self.path.split('?', 1)[0]
+                prefix = '/api/refresh/'
+                if path == '/api/recordings/start':
+                    body = self._read_json()
+                    if body is None:
+                        self._send_json({'ok': False, 'error': 'invalid',
+                                         'message': 'JSON object required'},
+                                        code=400)
+                        return
+                    result = service.start_recording(
+                        label=body.get('label', ''),
+                        notes=body.get('notes', ''),
+                        max_duration_sec=body.get('max_duration_sec'),
+                        created_by_ui=True)
+                    self._send_json(result, code=self._rec_code(result))
+                elif (path.startswith('/api/recordings/')
+                      and path.endswith('/stop')):
+                    job_id = path[len('/api/recordings/'):-len('/stop')]
+                    result = service.stop_recording(job_id)
+                    self._send_json(result, code=self._rec_code(result))
+                elif path.startswith(prefix):
+                    result = service.refresh(path[len(prefix):])
+                    code = 200 if result.get('ok') else (
+                        429 if result.get('error') == 'cooldown' else 400)
+                    self._send_json(result, code=code)
                 else:
                     self._send_json({'error': 'not found'}, code=404)
             except Exception as e:
@@ -135,6 +218,13 @@ class DevWebServer(object):
     The helper returns an already-bound socket, which we hand to HTTPServer
     (bind_and_activate=False) so the bind itself is the availability test --
     no check-then-bind race.
+
+    start() returns False when no port could be bound. It does NOT exit and
+    does NOT decide what the app does next: the caller (sdwan_analyzer.main)
+    applies the final-failure policy (stop the app via web_port.stop_app).
+    A malformed configured value fails at once; a valid but busy port is
+    retried (same port only) for about 60 s first, so start() can block for
+    that long on a held port.
     """
 
     def __init__(self, service, app_name=APP_NAME,
@@ -164,12 +254,12 @@ class DevWebServer(object):
         }
 
     def start(self):
-        result = web_port.bind_web_socket(
+        result = web_port.bind_web_socket_with_retry(
             self._app_name, self._get_appdata, self._put_appdata, cp.log)
 
         self._port_source = result.source
         if not result.ok:
-            # Fail web startup safely. The rest of the app keeps running.
+            # No port. Report it; the caller applies the stop-the-app policy.
             self._last_error = result.error
             cp.log('web: web server NOT started ({}).'.format(result.error))
             return False
@@ -180,6 +270,9 @@ class DevWebServer(object):
             self._httpd = HTTPServer(('0.0.0.0', result.port),
                                      _make_handler(self._service),
                                      bind_and_activate=False)
+            # Close the unused placeholder socket HTTPServer created, then
+            # adopt the pre-bound one (otherwise one fd leaks per server).
+            self._httpd.socket.close()
             self._httpd.socket = result.sock
             self._thread = threading.Thread(
                 target=self._httpd.serve_forever, daemon=True)

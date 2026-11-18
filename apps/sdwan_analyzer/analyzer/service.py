@@ -1,25 +1,33 @@
 """Application API: composes collectors + normalize + storage.
 
 This is the ONLY layer the presentation (web) tier is allowed to call. It
-owns router polling on two cadences, caches the latest normalized snapshot,
-and exposes plain-dict sections ready for JSON. The browser never reaches
-NCOS APIs -- it reaches web, which reaches here, which serves the CACHED
-snapshot. Web requests NEVER trigger router collection (COLLECTION
-PERFORMANCE / SAFETY).
+owns router collection, caches the latest normalized snapshot, and exposes
+plain-dict sections ready for JSON. The browser never reaches NCOS APIs.
+Web requests NEVER trigger scheduled collection; the only web-triggered
+collection is an explicit user manual refresh (refresh()).
 
-Cadence model
--------------
-- FAST cadence: lightweight topology/state (collect_base_snapshot). Small,
-  frequently-changing trees.
-- SLOW cadence: heavier runtime + static config (collect_heavy_snapshot),
-  including the loadbalancers endpoint which is slow on the R1900.
+Data-acquisition model
+----------------------
+There are exactly three ways data enters the system, and NO background
+cache-refresh poller:
 
-The two raw passes are cached independently and merged into the composed
-snapshot. A collector failure keeps the last-known-good raw for that group
-plus an error/timestamp, so one failing optional collector never blanks the
-whole snapshot or stops the app.
+1. Scheduled collection -- one normal observation every N minutes, N in
+   SCHEDULE_CHOICES (5/15/30/60). Aligned to the local clock. A startup
+   observation is collected first so the UI is never empty.
+2. Manual refresh -- targeted, per-group, ~5 s cooldown, tagged 'manual'.
+   It never changes the schedule.
+3. Recording -- (next phase) collect(source='recording', job_id=...).
 
-Business logic lives here (and in normalize), never in the web layer.
+Every collection pass produces a source-tagged observation (compact,
+timestamp-enveloped; see telemetry.py), updates the in-memory cache that the
+UI reads, and stores the observation. Static/config objects are stored only
+as change-versions (storage.ConfigVersionStore), never per sample.
+
+A collector failure keeps the last-known-good raw for that key plus an
+error/timestamp, so one failing optional collector never blanks the whole
+snapshot or stops the app.
+
+Business logic lives here (and in normalize/telemetry), never in web.
 """
 
 import threading
@@ -27,15 +35,39 @@ import time
 
 import cp
 
+from . import VERSION
 from . import collectors
 from . import normalize
+from . import recording
 from . import storage
+from . import telemetry
 
-# Conservative default cadences (seconds). Centralized + overridable via the
-# constructor so they are not scattered or chosen blindly. Heavy trees
-# (loadbalancers/bonding/QoE/config) run much slower than topology.
-DEFAULT_FAST_INTERVAL = 15
-DEFAULT_SLOW_INTERVAL = 120
+# User-selectable continuous-history intervals (minutes). No 1-minute mode.
+SCHEDULE_CHOICES = (5, 15, 30, 60)
+DEFAULT_SCHEDULE_MINUTES = 15
+
+# Config/static objects are re-read on ~hourly reconciliation (plus startup
+# and targeted manual refresh).
+CONFIG_RECONCILE_S = 3600
+
+# Cooldown per manual refresh group (seconds).
+REFRESH_COOLDOWN_S = 5
+
+SAMPLE_SOURCES = ('startup', 'scheduled', 'manual', 'recording')
+
+# Current-state section -> collector keys that must ALL be read successfully
+# in a pass for that section's freshness to advance.
+SECTION_KEYS = {
+    'wan': ('wan_devices',),
+    'cellular': ('wan_devices',),
+    'swans': ('swans',),
+    'qoe': ('qoe',),
+    'bonding': ('wan_bonding',),
+    'traffic_steering': ('steering_rules', 'steering_events',
+                         'steering_stats'),
+    'traffic_classes': ('identities_intent', 'traffic_class_config'),
+    'loadbalancers': ('loadbalancers',),
+}
 
 
 class _RawCache(object):
@@ -56,6 +88,8 @@ class _RawCache(object):
         self._updated = {}            # key -> ts of last successful read
         self._errors = {}            # key -> last error string
         self._error_ts = {}          # key -> ts of last error
+        self._error_type = {}        # key -> type of current error
+        self._last_error = {}        # key -> (ts, type, msg); never cleared
         self.updated_ts = None        # ts of last pass that updated any key
 
     def update(self, fetch_callable):
@@ -76,6 +110,7 @@ class _RawCache(object):
                 self._updated[key] = now
                 self._errors.pop(key, None)
                 self._error_ts.pop(key, None)
+                self._error_type.pop(key, None)
                 any_success = True
                 continue
             if res.ok:
@@ -83,11 +118,15 @@ class _RawCache(object):
                 self._updated[key] = now
                 self._errors.pop(key, None)
                 self._error_ts.pop(key, None)
+                self._error_type.pop(key, None)
                 any_success = True
             else:
                 # Retain previous value; record per-key error + timestamp.
                 self._errors[key] = res.error
                 self._error_ts[key] = now
+                etype = getattr(res, 'error_type', None) or 'api_error'
+                self._error_type[key] = etype
+                self._last_error[key] = (now, etype, res.error)
                 cp.log('service: collector {} failed ({}); '
                        'keeping last-known-good'.format(key, res.error))
         if any_success:
@@ -95,177 +134,330 @@ class _RawCache(object):
 
     def health(self):
         """Per-collector health: {key: {updated_ts, error, error_ts}}."""
-        keys = set(self.data) | set(self._errors)
+        keys = set(self.data) | set(self._errors) | set(self._last_error)
         out = {}
         for k in keys:
+            le = self._last_error.get(k) or (None, None, None)
             out[k] = {
                 'updated_ts': self._updated.get(k),
                 'error': self._errors.get(k),
                 'error_ts': self._error_ts.get(k),
+                # error_type: timeout | busy | api_error (current error).
+                'error_type': self._error_type.get(k),
+                'last_success_ts': self._updated.get(k),
+                'last_error_ts': le[0],
+                'last_error_type': le[1],
+                'last_error': le[2],
             }
         return out
 
 
 class AnalyzerService(object):
-    def __init__(self, store=None,
-                 fast_interval=DEFAULT_FAST_INTERVAL,
-                 slow_interval=DEFAULT_SLOW_INTERVAL):
+    def __init__(self, store=None, schedule_minutes=DEFAULT_SCHEDULE_MINUTES,
+                 config_store=None, clock=None):
         self._store = store if store is not None else storage.default_store()
+        self._config_store = (config_store if config_store is not None
+                              else storage.ConfigVersionStore())
+        self._clock = clock if clock is not None else time.time
+        self._rec_store = storage.RecordingStore()
+        self._recording = recording.RecordingController(self, self._rec_store)
         self._web_port_status = None
 
-        self._fast_interval = fast_interval
-        self._slow_interval = slow_interval
+        if schedule_minutes not in SCHEDULE_CHOICES:
+            schedule_minutes = DEFAULT_SCHEDULE_MINUTES
+        self._schedule_minutes = schedule_minutes
+        self._next_due = None            # epoch of next scheduled collection
 
-        # Independent raw caches per cadence group.
-        self._base_raw = _RawCache()
-        self._heavy_raw = _RawCache()
+        # Raw last-known-good caches: runtime keys vs static/config keys.
+        self._runtime_raw = _RawCache()
+        self._config_raw = _RawCache()
+        self._last_config_ts = None
 
-        # Composed normalized snapshot cache + guard.
+        # Composed normalized snapshot cache + guards.
         self._lock = threading.Lock()
+        self._collect_lock = threading.Lock()
         self._snapshot = None
         self._snapshot_ts = None
 
-        # Fingerprints from the previous composed snapshot, for change-ready
-        # history (topology / config / logical-policy churn detection).
+        # Fingerprints from the previous composed snapshot.
         self._prev_fingerprints = {}
+
+        # Cross-observation telemetry state (all bounded).
+        self._prev_counters = {}
+        self._swans_seen = telemetry.BoundedSeen()
+        self._event_seen = telemetry.BoundedSeen()
+        self._last_refresh = {}          # group -> ts of last accepted refresh
+        # section -> {collected_ts, sample_source} of the pass that last
+        # refreshed it. Advances only for sections actually collected.
+        self._freshness = {}
 
     def set_web_port_provider(self, provider):
         """Register a zero-arg callable that returns web port status."""
         self._web_port_status = provider
 
-    # --- cadence intervals ------------------------------------------------
+    # --- schedule ---------------------------------------------------------
 
-    def fast_interval(self):
-        return self._fast_interval
+    def schedule_minutes(self):
+        return self._schedule_minutes
 
-    def slow_interval(self):
-        return self._slow_interval
+    def set_schedule_minutes(self, minutes):
+        """Select the scheduled interval. Returns False if not allowed."""
+        if minutes not in SCHEDULE_CHOICES:
+            return False
+        self._schedule_minutes = minutes
+        self._plan_next_due(self._clock())
+        return True
 
-    # --- collection (background collector owns these) ---------------------
+    def _plan_next_due(self, now):
+        """Next local-clock-aligned boundary strictly after `now`."""
+        step = self._schedule_minutes * 60
+        try:
+            offset = time.localtime(now).tm_gmtoff or 0
+        except Exception:
+            offset = 0
+        self._next_due = ((int(now) + offset) // step + 1) * step - offset
 
-    def refresh_base(self):
-        """Run one FAST (lightweight topology) collection pass into cache."""
-        self._base_raw.update(collectors.collect_base_snapshot)
+    def next_scheduled_ts(self):
+        return self._next_due
 
-    def refresh_heavy(self):
-        """Run one SLOW (heavy runtime + static config) collection pass."""
-        self._heavy_raw.update(collectors.collect_heavy_snapshot)
+    def scheduled_due(self, now=None):
+        """True when the scheduled interval boundary has been reached."""
+        now = self._clock() if now is None else now
+        return self._next_due is not None and now >= self._next_due
+
+    # --- collection (the ONLY router I/O; no background cache poller) -----
+
+    def collect_startup(self):
+        """One initial full current-state observation (source=startup)."""
+        obs = self.collect('startup', keys=(collectors.RUNTIME_KEYS +
+                                            collectors.CONFIG_KEYS))
+        self._plan_next_due(self._clock())
+        return obs
+
+    def collect_scheduled(self):
+        """One scheduled observation; config re-read when reconcile is due."""
+        if self._rec_store.active_recording() is not None:
+            # The Recording worker is already producing fresher runtime
+            # observations; skip the duplicate poll, keep the schedule.
+            self._plan_next_due(self._clock())
+            return None
+        now = self._clock()
+        keys = collectors.RUNTIME_KEYS
+        if (self._last_config_ts is None
+                or now - self._last_config_ts >= CONFIG_RECONCILE_S):
+            keys = keys + collectors.CONFIG_KEYS
+        obs = self.collect('scheduled', keys=keys)
+        self._plan_next_due(self._clock())
+        return obs
+
+    # --- Recording (see recording.py) -------------------------------------
+
+    def start_recording(self, label='', notes='', max_duration_sec=None,
+                        created_by_ui=False):
+        return self._recording.start(label, notes, max_duration_sec,
+                                     created_by_ui)
+
+    def stop_recording(self, job_id):
+        return self._recording.stop(job_id)
+
+    def recording_tick(self):
+        """Advance the backend-owned Recording job (main loop, ~1/s)."""
+        self._recording.tick()
+
+    def list_recordings(self):
+        return self._recording.list_recordings()
+
+    def get_recording(self, job_id):
+        return self._recording.get_recording(job_id)
+
+    def active_recording(self):
+        return self._recording.active_recording()
+
+    def recording_samples(self, job_id, limit=None):
+        return self._recording.recording_samples(job_id, limit)
+
+    def refresh(self, group):
+        """Targeted manual refresh. Does NOT touch the schedule.
+
+        Returns {ok, refresh_ts, refresh_group, duration_ms,
+        collector_errors} (plus error/retry_after_s when rejected).
+        """
+        keys = collectors.REFRESH_GROUPS.get(group)
+        now = self._clock()
+        if group == 'loadbalancers' and (
+                self._rec_store.active_recording() is not None):
+            return {'ok': False, 'refresh_group': group,
+                    'refresh_ts': int(now), 'duration_ms': 0,
+                    'collector_errors': [],
+                    'error': 'not allowed during a Recording'}
+        if keys is None:
+            return {'ok': False, 'refresh_group': group,
+                    'refresh_ts': int(now), 'duration_ms': 0,
+                    'collector_errors': [], 'error': 'unknown refresh group'}
+        last = self._last_refresh.get(group)
+        if last is not None and now - last < REFRESH_COOLDOWN_S:
+            return {'ok': False, 'refresh_group': group,
+                    'refresh_ts': int(now), 'duration_ms': 0,
+                    'collector_errors': [], 'error': 'cooldown',
+                    'retry_after_s': round(
+                        REFRESH_COOLDOWN_S - (now - last), 1)}
+        self._last_refresh[group] = now
+        obs = self.collect('manual', keys=keys, group=group)
+        return {'ok': True, 'refresh_ts': obs['collected_ts'],
+                'refresh_group': group, 'duration_ms': obs['duration_ms'],
+                'collector_errors': obs['collector_errors']}
+
+    def collect(self, source, keys, group=None, job_id=None):
+        """Run one collection pass, update the cache, store an observation."""
+        with self._collect_lock:
+            t0 = time.time()
+            keys = tuple(keys)
+            results = collectors.collect_keys(keys)
+            errors = [{'collector': k, 'error': r.error,
+                       'error_type': getattr(r, 'error_type', None)}
+                      for k, r in sorted(results.items())
+                      if not getattr(r, 'ok', True)]
+            rt = {k: r for k, r in results.items()
+                  if k not in collectors.CONFIG_KEYS}
+            cf = {k: r for k, r in results.items()
+                  if k in collectors.CONFIG_KEYS}
+            if rt:
+                self._runtime_raw.update(lambda: rt)
+            if cf:
+                self._config_raw.update(lambda: cf)
+            now = int(self._clock())
+            for sec, sec_keys in SECTION_KEYS.items():
+                if all(k in results and getattr(results[k], 'ok', True)
+                       for k in sec_keys):
+                    self._freshness[sec] = {'collected_ts': now,
+                                            'sample_source': source}
+            if all(k in keys for k in collectors.CONFIG_KEYS):
+                self._last_config_ts = now
+            snap = self.recompose()
+            obs = self._build_observation(source, keys, snap, now,
+                                          group, job_id)
+            obs['collector_errors'] = errors
+            obs['duration_ms'] = int((time.time() - t0) * 1000)
+            if source == 'recording' and job_id:
+                # Recording samples live in the RecordingStore, tagged.
+                obs['recording_group'] = group
+                obs['refresh_group'] = None
+                if not self._recording.store_sample(job_id, obs):
+                    cp.log('service: recording sample dropped (cap)')
+            else:
+                self._store.append(obs)
+            return obs
 
     def recompose(self):
-        """Recompose the normalized snapshot from cached raw and store it.
+        """Recompose the CURRENT STATE from cached raw (the UI cache).
 
-        Called by the background collector after a refresh. Web requests do
-        NOT call this -- they read the cached snapshot via snapshot().
+        OBSERVATION vs CURRENT STATE: an observation (see _build_observation)
+        is the persisted, possibly PARTIAL record of one acquisition. The
+        current state composed here is the merged last-known-good view built
+        from per-key raw caches, so a partial manual refresh only replaces
+        the keys it collected; other sections keep their earlier data. Each
+        section's age is in `section_freshness`.
+
+        Pure over cached raw: no router I/O except per-bond name resolution.
         """
         snap = self._compose_snapshot()
         with self._lock:
             self._snapshot = snap
             self._snapshot_ts = snap.get('timestamp')
-        # Store a COMPACT history sample, never the full snapshot. The live
-        # snapshot keeps raw investigative fields; history must stay bounded
-        # in memory (R1900), so it holds only analysis-useful normalized
-        # values -- no raw passthrough trees, no compiled_rules array.
-        self._store.append(self._compact_history_sample(snap))
         return snap
 
-    def _compact_history_sample(self, snap):
-        """Project a full snapshot into a compact, memory-bounded sample.
+    def _build_observation(self, source, keys, snap, now, group, job_id):
+        """Source-tagged compact observation. Never a raw API snapshot.
 
-        Contains ONLY analysis-useful normalized values -- no raw passthrough
-        trees, no compiled_rules array, no per-object 'raw'. This is what
-        /api/history serves; the live /api/snapshot keeps the richer data.
+        Only sections whose collectors ran in this pass are populated (a
+        targeted refresh yields a partial observation). Static/config data is
+        referenced by version number, never copied per sample.
         """
-        if not isinstance(snap, dict):
-            return {'timestamp': int(time.time())}
-        wan = snap.get('wan', {}) or {}
-        ts = snap.get('traffic_steering', {}) or {}
+        data = self._raw()
+        have = set(keys)
+        obs = {'sample_source': source, 'job_id': job_id,
+               'refresh_group': group, 'timestamp': now,
+               'collected_ts': now}
+        if 'wan_devices' in have:
+            devices = data.get('wan_devices')
+            obs['wan'] = telemetry.wan_state(
+                devices, data.get('primary_device'), now)
+            obs['interfaces'], self._prev_counters = (
+                telemetry.interface_records(devices, self._prev_counters,
+                                            now))
+            obs['cellular'] = telemetry.cellular_records(devices, now)
+        if 'swans' in have:
+            obs['swans_samples'] = telemetry.swans_new_samples(
+                data.get('swans'), self._swans_seen, now)
+        if 'qoe' in have:
+            obs['qoe'] = telemetry.qoe_records(data.get('qoe'), now)
+        if 'wan_bonding' in have:
+            obs['wbond'] = telemetry.wbond_runtime(snap.get('bonding'), now)
+        if 'steering_rules' in have:
+            ts = snap.get('traffic_steering', {})
+            obs['steering'] = telemetry.steering_runtime(
+                ts.get('logical_rules'), now)
+            obs['steering_events'] = telemetry.steering_new_events(
+                ts.get('events'), self._event_seen, now)
+        obs['config_versions'] = self._update_config_versions(snap, now)
+        return obs
 
-        wan_states = {}
-        underlay = {}
-        for p in wan.get('paths', []):
-            if isinstance(p, dict):
-                wan_states[p.get('uid')] = p.get('connection_state')
-                if p.get('underlay_uid'):
-                    underlay[p.get('uid')] = p.get('underlay_uid')
+    def _update_config_versions(self, snap, now):
+        """Version static/config objects; a new version only on fp change."""
+        fps = snap.get('fingerprints', {})
+        wan = snap.get('wan', {})
+        bonds = snap.get('bonding', {}).get('bonds', [])
+        steering_defs = [{
+            'logical_name': r.get('logical_name'),
+            'fingerprint': r.get('semantic_fingerprint'),
+            'selector': r.get('wan_selector_type'),
+            'preferred_wan_raw': r.get('preferred_wan_raw'),
+            'branches': [{'traffic_class': b.get('traffic_class_name'),
+                          'trigger_priority': b.get('trigger_priority'),
+                          'selector': b.get('wan_selector_type')}
+                         for b in r.get('branches', [])
+                         if isinstance(b, dict)],
+        } for r in snap.get('traffic_steering', {}).get('logical_rules', [])]
+        wbond_cfg = [{'iface': b.get('iface'), 'name': b.get('name'),
+                      'members': [{'member_uid': m.get('member_uid'),
+                                   'configured_weight':
+                                   m.get('configured_weight')}
+                                  for m in b.get('members', [])]}
+                     for b in bonds]
+        caps = {'supported': snap.get('bonding', {}).get(
+                    'supported_capabilities', []),
+                'negotiated': {b.get('iface'): b.get('negotiated_capabilities')
+                               for b in bonds}}
+        underlay = wan.get('underlay_map', [])
+        items = (
+            ('traffic_classes', fps.get('traffic_classes'),
+             snap.get('traffic_classes')),
+            ('destinations', None, snap.get('identities', {}).get(
+                'destinations')),
+            ('wan_rules', None, wan.get('config')),
+            ('steering_definitions', fps.get('logical_rules'),
+             steering_defs),
+            ('wbond_config', fps.get('bonding_membership'), wbond_cfg),
+            ('overlay_underlay', None, underlay),
+            ('capabilities', None, caps),
+        )
+        out = {}
+        for name, fp, payload in items:
+            if fp is None:
+                fp = normalize._stable_hash(payload)
+            out[name] = self._config_store.update(name, fp, payload, now)
+        return out
 
-        swans = [{'uid': p.get('uid'), 'latency_ms': p.get('latency_ms'),
-                  'jitter_ms': p.get('jitter_ms')}
-                 for p in (snap.get('swans', {}) or {}).get('paths', [])
-                 if isinstance(p, dict)]
-        qoe = [{'uid': p.get('uid'),
-                'latency_avg_ms': p.get('latency_avg_ms'),
-                'latency_last_ms': p.get('latency_last_ms'),
-                'loss': p.get('loss')}
-               for p in (snap.get('qoe', {}) or {}).get('paths', [])
-               if isinstance(p, dict)]
-
-        rules = []
-        for lr in ts.get('logical_rules', []):
-            if not isinstance(lr, dict):
-                continue
-            rules.append({
-                'logical_name': lr.get('logical_name'),
-                'fingerprint': lr.get('semantic_fingerprint'),
-                'selector': lr.get('wan_selector_type'),
-                'preferred_wan': lr.get('preferred_wan'),
-                'steering_to': lr.get('steering_to'),
-                'runtime_algorithm': lr.get('runtime_algorithm'),
-                'preferred_flows': lr.get('preferred_flows'),
-                'nonpreferred_flows': lr.get('nonpreferred_flows'),
-                'latest_event_reason': lr.get('latest_event_reason'),
-            })
-
-        lbs = []
-        for lb in (snap.get('loadbalancers', []) or []):
-            if not isinstance(lb, dict):
-                continue
-            lbs.append({
-                'name': lb.get('name'),
-                'algorithm': lb.get('algorithm'),
-                'active_device': lb.get('active_device'),
-                'scores': {m.get('uid'): m.get('score')
-                           for m in lb.get('members', [])
-                           if isinstance(m, dict)},
-            })
-
-        bonds = []
-        for b in (snap.get('bonding', {}) or {}).get('bonds', []):
-            if not isinstance(b, dict):
-                continue
-            bonds.append({
-                'iface': b.get('iface'),
-                'name': b.get('name'),
-                'total_download_flows': b.get('total_download_flows'),
-                'total_upload_flows': b.get('total_upload_flows'),
-                'members': [{
-                    'member_uid': m.get('member_uid'),
-                    'configured_weight': m.get('configured_weight'),
-                    'current_download_weight': m.get('current_download_weight'),
-                    'current_upload_weight': m.get('current_upload_weight'),
-                    'download_flows': m.get('download_flows'),
-                    'upload_flows': m.get('upload_flows'),
-                } for m in b.get('members', []) if isinstance(m, dict)],
-            })
-
-        return {
-            'timestamp': snap.get('timestamp'),
-            'primary_device': wan.get('primary_device'),
-            'wan_states': wan_states,
-            'underlay_map': underlay,
-            'swans': swans,
-            'qoe': qoe,
-            'logical_rules': rules,
-            'loadbalancers': lbs,
-            'bonding': bonds,
-            'fingerprints': snap.get('fingerprints', {}),
-            'changes': snap.get('changes', {}),
-        }
+    def _raw(self):
+        """Merged last-known-good raw view (config + runtime)."""
+        data = dict(self._config_raw.data)
+        data.update(self._runtime_raw.data)
+        return data
 
     # --- composition (pure over cached raw; no router I/O except WBOND) ---
 
     def _compose_snapshot(self):
-        base = self._base_raw.data or {}
-        heavy = self._heavy_raw.data or {}
+        base = heavy = self._raw()
 
         primary = base.get('primary_device')
         raw_devices = base.get('wan_devices')
@@ -291,7 +483,7 @@ class AnalyzerService(object):
             base.get('steering_rules'),
             base.get('steering_stats'),
             base.get('steering_events'),
-            dest_index)
+            dest_index, wan_paths)
 
         events = normalize.steering_events(base.get('steering_events'))
         stats = normalize.steering_stats(base.get('steering_stats'))
@@ -359,6 +551,8 @@ class AnalyzerService(object):
             'fingerprints': self._compute_fingerprints(wan_paths, logical,
                                                         bonding, traffic_classes),
             'collectors': self._collector_health(),
+            'section_freshness': {k: dict(v) for k, v in
+                                  self._freshness.items()},
         }
 
         snapshot['changes'] = self._detect_changes(snapshot['fingerprints'])
@@ -380,7 +574,11 @@ class AnalyzerService(object):
             out.append({
                 'logical_name': lr.get('logical_name'),
                 'trigger_priority': lr.get('trigger_priority'),
+                'branch_count': len(lr.get('branches', [])),
                 'preferred_wan': lr.get('preferred_wan'),
+                'preferred_wan_raw': lr.get('preferred_wan_raw'),
+                'preferred_wan_uid': lr.get('preferred_wan_uid'),
+                'preferred_wan_name': lr.get('preferred_wan_name'),
                 'preferred_flows': pref,
                 'nonpreferred_flows': nonpref,
                 'was_flow_matched': lr.get('was_flow_matched'),
@@ -453,8 +651,8 @@ class AnalyzerService(object):
         rule_fps = {}
         for lr in logical:
             name = lr.get('logical_name') or 'rule'
-            rule_fps['{}#{}'.format(name, lr.get('trigger_priority'))] = \
-                lr.get('semantic_fingerprint')
+            # One logical policy == one name (branches live inside it).
+            rule_fps[name] = lr.get('semantic_fingerprint')
         return {
             'topology': normalize.topology_fingerprint(wan_paths),
             'bonding_membership': normalize.bonding_membership_fingerprint(
@@ -507,22 +705,21 @@ class AnalyzerService(object):
                 'first_snapshot': False}
 
     def _collector_health(self):
-        """Per-cadence + per-collector collection health.
+        """Per-collector health (last-known-good ts, error, error ts).
 
-        Per-collector detail (last-known-good ts, error, error ts) lets
-        /api/status show exactly which optional endpoint failed while the
-        rest of the snapshot stays valid.
+        Shows exactly which optional endpoint failed while the rest of the
+        snapshot stays valid.
         """
         return {
-            'fast': {
-                'interval': self._fast_interval,
-                'last_pass_ts': self._base_raw.updated_ts,
-                'collectors': self._base_raw.health(),
+            'schedule_minutes': self._schedule_minutes,
+            'next_scheduled_ts': self._next_due,
+            'runtime': {
+                'last_pass_ts': self._runtime_raw.updated_ts,
+                'collectors': self._runtime_raw.health(),
             },
-            'slow': {
-                'interval': self._slow_interval,
-                'last_pass_ts': self._heavy_raw.updated_ts,
-                'collectors': self._heavy_raw.health(),
+            'config': {
+                'last_pass_ts': self._config_raw.updated_ts,
+                'collectors': self._config_raw.health(),
             },
         }
 
@@ -542,24 +739,6 @@ class AnalyzerService(object):
         if not isinstance(snap, dict):
             return None
         return snap.get(name)
-
-    # --- back-compat helpers ---------------------------------------------
-
-    def build_snapshot(self):
-        """Back-compat: force a fresh collect + compose and return it.
-
-        Retained for the foundation loop / any direct caller. Prefer the
-        background refresh_* + snapshot() path so web never blocks on
-        collection. This performs router I/O, so it must NOT be called from a
-        web request handler.
-        """
-        self.refresh_base()
-        self.refresh_heavy()
-        return self.recompose()
-
-    def record_snapshot(self):
-        """Back-compat: build + store one snapshot (used by legacy loop)."""
-        return self.build_snapshot()
 
     def cellular_detail(self, device_id):
         """Per-modem diagnostics/stats for one cellular device UID.
@@ -595,7 +774,12 @@ class AnalyzerService(object):
         return {
             'app': 'sdwan_analyzer',
             'phase': 'backend',
+            'version': VERSION,
+            'recording': self._recording.status_block(),
             'storage': self._store.stats(),
+            'config_versions': self._config_store.summary(),
+            'section_freshness': {k: dict(v) for k, v in
+                                  self._freshness.items()},
             'web': web,
             'snapshot_ts': self._snapshot_ts,
             'collectors': self._collector_health(),

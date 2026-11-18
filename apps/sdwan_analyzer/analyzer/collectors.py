@@ -52,7 +52,14 @@ sub-path. Per-device diagnostics/stats are fetched per UID, never by pulling
 the whole status/wan tree in a loop.
 """
 
+import threading
+
 import cp
+
+
+ERR_TIMEOUT = 'timeout'   # read exceeded READ_TIMEOUT_S
+ERR_BUSY = 'busy'         # skipped: an earlier timed-out read is still pending
+ERR_API = 'api_error'     # cp.get raised
 
 
 class CollectResult(object):
@@ -70,26 +77,68 @@ class CollectResult(object):
         error (str|None): failure reason when not ok.
     """
 
-    __slots__ = ('ok', 'value', 'error')
+    __slots__ = ('ok', 'value', 'error', 'error_type')
 
-    def __init__(self, ok, value=None, error=None):
+    def __init__(self, ok, value=None, error=None, error_type=None):
         self.ok = ok
         self.value = value
         self.error = error
+        # One of ERR_TIMEOUT / ERR_BUSY / ERR_API when not ok.
+        self.error_type = error_type
+
+
+# Wall-clock bound for one collector read (seconds). Shared cp.py is NOT
+# modified: cp.get() has only a per-recv socket timeout on the router and no
+# bound at all over REST, so each read runs in a short-lived daemon thread
+# and the caller stops waiting after READ_TIMEOUT_S. A timed-out read cannot
+# be killed; its thread is abandoned and `_hung` makes later reads fail fast
+# (instead of piling up concurrent cp.get calls) until it finishes. LIMITATION:
+# the abandoned call may still complete in the background.
+READ_TIMEOUT_S = 15
+_hung = []
+
+
+def _bounded_call(path, timeout):
+    """Run cp.get(path) with a wall-clock bound.
+
+    Returns (done, value, err, err_type). At most ONE worker thread exists:
+    while a timed-out call is still pending, no new thread is started.
+    """
+    _hung[:] = [t for t in _hung if t.is_alive()]
+    if _hung:
+        return (False, None, 'collector busy (previous read still pending)',
+                ERR_BUSY)
+    box = {}
+
+    def _run():
+        try:
+            box['value'] = cp.get(path)
+        except Exception as e:
+            box['error'] = str(e)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        _hung.append(t)
+        return False, None, 'timeout after {}s'.format(timeout), ERR_TIMEOUT
+    if 'error' in box:
+        return False, None, box['error'], ERR_API
+    return True, box.get('value'), None, None
 
 
 def _get_result(path):
     """Fetch a status/config path as an explicit CollectResult.
 
-    A successful cp.get() (even returning None/empty) yields ok=True; only an
-    exception yields ok=False. This is the caching-authoritative read.
+    A successful cp.get() (even returning None/empty) yields ok=True; a
+    raised exception or a wall-clock timeout yields ok=False. This is the
+    caching-authoritative read.
     """
-    try:
-        value = cp.get(path)
+    done, value, err, etype = _bounded_call(path, READ_TIMEOUT_S)
+    if done:
         return CollectResult(True, value=value, error=None)
-    except Exception as e:
-        cp.log('collectors: error reading {}: {}'.format(path, e))
-        return CollectResult(False, value=None, error=str(e))
+    cp.log('collectors: error reading {}: {}'.format(path, err))
+    return CollectResult(False, value=None, error=err, error_type=etype)
 
 
 def _get(path):
@@ -268,7 +317,7 @@ def loadbalancers():
     """status/wan/loadbalancers -> {name: {type/algo, devices, score, ...}}.
 
     WARNING: this endpoint can be slow on the R1900. It is a HEAVY collector
-    and must run on the slow cadence, never the fast topology cadence. Object
+    and is read only on startup/reconciliation/manual refresh. Object
     types include rate-* and spillover-*; fields vary by algorithm.
     """
     return _get('status/wan/loadbalancers')
@@ -292,12 +341,12 @@ def wan_bonding():
 
     Contains per-bond runtime (mode, state, members, directional weights,
     flow counts, capabilities). Per-interface member detail is fetched via
-    wbond_interface(iface). HEAVY-ish -> slow cadence.
+    wbond_interface(iface). Read on every observation.
     """
     return _get('status/sdwan_adv/wan_bonding')
 
 
-# --- Config trees (static-ish -- cache long, refresh on slow cadence) -----
+# --- Config trees (static-ish -- cache long, read on startup, reconciliation, manual refresh) -----
 
 def wan_rules2():
     """config/wan/rules2 -> WAN profile config (priorities, bandwidth, etc.).
@@ -355,13 +404,9 @@ def _steering_split_results():
     """
     res = _get_result('status/wan/steering')
     if not res.ok:
-        err = res.error
-        return {
-            'steering_rules': CollectResult(False, error=err),
-            'steering_events': CollectResult(False, error=err),
-            'steering_stats': CollectResult(False, error=err),
-            'steering_intents': CollectResult(False, error=err),
-        }
+        return {k: CollectResult(False, error=res.error,
+                                 error_type=res.error_type)
+                for k in _STEERING_KEYS}
     parent = res.value if isinstance(res.value, dict) else {}
     # A successful parent read that lacks a child key is a legitimate empty
     # for that child (ok=True, value None) -- it must replace stale data.
@@ -373,43 +418,93 @@ def _steering_split_results():
     }
 
 
-def collect_base_snapshot():
-    """LIGHTWEIGHT topology/state pass -- safe to run on the fast cadence.
+# --- Collection groups ----------------------------------------------------
+#
+# There are NO periodic fast/slow passes. A pass is run only for startup, the
+# user-selected schedule, a manual refresh or (later) a Recording job.
+#
+# RUNTIME keys are read for every scheduled observation. CONFIG keys are
+# static/change-versioned: read at startup, on ~hourly reconciliation and on
+# targeted manual refresh. NOTE: the broad status/sdwan_adv read is never
+# collected; only the targeted wan_bonding and qoe subtrees are.
 
-    Returns {key: CollectResult}. Small, frequently-changing trees only.
-    Excludes heavy/slow trees (loadbalancers), detailed bonding runtime,
-    QoE, and static config trees (collected on the slow cadence). The four
-    steering sub-trees come from ONE status/wan/steering read (see
-    _steering_split_results).
+_PATHS = {
+    'wan_devices': 'status/wan/devices',
+    'primary_device': 'status/wan/primary_device',
+    'wan_policies': 'status/wan/policies',
+    'swans': 'status/wan/swans',
+    'sdwan_links': 'status/wan/sdwan',
+    'wan_bonding': 'status/sdwan_adv/wan_bonding',
+    'qoe': 'status/sdwan_adv/qoe',
+    'loadbalancers': 'status/wan/loadbalancers',
+    'wan_rules2': 'config/wan/rules2',
+    'identities_ip': 'config/identities/ip',
+    'identities_intent': 'config/identities/intent',
+    'traffic_class_config': 'config/sdwan_adv/traffic_class',
+}
+_STEERING_KEYS = ('steering_rules', 'steering_events', 'steering_stats',
+                  'steering_intents')
+
+# Key classes. loadbalancers is RUNTIME data (not static config) but is
+# expensive on the R1900, so it is read only at startup, ~hourly reconciliation
+# and targeted manual refresh -- never on every observation and never during
+# high-rate Recording by default.
+STATIC_CONFIG_KEYS = ('wan_rules2', 'identities_ip', 'identities_intent',
+                      'traffic_class_config')
+EXPENSIVE_RUNTIME_KEYS = ('loadbalancers',)
+CLASS_RUNTIME = 'runtime'
+CLASS_EXPENSIVE_RUNTIME = 'expensive_runtime'
+CLASS_STATIC_CONFIG = 'static_config'
+
+RUNTIME_KEYS = ('wan_devices', 'primary_device', 'wan_policies', 'swans',
+                'sdwan_links', 'wan_bonding', 'qoe') + _STEERING_KEYS
+# Low-frequency set (startup + reconciliation): static config + expensive
+# runtime. Name kept for the existing reconcile logic; see classes above.
+CONFIG_KEYS = EXPENSIVE_RUNTIME_KEYS + STATIC_CONFIG_KEYS
+
+
+def key_class(key):
+    if key in EXPENSIVE_RUNTIME_KEYS:
+        return CLASS_EXPENSIVE_RUNTIME
+    if key in STATIC_CONFIG_KEYS:
+        return CLASS_STATIC_CONFIG
+    return CLASS_RUNTIME
+
+# Targeted manual-refresh groups -> keys read.
+REFRESH_GROUPS = {
+    'traffic_classes': ('identities_intent', 'traffic_class_config'),
+    'steering': _STEERING_KEYS + ('identities_ip',),
+    'bonding': ('wan_devices', 'wan_bonding'),
+    'wan_paths': ('wan_devices', 'primary_device', 'swans', 'qoe'),
+    'overview': RUNTIME_KEYS,
+    'loadbalancers': EXPENSIVE_RUNTIME_KEYS,
+}
+
+
+def collect_keys(keys):
+    """Read the named collector keys. Returns {key: CollectResult}.
+
+    Steering keys share ONE status/wan/steering read (split locally).
     """
-    out = {
-        'wan_devices': _get_result('status/wan/devices'),
-        'primary_device': _get_result('status/wan/primary_device'),
-        'wan_policies': _get_result('status/wan/policies'),
-        'swans': _get_result('status/wan/swans'),
-        'sdwan_links': _get_result('status/wan/sdwan'),
-    }
-    out.update(_steering_split_results())
+    out = {}
+    keys = tuple(keys)
+    for key in keys:
+        if key in _STEERING_KEYS or key not in _PATHS:
+            continue
+        out[key] = _get_result(_PATHS[key])
+    if any(k in _STEERING_KEYS for k in keys):
+        split = _steering_split_results()
+        for key in keys:
+            if key in _STEERING_KEYS:
+                out[key] = split[key]
     return out
 
 
-def collect_heavy_snapshot():
-    """HEAVIER runtime + static config pass -- run on the SLOW cadence.
+def collect_runtime_snapshot():
+    """Runtime telemetry reads for one observation."""
+    return collect_keys(RUNTIME_KEYS)
 
-    Returns {key: CollectResult}. Groups the expensive/slow trees
-    (loadbalancers), detailed bonding runtime, QoE, and the static-ish config
-    identity/class trees. Kept separate so heavy cadence differs from
-    lightweight topology cadence (COLLECTION PERFORMANCE / SAFETY).
-    """
-    # NOTE: the broad status/sdwan_adv read is intentionally NOT collected --
-    # it is not consumed anywhere and pulling the whole subtree adds needless
-    # management-plane load. Only the targeted sub-trees below are read.
-    return {
-        'wan_bonding': _get_result('status/sdwan_adv/wan_bonding'),
-        'qoe': _get_result('status/sdwan_adv/qoe'),
-        'loadbalancers': _get_result('status/wan/loadbalancers'),
-        'wan_rules2': _get_result('config/wan/rules2'),
-        'identities_ip': _get_result('config/identities/ip'),
-        'identities_intent': _get_result('config/identities/intent'),
-        'traffic_class_config': _get_result('config/sdwan_adv/traffic_class'),
-    }
+
+def collect_config_snapshot():
+    """Static/config reads (change-versioned; startup + reconciliation)."""
+    return collect_keys(CONFIG_KEYS)

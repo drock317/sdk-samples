@@ -14,4 +14,4 @@
 # never reaches NCOS APIs. Collection/storage/business logic stay out of the
 # presentation layer.
 
-VERSION = '0.2.2'
+VERSION = '0.3.2'
