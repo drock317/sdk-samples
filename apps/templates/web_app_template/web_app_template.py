@@ -10,6 +10,9 @@ import socketserver
 import os
 import sys
 import json
+import time
+
+import web_port
 
 try:
     import configparser
@@ -23,7 +26,9 @@ try:
 except ImportError:
     ON_ROUTER = False
 
-# Default port
+# First-run discovery start port for local (off-router) use. On-router the
+# effective port is resolved through web_port (configured appdata value is
+# authoritative; otherwise discover-and-persist from this base).
 PORT = 8000
 
 # Resolve paths relative to this script
@@ -314,46 +319,93 @@ class AppRequestHandler(http.server.BaseHTTPRequestHandler):
                               format % args))
 
 
-def main():
-    """Start the HTTP server."""
-    app_name, version = _read_package_ini()
+def _main_on_router(app_name, version):
+    """Start the HTTP server on the router using the web_port standard.
 
-    if ON_ROUTER:
-        cp.log('Starting {} v{}...'.format(app_name, version))
+    The effective port comes from web_port.bind_web_socket:
+      * a configured <app_name>_web_port in App Data is authoritative
+        (bind-exact or fail closed), and
+      * first-run discovery scans from PORT by real socket bind and
+        persists the result for reuse on later starts.
 
+    bind_web_socket returns an already-bound socket, which is handed to
+    HTTPServer(bind_and_activate=False) so the bind itself is the
+    availability test (no check-then-bind race).
+    """
+    cp.log('Starting {} v{}...'.format(app_name, version))
+
+    result = web_port.bind_web_socket_with_retry(
+        app_name, cp.get_appdata, cp.put_appdata, cp.log,
+        start_port=PORT)
+    if not result.ok:
+        # A web app with no port is useless: stop the app via the SDK. Do NOT
+        # sys.exit(): NCOS restarts an exited app (restart = true) every few
+        # seconds, which would spam the log forever. A stopped app is not
+        # restarted. The reason has already been logged.
+        cp.log('ERROR: web server NOT started ({}). Stopping the app; '
+               'correct {} and start it again.'.format(
+                   result.error, web_port.appdata_field(app_name)))
+        if web_port.stop_app(cp.put, cp.log):
+            time.sleep(30)  # give the SDK time to terminate this process
+        cp.log('SDK stop request was not honoured; idling without the web '
+               'server (no exit, to avoid a restart loop).')
+        while True:
+            time.sleep(3600)
+
+    httpd = http.server.HTTPServer(('0.0.0.0', result.port),
+                                   AppRequestHandler,
+                                   bind_and_activate=False)
+    # Close the unused placeholder socket HTTPServer created, then hand over
+    # the pre-bound listening socket (no re-bind).
+    httpd.socket.close()
+    httpd.socket = result.sock
+    cp.log('Web server started on port {} (source: {})'.format(
+        result.port, result.source))
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
+
+
+def _main_local(app_name, version):
+    """Start the HTTP server for local (off-router) development.
+
+    No cp/App Data available locally, so this uses the simple bind on PORT.
+    The on-router path is the one that implements the web_port standard.
+    """
     try:
         with socketserver.TCPServer(("", PORT), AppRequestHandler) as httpd:
-            if ON_ROUTER:
-                cp.log('Web server started on port {}'.format(PORT))
-            else:
-                print("=" * 60)
-                print("{} v{}".format(app_name, version))
-                print("=" * 60)
-                print("Server running at: http://0.0.0.0:{}".format(PORT))
-                print("Serving directory: {}".format(_SCRIPT_DIR))
-                print("\nPress Ctrl+C to stop the server")
-                print("=" * 60)
-
+            print("=" * 60)
+            print("{} v{}".format(app_name, version))
+            print("=" * 60)
+            print("Server running at: http://0.0.0.0:{}".format(PORT))
+            print("Serving directory: {}".format(_SCRIPT_DIR))
+            print("\nPress Ctrl+C to stop the server")
+            print("=" * 60)
             httpd.serve_forever()
-
     except KeyboardInterrupt:
-        if not ON_ROUTER:
-            print("\n\nServer stopped by user.")
+        print("\n\nServer stopped by user.")
         sys.exit(0)
     except OSError as e:
         if e.errno == 48 or e.errno == 98:  # Address already in use
-            msg = "Port {} is already in use.".format(PORT)
-            if ON_ROUTER:
-                cp.log('ERROR: {}'.format(msg))
-            else:
-                print("\nError: {}".format(msg))
+            print("\nError: Port {} is already in use.".format(PORT))
         else:
-            msg = "Failed to start server: {}".format(e)
-            if ON_ROUTER:
-                cp.log('ERROR: {}'.format(msg))
-            else:
-                print("\nError: {}".format(msg))
+            print("\nError: Failed to start server: {}".format(e))
         sys.exit(1)
+
+
+def main():
+    """Start the HTTP server."""
+    app_name, version = _read_package_ini()
+    if ON_ROUTER:
+        _main_on_router(app_name, version)
+    else:
+        _main_local(app_name, version)
 
 
 if __name__ == "__main__":

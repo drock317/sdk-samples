@@ -38,6 +38,51 @@ def find_iperf3():
     return None
 
 
+def get_source_ips():
+    """Collect bindable local IPs (LAN networks and connected WAN devices).
+
+    Returns a list of {'ip', 'label'} dicts. iperf3 -B binds the client/server
+    socket to one of these local addresses so the test egresses a chosen
+    interface. Only IPv4 addresses are returned (the client command forces -4).
+    """
+    ips = []
+    seen = set()
+
+    def add(ip, label):
+        if ip and ':' not in ip and ip not in seen:
+            seen.add(ip)
+            ips.append({'ip': ip, 'label': label})
+
+    # LAN networks: status/lan/networks/<name>/info has name + ip_address
+    try:
+        networks = cp.get('status/lan/networks') or {}
+        for net in networks.values():
+            info = net.get('info', {}) if isinstance(net, dict) else {}
+            add(info.get('ip_address'), 'LAN: ' + (info.get('name') or 'LAN'))
+    except Exception as e:
+        cp.log(f'Error reading LAN networks: {e}')
+
+    # WAN devices: status/wan/devices/<id>/status.ipinfo.ip_address (only when
+    # connected). Label with the device product/type so the user can tell SIMs
+    # and ethernet WANs apart.
+    try:
+        devices = cp.get('status/wan/devices') or {}
+        for dev in devices.values():
+            if not isinstance(dev, dict):
+                continue
+            status = dev.get('status', {})
+            if status.get('connection_state') != 'connected':
+                continue
+            ip = status.get('ipinfo', {}).get('ip_address')
+            info = dev.get('info', {})
+            name = info.get('product') or info.get('type') or 'WAN'
+            add(ip, 'WAN: ' + name)
+    except Exception as e:
+        cp.log(f'Error reading WAN devices: {e}')
+
+    return ips
+
+
 def load_history():
     """Load test history from disk."""
     try:
@@ -82,6 +127,16 @@ def add_history_entry(opts, summary):
 def build_client_command(binary, opts):
     """Build iperf3 client command from options."""
     cmd = [binary, '-c', opts['host'], '-J']
+    # Bind to a chosen local source IP (LAN or WAN) so the test egresses that
+    # interface. -B must come before other options.
+    if opts.get('source_ip'):
+        cmd += ['-B', opts['source_ip']]
+    # Force IPv4 unless the target is an IPv6 literal. iperf3 resolves both A
+    # and AAAA and prefers IPv6; a router WAN that hands out an IPv6 address
+    # and default route but does not actually pass IPv6 traffic (seen on
+    # cellular) makes the connect hang silently until the test times out.
+    if ':' not in opts['host']:
+        cmd.append('-4')
     if opts.get('port') and opts['port'] != 5201:
         cmd += ['-p', str(opts['port'])]
     if opts.get('protocol') == 'udp':
@@ -176,45 +231,43 @@ def parse_json_results(json_str):
     }
 
     end = data.get('end', {})
+    test_start = data.get('start', {}).get('test_start', {})
+    reverse = bool(test_start.get('reverse'))
+    bidir = bool(test_start.get('bidir'))
 
-    # TCP results
-    sum_sent = end.get('sum_sent', {})
-    sum_received = end.get('sum_received', {})
+    # sum_sent / sum_received are the SAME flow measured at each end, not
+    # upload vs download. Report the receiver side (what actually arrived).
+    # The flow runs client->server unless -R; --bidir adds a second flow in
+    # the *_bidir_reverse keys. UDP on older iperf3 only has 'sum'.
+    def received(suffix=''):
+        return end.get('sum_received' + suffix) or end.get('sum' + suffix) or {}
 
-    if sum_sent.get('bits_per_second') is not None:
-        summary['upload'] = format_bits(sum_sent['bits_per_second'])
-        summary['transfer'] = format_bytes(sum_sent.get('bytes', 0))
-        summary['bandwidth_raw'] = summary['upload']
+    forward = received()
+    if bidir:
+        flows = {'upload': forward, 'download': received('_bidir_reverse')}
+    elif reverse:
+        flows = {'download': forward}
+    else:
+        flows = {'upload': forward}
 
-    if sum_received.get('bits_per_second') is not None:
-        summary['download'] = format_bits(sum_received['bits_per_second'])
-        if summary['transfer'] == '--':
-            summary['transfer'] = format_bytes(sum_received.get('bytes', 0))
-        summary['bandwidth_raw'] = summary['download']
+    total_bytes = 0
+    for direction, flow in flows.items():
+        if flow.get('bits_per_second') is not None:
+            summary[direction] = format_bits(flow['bits_per_second'])
+            total_bytes += flow.get('bytes', 0)
+    if total_bytes:
+        summary['transfer'] = format_bytes(total_bytes)
 
-    # UDP results
-    sum_udp = end.get('sum', {})
-    if sum_udp.get('bits_per_second') is not None:
-        bw = format_bits(sum_udp['bits_per_second'])
-        summary['upload'] = bw
-        summary['bandwidth_raw'] = bw
-        summary['transfer'] = format_bytes(sum_udp.get('bytes', 0))
+    # History keeps one number: download for download/bidir, else upload.
+    summary['bandwidth_raw'] = (summary['download']
+                                if summary['download'] != '--'
+                                else summary['upload'])
 
-    if sum_udp.get('jitter_ms') is not None:
-        summary['jitter'] = f"{sum_udp['jitter_ms']:.3f} ms"
-
-    if sum_udp.get('lost_percent') is not None:
-        summary['loss'] = f"{sum_udp['lost_percent']:.2f}%"
-
-    # Bidirectional results
-    streams = end.get('streams', [])
-    for stream in streams:
-        sender = stream.get('sender', {})
-        receiver = stream.get('receiver', {})
-        if sender.get('bits_per_second') is not None:
-            summary['upload'] = format_bits(sender['bits_per_second'])
-        if receiver.get('bits_per_second') is not None:
-            summary['download'] = format_bits(receiver['bits_per_second'])
+    # UDP jitter/loss come from the receiver of the primary (forward) flow.
+    if forward.get('jitter_ms') is not None:
+        summary['jitter'] = f"{forward['jitter_ms']:.3f} ms"
+    if forward.get('lost_percent') is not None:
+        summary['loss'] = f"{forward['lost_percent']:.2f}%"
 
     return summary
 
@@ -267,27 +320,30 @@ def run_test(opts):
             with output_lock:
                 current_output += '\nServer stopped.\n'
         else:
-            # Client mode: collect all output, parse JSON at end
-            stdout_data = b''
-            while True:
-                line = proc.stdout.readline()
-                if not line and proc.poll() is not None:
-                    break
-                if line:
-                    stdout_data += line
-                    decoded = line.decode('utf-8', errors='replace')
-                    with output_lock:
-                        current_output += decoded
+            # Client mode: with -J, iperf3 emits one JSON blob at the end, so
+            # drain stdout AND stderr together via communicate(). readline()
+            # looping on stdout alone can busy-spin or hang, and loses stderr
+            # (where connection errors are written). Give it the test duration
+            # plus headroom so a stuck connection cannot hang forever.
+            with output_lock:
+                current_output = 'Running test...\n'
 
-            # Get any remaining output
-            remaining, stderr = proc.communicate(timeout=5)
-            if remaining:
-                stdout_data += remaining
+            timeout = int(opts.get('duration', 10) or 10) + 20
+            try:
+                stdout_data, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout_data, stderr = proc.communicate()
                 with output_lock:
-                    current_output += remaining.decode('utf-8', errors='replace')
+                    test_error = ('Test timed out after %ds (server unreachable '
+                                  'or not responding).' % timeout)
+                    test_summary = None
+                    current_output = (test_error + '\n')
+                return
 
             # Parse JSON results
-            full_output = stdout_data.decode('utf-8', errors='replace')
+            full_output = (stdout_data or b'').decode('utf-8', errors='replace')
+            stderr_text = (stderr or b'').decode('utf-8', errors='replace').strip()
             summary = parse_json_results(full_output)
 
             with output_lock:
@@ -317,12 +373,18 @@ def run_test(opts):
                     add_history_entry(opts, summary)
                     cp.log(f"iPerf3 result: {summary.get('bandwidth_raw', '--')}")
                 else:
-                    test_error = 'Failed to parse iperf3 output.'
-                    if stderr:
-                        err_text = stderr.decode('utf-8', errors='replace').strip()
-                        if err_text:
-                            test_error += f' stderr: {err_text}'
-                            current_output += f'\nSTDERR: {err_text}\n'
+                    # No parseable JSON. The real reason is almost always on
+                    # stderr (connection refused, host unreachable, bad flag).
+                    if stderr_text:
+                        test_error = stderr_text
+                        current_output = stderr_text + '\n'
+                    elif full_output.strip():
+                        test_error = 'Could not parse iperf3 output.'
+                        current_output = full_output
+                    else:
+                        test_error = ('No output from iperf3 (server unreachable '
+                                      'or connection refused).')
+                        current_output = test_error + '\n'
 
     except subprocess.TimeoutExpired:
         with output_lock:
@@ -434,6 +496,8 @@ class Iperf3Handler(http.server.SimpleHTTPRequestHandler):
             self.api_status()
         elif self.path == '/api/history':
             self.api_history()
+        elif self.path == '/api/ips':
+            self.api_ips()
         elif self.path == '/api/export/csv':
             self.api_export_csv()
         elif self.path == '/api/export/html':
@@ -547,6 +611,9 @@ class Iperf3Handler(http.server.SimpleHTTPRequestHandler):
     def api_history(self):
         history = load_history()
         self.send_json({'history': history})
+
+    def api_ips(self):
+        self.send_json({'ips': get_source_ips()})
 
     def api_clear_history(self):
         save_history([])

@@ -16,6 +16,27 @@ import configparser
 results_dir = 'results'
 dispatcher = None
 
+# Timestamp shown on each results panel entry and reported as the last test time.
+TITLE_TIMESTAMP_FORMAT = '%H:%M:%S  %m/%d/%Y'
+
+# Pings sent to the iPerf3 server, before the transfer starts, to measure
+# latency on an idle link.
+LATENCY_PING_COUNT = 4
+
+# control/ping is one shared router resource - see ping() below.
+ping_resource_lock = Lock()
+
+# The results panel text and the test counters are read-modify-written from every
+# modem thread in a survey, so they are guarded - see log_all() and
+# record_test_result().
+results_lock = Lock()
+
+# How much of the results panel text to keep. The panel is newest-first and is
+# only a display buffer, so old entries fall off the end. The test counters are
+# tracked separately for exactly this reason: counting entries in this buffer
+# stops increasing once it fills up.
+RESULTS_BUFFER_CHARS = 32000
+
 
 class TestHandler(tornado.web.RequestHandler):
     """Handles test/ endpoint requests."""
@@ -46,9 +67,12 @@ class ClearHandler(tornado.web.RequestHandler):
     """Handles clear/ endpoint requests."""
 
     def get(self):
-        """Clear the dispatcher results"""
+        """Clear the dispatcher results and the test counters shown above them"""
         if dispatcher:
-            dispatcher.results = ''
+            with results_lock:
+                dispatcher.results = ''
+                dispatcher.test_count = 0
+                dispatcher.last_test_time = None
         self.redirect('/')
         return
 
@@ -63,9 +87,15 @@ class ConfigHandler(tornado.web.RequestHandler):
             if dispatcher:
                 config["results"] = dispatcher.results
                 config["version"] = dispatcher.version
+                # Counted server side. The UI used to count timestamps in the
+                # results text, which stops growing once that buffer fills.
+                config["test_count"] = dispatcher.test_count
+                config["last_test_time"] = dispatcher.last_test_time
             else:
                 config["results"] = ""
                 config["version"] = "1.0.0"
+                config["test_count"] = 0
+                config["last_test_time"] = None
             
             # Add GPS lock status
             try:
@@ -137,6 +167,32 @@ class SubmitHandler(tornado.web.RequestHandler):
             cp.log(f'Exception parsing iperf3_ports: {e}')
 
         try:
+            protocol = self.get_argument('iperf3_protocol', '').strip().lower()
+            if protocol:
+                dispatcher.config["iperf3_protocol"] = protocol
+        except Exception as e:
+            cp.log(f'Exception parsing iperf3_protocol: {e}')
+
+        # Size-style iPerf3 options. Blank means "let iperf3 decide", so an empty
+        # field is stored as-is rather than falling back to a default.
+        for field in ('iperf3_bandwidth', 'iperf3_bytes', 'iperf3_buffer_length',
+                      'iperf3_window'):
+            try:
+                dispatcher.config[field] = self.get_argument(field, '').strip()
+            except Exception as e:
+                cp.log(f'Exception parsing {field}: {e}')
+
+        # Numeric iPerf3 options. A blank field falls back to the code default
+        # instead of 0, which would mean a zero-second test.
+        for field in ('iperf3_duration', 'iperf3_parallel', 'iperf3_omit'):
+            try:
+                value = self.get_argument(field, '').strip()
+                dispatcher.config[field] = int(value) if value else settings[field]
+            except Exception as e:
+                cp.log(f'Exception parsing {field}: {e}')
+                dispatcher.config[field] = settings[field]
+
+        try:
             surveyors = self.get_argument('surveyors')
             if surveyors:
                 surveyors = [x.strip() for x in surveyors.split(',')]
@@ -159,7 +215,9 @@ class SubmitHandler(tornado.web.RequestHandler):
             "debug": bool,
             "enabled": bool,
             "enable_timer": bool,
-            "all_wans": bool
+            "all_wans": bool,
+            "iperf3_no_delay": bool,
+            "iperf3_zero_copy": bool
         }
 
         # Function to safely get and convert arguments
@@ -210,6 +268,9 @@ class Dispatcher:
         self.manual = False
         self.timestamp = None
         self.total_bytes = {}
+        # Counted as tests complete, not derived from the capped results text.
+        self.test_count = 0
+        self.last_test_time = None
         self.lat, self.long, self.accuracy = None, None, None
         self.serial_number, self.mac_address, self.router_id = None, None, None
         self.ping_lock = Lock()  # Lock for thread-safe ping counter operations
@@ -506,9 +567,37 @@ def get_config(name):
                 config['iperf3_server'] = settings['iperf3_server']
         if config.get('iperf3_ports') is None:
             config['iperf3_ports'] = settings['iperf3_ports']
+        # Fill in any iPerf3 test option a config saved by an older version
+        # predates, so the UI always has a value to show.
+        for field, default in settings.items():
+            if field.startswith('iperf3_') and config.get(field) is None:
+                config[field] = default
         config.pop('speedtest_url', None)
         save_config(config, 'Mobile_Site_Survey')
     return config
+
+
+def iperf3_options(config):
+    """Collect the iPerf3 test options from config, keyed as speedtest wants.
+
+    Only keys actually present are passed through, so the speedtest module keeps
+    its own default for anything this config does not carry. Values are validated
+    there rather than here.
+    """
+    mapping = {
+        'iperf3_protocol': 'protocol',
+        'iperf3_duration': 'duration',
+        'iperf3_parallel': 'parallel',
+        'iperf3_bandwidth': 'bandwidth',
+        'iperf3_bytes': 'bytes',
+        'iperf3_buffer_length': 'buffer_length',
+        'iperf3_omit': 'omit',
+        'iperf3_window': 'window',
+        'iperf3_no_delay': 'no_delay',
+        'iperf3_zero_copy': 'zero_copy'
+    }
+    return {option: config[field] for field, option in mapping.items()
+            if config.get(field) is not None}
 
 
 def apply_speedtest_config(config):
@@ -517,7 +606,8 @@ def apply_speedtest_config(config):
         speedtest.configure(
             engine=config.get('speedtest_engine'),
             iperf3_server=config.get('iperf3_server', ''),
-            iperf3_ports=config.get('iperf3_ports', ''))
+            iperf3_ports=config.get('iperf3_ports', ''),
+            iperf3_options=iperf3_options(config))
         problem = speedtest.engine_error()
         if problem:
             cp.log(f'Speedtest engine: {speedtest.describe_engine()} '
@@ -547,7 +637,26 @@ def log_all(msg, logs):
     logstamp = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
     cp.log(msg)
     logs.append(f'{logstamp} {msg}')
-    dispatcher.results = f'{msg}\n\n' + dispatcher.results[:32000]
+    # Concurrent modem threads all append here, so without the lock one thread's
+    # entry can overwrite another's.
+    with results_lock:
+        dispatcher.results = f'{msg}\n\n' + dispatcher.results[:RESULTS_BUFFER_CHARS]
+
+
+def record_test_result():
+    """Count one completed modem test and stamp the time it finished.
+
+    Kept separate from the results panel text because that text is a capped
+    display buffer - deriving the count from it stops at whatever fits in
+    RESULTS_BUFFER_CHARS, and its newest-first order makes the trailing
+    timestamp the oldest retained one rather than the latest.
+    """
+    if not dispatcher:
+        return
+    with results_lock:
+        dispatcher.test_count += 1
+        dispatcher.last_test_time = time.strftime(TITLE_TIMESTAMP_FORMAT,
+                                                 time.gmtime())
 
 
 def log_progress(msg, logs):
@@ -557,45 +666,84 @@ def log_progress(msg, logs):
     logs.append(f'{logstamp} {msg}')
 
 
-def ping(host, iface):
-    """Ping host and return dict of results"""
-    try:
-        start = {"bind_ip": False, "deadline": "Same as timeout", "df": "do", "family": "inet", "fwmark": None,
-                 "host": host, "iface": iface, "interval": 0.5, "num": 10, "size": 56, "srcaddr": None, "timeout": 15}
+def ping(host, iface, count=10):
+    """Ping host over iface and return a dict of results including min/avg/max.
 
-        cp.put('control/ping/start', {})
-        cp.put('control/ping/status', '')
-        cp.put('control/ping/start', start)
-        pingstats = start
-        try_count = 0
-        while try_count < 30:
-            result = cp.get('control/ping')
-            if result.get('status') in ["error", "done"]:
-                break
-            time.sleep(0.5)
-            try_count += 1
-        else:
-            pingstats['error'] = "No Results - Execution Timed Out"
-            return pingstats
-        # Parse results text
-        parsedresults = result.get('result').split('\n')
-        i = 0
-        index = 1
-        for item in parsedresults:
-            if item[0:3] == "---": index = i + 1
-            i += 1
+    Two callers: the dispatcher's packet loss loop, which wants the default
+    10-packet run, and ping_latency() below, which the iPerf3 engine uses to
+    measure latency before a transfer.
+    """
+    # control/ping is a single shared router resource, so concurrent callers must
+    # not drive it at the same time - one would read back the other's results.
+    # Surveys test every connected modem at once, so callers serialise here.
+    with ping_resource_lock:
         try:
-            pingstats['tx'] = int(parsedresults[index].split(' ')[0])
-            pingstats['rx'] = int(parsedresults[index].split(' ')[3])
-            pingstats['loss'] = float(parsedresults[index].split(' ')[6].split('%')[0])
-            pingstats['min'] = float(parsedresults[index + 1].split(' ')[5].split('/')[0])
-            pingstats['avg'] = float(parsedresults[index + 1].split(' ')[5].split('/')[1])
-            pingstats['max'] = float(parsedresults[index + 1].split(' ')[5].split('/')[2])
+            start = {"bind_ip": False, "deadline": "Same as timeout", "df": "do", "family": "inet", "fwmark": None,
+                     "host": host, "iface": iface, "interval": 0.5, "num": count, "size": 56, "srcaddr": None,
+                     "timeout": 15}
+
+            cp.put('control/ping/start', {})
+            cp.put('control/ping/status', '')
+            cp.put('control/ping/start', start)
+            pingstats = start
+            try_count = 0
+            while try_count < 30:
+                result = cp.get('control/ping')
+                if result.get('status') in ["error", "done"]:
+                    break
+                time.sleep(0.5)
+                try_count += 1
+            else:
+                pingstats['error'] = "No Results - Execution Timed Out"
+                return pingstats
+            # Parse results text
+            parsedresults = result.get('result').split('\n')
+            i = 0
+            index = 1
+            for item in parsedresults:
+                if item[0:3] == "---": index = i + 1
+                i += 1
+            try:
+                pingstats['tx'] = int(parsedresults[index].split(' ')[0])
+                pingstats['rx'] = int(parsedresults[index].split(' ')[3])
+                pingstats['loss'] = float(parsedresults[index].split(' ')[6].split('%')[0])
+                pingstats['min'] = float(parsedresults[index + 1].split(' ')[5].split('/')[0])
+                pingstats['avg'] = float(parsedresults[index + 1].split(' ')[5].split('/')[1])
+                pingstats['max'] = float(parsedresults[index + 1].split(' ')[5].split('/')[2])
+            except Exception as e:
+                cp.log(f'Exception parsing ping results: {e}')
+            return pingstats
         except Exception as e:
-            cp.log(f'Exception parsing ping results: {e}')
-        return pingstats
+            cp.log(f'Exception in PING: {e}')
+
+
+def ping_latency(host, iface, count=LATENCY_PING_COUNT):
+    """Ping host before any transfer and return {'avg', 'min', 'max', 'loss'}.
+
+    In ms, with loss as a percentage. Any value may be None. This is what the
+    reported Latency means for the iPerf3 engine: the quiet-path round trip,
+    measured before any data moves.
+
+    iperf3's own round-trip times are NOT used for this. They are sampled from a
+    saturating transfer, so they include the queueing delay the test itself
+    causes - typically several times the idle figure - and are logged as a
+    separate saturated reading rather than reported as latency.
+
+    The survey's packet loss column keeps coming from the dispatcher's own
+    continuous ping loop, so the loss value here is only for logging.
+    """
+    empty = {'avg': None, 'min': None, 'max': None, 'loss': None}
+    try:
+        result = ping(host, iface, count=count) or {}
+        if result.get('avg') is None:
+            cp.log(f'No latency measured for {host} on {iface}: '
+                   f'{result.get("error") or "ping returned no statistics"}')
+            return dict(empty, loss=result.get('loss'))
+        return {'avg': result.get('avg'), 'min': result.get('min'),
+                'max': result.get('max'), 'loss': result.get('loss')}
     except Exception as e:
-        cp.log(f'Exception in PING: {e}')
+        cp.log(f'Exception measuring latency to {host}: {e}')
+        return dict(empty)
 
 
 def _normalize_to_list(obj):
@@ -914,7 +1062,14 @@ def run_tests(modem):
                 log_all(msg, logs)
         engine = speedtest.resolve_engine()
         try:
-            st = Speedtest(source_address=source_ip, interface=iface, device=modem)
+            # The iPerf3 engine has no idle latency measurement of its own, so it
+            # is handed this app's ping code to run against the iperf3 server
+            # before the transfer starts. Passed as a callback rather than
+            # imported into the speedtest module so the ping logic lives in one
+            # place. netperf (TCP_RR) and Ookla (its ping stage) both measure
+            # their own idle latency and ignore this.
+            st = Speedtest(source_address=source_ip, interface=iface, device=modem,
+                           latency_probe=lambda host: ping_latency(host, iface))
         except Exception as e:
             msg = f'Exception in speedtest startup: {e}'
             log_all(msg, logs)
@@ -1006,8 +1161,15 @@ def run_tests(modem):
         except Exception as e:
             msg = f'Exception running speedtest for {product} {carrier}: {e}'
             log_all(msg, logs)
-
-
+            # The iPerf3 latency probe runs before any data moves, so a transfer
+            # that then fails or times out still has a valid idle latency to
+            # report. Throughput stays 0.0, which is what records the failure.
+            if latency is None and st.probed_latency is not None:
+                latency = round(st.probed_latency)
+                if jitter is None and st.probed_jitter is not None:
+                    jitter = st.probed_jitter
+                log_progress(f'Reporting probed idle latency {latency}ms '
+                             f'despite the failed speedtest.', logs)
 
     # SEND TO SERVER:
     # Use time.gmtime() to ensure UTC time regardless of system timezone
@@ -1177,6 +1339,10 @@ def run_tests(modem):
         msg = f'Exception formatting results: {e}'
         text = msg
         log_all(msg, logs)
+
+    # Counted whether or not the panel entry formatted cleanly - the test itself
+    # ran either way.
+    record_test_result()
 
     # Write to CSV:
     if dispatcher.config.get("write_csv"):
