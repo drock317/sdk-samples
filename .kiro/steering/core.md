@@ -23,6 +23,11 @@ lives in the topic files listed at the bottom.
 - **Never write defaults to appdata** — that overrides NCM group config. Default in code instead.
   (`cp.start_web_server` saving the port it actually bound is a recorded assignment, not a default.)
 - **Web apps never hardcode a port** — use `cp.start_web_server()` (see `web-standards.md`).
+- **Upstream `cp.py` is authoritative for shared SDK behavior** — use `cp.start_web_server()` /
+  `cp.bind_web_port()` / `cp.stop_app()` instead of writing wrappers or copying a `web_port.py`
+  helper. Port persistence, busy-port retry (~10 s), and self-stop-on-failure come from `cp.py`.
+  Exception: `apps/sdwan_analyzer` (v0.5.0) keeps its own `analyzer/web_port.py` until the
+  deferred migration in `dynamic-web-ports/docs/SDWAN_UPSTREAM_MIGRATION.md`; do not touch it.
 - **Never commit `sdk_settings.ini`**, and never print the router password.
 
 ## Always deploy after changing an app
