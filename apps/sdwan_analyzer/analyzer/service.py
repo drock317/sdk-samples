@@ -37,6 +37,7 @@ import time
 import cp
 
 from . import VERSION
+from . import analytics
 from . import collectors
 from . import durable
 from . import inspector
@@ -972,6 +973,14 @@ class AnalyzerService(object):
             window_start=window)
         return query.envelope(res['samples'], res['next_cursor'],
                               res['skipped_lines'])
+
+    def query_interface_rates(self, raw_query=''):
+        """Calculated RX/TX rates for one interface, on demand (read-only)."""
+        p = analytics.parse_params(raw_query)
+        now = self._clock()
+        window = (now - query.DEFAULT_WINDOW_S
+                  if durable.sane_ts(now) else None)
+        return analytics.interface_rates(self._store, p, window)
 
     def query_recording_samples(self, job_id, raw_query=''):
         """One bounded page of a Recording's samples, oldest first."""

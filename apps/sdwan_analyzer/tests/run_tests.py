@@ -2924,6 +2924,10 @@ def main():
     import counters_tests
     counters_tests.bind(check)
     tests = tests + counters_tests.TESTS
+    import analytics_tests
+    analytics_tests.bind(check, _Clock)
+    analytics_tests.bind_port(_free_port)
+    tests = tests + analytics_tests.TESTS
     import failed_read_tests
     failed_read_tests.bind(check)
     tests = tests + failed_read_tests.TESTS

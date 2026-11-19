@@ -100,6 +100,7 @@ not ready"}` until the first snapshot has been composed.
 - `GET /api/identities` — resolved destination identities
 - `GET /api/changes` — topology/config change flags vs previous snapshot
 - `GET /api/history` (0.4.4) — durable, paginated history; see *Query APIs*.
+- `GET /api/analytics/interfaces` (0.6.0) — calculated interface RX/TX rates; see *Query APIs*.
 - `GET /api/recordings/<job_id>/samples` (0.4.4) — paginated Recording
   samples; see *Query APIs*.
 - `POST /api/refresh/<group>` — manual refresh of one group
@@ -510,6 +511,56 @@ sample file exists. To follow an active Recording, page with `cursor` until
 GET /api/recordings/rec-1790380800-001/samples?group=wan&limit=50
 GET /api/recordings/rec-1790380800-001/samples?after=1790380830.5
 ```
+
+### `GET /api/analytics/interfaces` (0.6.0)
+
+Calculated RX/TX throughput of **one** interface, computed on demand from the
+stored history. Read-only: nothing is stored, cached or changed.
+
+| Parameter | Behaviour |
+|---|---|
+| `uid` | **required**, the interface uid (e.g. `ethernet-wan`, `sdwan-hub0_wan`, `wbond-wbond0_hub0`) |
+| `limit` | 1-250 rates per page, default 100 |
+| `start`, `end` | as `/api/history` (default: last 24 h) |
+| `max_gap_s` | optional: a pair further apart than this reports `gap_exceeded` and no rate. No default |
+| `cursor` | token from the previous page (same `uid`, `start`, `end`, `max_gap_s`) |
+
+One entry in `rates` per pair of consecutive observations, oldest first:
+
+```
+{"uid": "ethernet-wan", "object_class": "physical", "max_gap_s": null,
+ "rates": [{
+   "uid": "ethernet-wan", "object_class": "physical",
+   "start_ts": 1790380800.25, "end_ts": 1790380810.75, "interval_s": 10.5,
+   "time_source": "collected_at", "time_precision": "fractional",
+   "reduced_precision": false, "interval_error_bound_s": null,
+   "status": "ok",
+   "rx": {"status": "ok", "delta_bytes": 131250, "bytes_per_s": 12500.0,
+          "bits_per_s": 100000.0, "mbps": 0.1},
+   "tx": {"status": "ok", "delta_bytes": 52500, "bytes_per_s": 5000.0,
+          "bits_per_s": 40000.0, "mbps": 0.04}}],
+ "count": 1, "next_cursor": null, "has_more": false, "skipped_lines": 0}
+```
+
+- `status` is `ok` only when RX and TX are both `ok`; otherwise it is the
+  first failing status: `missing_baseline`, `missing_value`,
+  `identity_mismatch`, `invalid_time`, `non_monotonic_time`,
+  `counter_decrease`, `gap_exceeded` (see `counters.py`) or `suspect_input`.
+  Rates and `delta_bytes` are `null` unless the direction is `ok`.
+- Time uses fractional `collected_at` when both observations have it,
+  otherwise integer `collected_ts` with `reduced_precision: true`.
+- An observation with no record for the interface (for example a failed
+  read) is never skipped or zero-filled: the pairs on either side of it are
+  reported with `missing_value` / `missing_baseline`.
+- `suspect_input`: an observation written by v0.4.4 or earlier whose
+  `collector_errors` names `wan_devices` may hold re-stamped counters, so no
+  rate is calculated from it.
+- Physical, `sdwan` and `wbond` interfaces are separate identities; their
+  counters overlap and are never added together.
+- Errors and limits follow `/api/history` (400 for a missing or invalid
+  `uid`, parameter or cursor; 410 for an expired cursor). The cursor also
+  carries the last observation as the baseline for the next page, so the pair
+  across a page boundary is calculated.
 
 ### Cursors
 
