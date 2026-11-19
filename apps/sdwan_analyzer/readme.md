@@ -122,6 +122,7 @@ not ready"}` until the first snapshot has been composed.
 - `GET /api/changes` — topology/config change flags vs previous snapshot
 - `GET /api/history` (0.4.4) — durable, paginated history; see *Query APIs*.
 - `GET /api/analytics/interfaces` (0.6.0) — calculated interface RX/TX rates; see *Query APIs*.
+- `GET /api/analytics/topology` (0.8.0) — current physical WAN / SD-WAN overlay / WBOND relationships with known state; unverified links are returned as `unresolved`. See `docs/analytics/topology.md`.
 - `GET /api/recordings/<job_id>/samples` (0.4.4) — paginated Recording
   samples; see *Query APIs*.
 - `POST /api/refresh/<group>` — manual refresh of one group

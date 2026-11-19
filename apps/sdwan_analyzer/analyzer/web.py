@@ -144,6 +144,7 @@ _DEV_PAGE = """<!DOCTYPE html>
 <li><a href="/api/changes">/api/changes</a> (topology/config change flags)</li>
 <li><a href="/api/storage">/api/storage</a> (Storage Inspector: memory counts, app file metadata; generated on demand)</li>
 <li><a href="/api/history">/api/history</a> (durable, paginated: limit, start, end, sample_source, cursor)</li>
+<li><a href="/api/analytics/topology">/api/analytics/topology</a> (current WAN / overlay / WBOND relationships, read-only)</li>
 <li>/api/analytics/interfaces?uid=&lt;interface uid&gt; (calculated RX/TX rates, read-only; limit, start, end, max_gap_s, cursor)</li>
 <li><a href="/api/recordings">/api/recordings</a>, <a href="/api/recordings/active">/active</a>, /api/recordings/&lt;id&gt;, /api/recordings/&lt;id&gt;/samples (paginated); POST /api/recordings/start, /api/recordings/&lt;id&gt;/stop (backend-owned, max 30 min)</li>
 <li>POST /api/refresh/&lt;group&gt; (manual: traffic_classes, steering, bonding, wan_paths, overview)</li>
@@ -232,6 +233,13 @@ def _make_handler(service):
                 if m is not None:
                     self._send_json(service.query_recording_samples(
                         m.group(1), raw_query))
+                elif path == '/api/analytics/topology':
+                    topo = service.query_topology()
+                    if topo is None:
+                        self._send_json(
+                            {'error': 'snapshot not ready'}, code=503)
+                    else:
+                        self._send_json(topo)
                 elif path == '/api/analytics/interfaces':
                     self._send_json(service.query_interface_rates(raw_query))
                 elif path == '/api/history':

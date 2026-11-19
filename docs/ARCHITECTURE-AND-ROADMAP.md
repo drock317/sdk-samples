@@ -160,6 +160,7 @@ Still open:
 | 7 | Generalized failed-read invariant (U9), version 0.5.0, full suite on both interpreters | Done, see the final report for counts |
 | 8 | Package prepared for manual validation (not deployed) | Done |
 | 9 | Review, then push or merge on approval | Waiting for review. Nothing committed or pushed |
+| v0.8.0 | Current-state topology and relationships, `GET /api/analytics/topology` | Done, see `docs/analytics/topology.md` |
 
 ## 7. Failed-read invariant and runtime audit
 

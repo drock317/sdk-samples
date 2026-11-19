@@ -2928,6 +2928,9 @@ def main():
     analytics_tests.bind(check, _Clock)
     analytics_tests.bind_port(_free_port)
     tests = tests + analytics_tests.TESTS
+    import topology_tests
+    topology_tests.bind(check, _free_port)
+    tests = tests + topology_tests.TESTS
     import ui_tests
     ui_tests.bind(check, _Clock, _free_port)
     tests = tests + ui_tests.TESTS

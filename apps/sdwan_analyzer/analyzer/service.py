@@ -46,6 +46,7 @@ from . import query
 from . import recording
 from . import storage
 from . import telemetry
+from . import topology
 
 # User-selectable continuous-history intervals (minutes). No 1-minute mode.
 SCHEDULE_CHOICES = (1, 5, 15, 30, 60)
@@ -981,6 +982,21 @@ class AnalyzerService(object):
         window = (now - query.DEFAULT_WINDOW_S
                   if durable.sane_ts(now) else None)
         return analytics.interface_rates(self._store, p, window)
+
+    def query_topology(self):
+        """Current WAN/overlay/WBOND relationships (read-only, cached).
+
+        Pure over the cached snapshot and cached raw wan_devices; no router
+        I/O. None until the first snapshot exists.
+        """
+        with self._lock:
+            snap = self._snapshot
+            devices = self._raw().get('wan_devices')
+            health = dict(self._config_raw.health())
+            health.update(self._runtime_raw.health())
+        if snap is None:
+            return None
+        return topology.build(snap, devices, health)
 
     def query_recording_samples(self, job_id, raw_query=''):
         """One bounded page of a Recording's samples, oldest first."""
