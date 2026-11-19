@@ -27,6 +27,8 @@ unchanged schedule. No analytics are computed here.
 LIMITATION: jobs/samples are in memory only (lost on app restart/reboot).
 """
 
+import cp
+
 from . import collectors
 
 MAX_DURATION_SEC = 1800
@@ -153,8 +155,14 @@ class RecordingController(object):
             return _err('active_exists', 'a recording is already active')
         now = self._now()
         self._seq += 1
+        job_id = 'rec-{}-{:03d}'.format(int(now), self._seq)
+        while self._store.get_recording(job_id) is not None:
+            # A durable store reloads earlier jobs after a restart; never
+            # reuse an ID (and so a directory) that already exists.
+            self._seq += 1
+            job_id = 'rec-{}-{:03d}'.format(int(now), self._seq)
         job = {
-            'job_id': 'rec-{}-{:03d}'.format(int(now), self._seq),
+            'job_id': job_id,
             'label': label.strip()[:_MAX_LABEL],
             'notes': notes.strip()[:_MAX_NOTES],
             'state': 'recording',
@@ -176,6 +184,7 @@ class RecordingController(object):
         self._rt[job['job_id']] = {
             'next': {g: now for g, _, _ in PROFILE}, 'start_cfg': False}
         self._event(job, EV_STARTED, 'started')
+        self._store.job_changed(job)
         return {'ok': True, 'recording': self.view(job)}
 
     def stop(self, job_id):
@@ -198,6 +207,9 @@ class RecordingController(object):
             if job is None:
                 return
             now = self._now()
+            # Durable store: periodic fsync + metadata checkpoint (no-op for
+            # the in-memory store).
+            self._store.housekeeping(now)
             if now - job['started_ts'] >= job['max_duration_sec']:
                 self._end(job, 'expired', EV_EXPIRED, 'max_duration')
                 self._run_finalize()
@@ -253,9 +265,8 @@ class RecordingController(object):
             end = self._versions()
             job['config_versions_end'] = end
             start = job['config_versions_start']
-            if start is None:
-                continue
-            changed = sorted(n for n in end if end[n] != start.get(n))
+            changed = [] if start is None else sorted(
+                n for n in end if end[n] != start.get(n))
             if changed:
                 job['config_changes'] = [
                     {'name': n, 'start_version': start.get(n),
@@ -264,6 +275,8 @@ class RecordingController(object):
                             'config changed during recording: {}'.format(
                                 ', '.join(changed)),
                             detail=job['config_changes'])
+            # Job complete: fsync samples, final metadata, close, retention.
+            self._store.job_changed(job, final=True)
 
     def _end(self, job, state, event, reason):
         job['state'] = state
@@ -271,6 +284,7 @@ class RecordingController(object):
         job['ended_ts'] = int(self._now())
         self._event(job, event, reason)
         self._finalize.append(job['job_id'])
+        self._store.job_changed(job, force_sync=True)
 
     def _fail(self, job, reason):
         try:
@@ -279,8 +293,29 @@ class RecordingController(object):
                 job['stop_reason'] = reason
                 job['ended_ts'] = int(self._now())
                 self._event(job, EV_FAILED, reason)
+                self._store.job_changed(job, final=True)
         except Exception:
             pass
+
+    def shutdown(self):
+        """Graceful app stop: end any active job as stopped/app_shutdown.
+
+        No end-of-job config pass (no router I/O while shutting down); the
+        store fsyncs the samples and writes the final metadata.
+        """
+        try:
+            job = self._store.active_recording()
+            if job is None:
+                return
+            job['state'] = 'stopped'
+            job['stop_reason'] = 'app_shutdown'
+            job['ended_ts'] = int(self._now())
+            self._event(job, EV_STOPPED, 'app_shutdown')
+            if job['job_id'] in self._finalize:
+                self._finalize.remove(job['job_id'])
+            self._store.job_changed(job, final=True)
+        except Exception as e:
+            cp.log('recording: shutdown error: {}'.format(e))
 
     def _event(self, job, event_type, reason, detail=None):
         ev = {'job_id': job['job_id'], 'event_ts': int(self._now()),

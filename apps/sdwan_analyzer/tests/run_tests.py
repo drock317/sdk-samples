@@ -2555,7 +2555,8 @@ def _make_app_tree():
     app = os.path.join(base, 'app')
     outside = os.path.join(base, 'outside')
     for d in (app, os.path.join(app, 'analyzer'),
-              os.path.join(app, '__pycache__'), os.path.join(app, 'data'),
+              os.path.join(app, '__pycache__'),
+              os.path.join(app, 'tmp', 'telemetry'),
               os.path.join(app, 'certs'), outside):
         os.makedirs(d)
 
@@ -2573,8 +2574,8 @@ def _make_app_tree():
         w(os.path.join(app, name))
     w(os.path.join(app, 'certs', 'ca.crt'))
     w(os.path.join(app, '__pycache__', 'x.cpython-38.pyc'))
-    # Future durable telemetry dir:
-    w(os.path.join(app, 'data', 'obs-0001.jsonl'), 'x' * 10)
+    # Durable telemetry runtime dir (reported under `persistent`):
+    w(os.path.join(app, 'tmp', 'telemetry', 'obs-0001.jsonl'), 'x' * 10)
     # Outside the root, reachable only via symlinks:
     w(os.path.join(outside, 'outside.py'))
     w(os.path.join(outside, 'sdk_settings.ini'))
@@ -2620,8 +2621,8 @@ def test_storage_inspector_files_allowlist():
         check(af['skipped_symlinks'] == 2,
               'symlinks (dir + file) ignored, not followed')
         check(af['excluded_count'] >= 7, 'excluded files only counted')
-        check(not any(p.startswith('data/') for p in names),
-              'data dir not double-counted under application_files')
+        check(not any(p.startswith('tmp/') for p in names),
+              'tmp/ runtime dir not double-counted under application_files')
         check(os.path.abspath(app) not in text and base not in text,
               'absolute paths are not exposed')
         # A symlinked ROOT is refused outright.
@@ -2645,22 +2646,23 @@ def test_storage_inspector_persistent_section():
     print('test_storage_inspector_persistent_section')
     base, app, outside = _make_app_tree()
     try:
-        # Memory-only, no data dir yet.
-        shutil.rmtree(os.path.join(app, 'data'))
+        # Memory-only, no telemetry dir yet.
+        shutil.rmtree(os.path.join(app, 'tmp'))
         p = AnalyzerService(app_root=app).storage_report()['persistent']
         check(p['enabled'] is False and p['root_exists'] is False and
               p['total_bytes'] == 0 and p['file_count'] == 0 and
-              p['files'] == [], 'no data dir: explicit, empty, disabled')
-        check(p['root'] == 'data', 'future data root named')
-        # Future durable files show up here without changing the shape.
-        os.makedirs(os.path.join(app, 'data'))
-        with open(os.path.join(app, 'data', 'obs-1.jsonl'), 'w') as f:
+              p['files'] == [], 'no telemetry dir: explicit, empty, disabled')
+        check(p['root'] == 'tmp/telemetry', 'telemetry root named')
+        # Files in the runtime dir show up here without changing the shape.
+        os.makedirs(os.path.join(app, 'tmp', 'telemetry'))
+        with open(os.path.join(app, 'tmp', 'telemetry', 'obs-1.jsonl'),
+                  'w') as f:
             f.write('x' * 25)
         p2 = AnalyzerService(app_root=app).storage_report()['persistent']
         check(p2['root_exists'] is True and p2['file_count'] == 1 and
               p2['total_bytes'] == 25 and
               p2['files'][0]['relative_path'] == 'obs-1.jsonl' and
-              set(p2) == set(p), 'data dir files reported; same shape')
+              set(p2) == set(p), 'telemetry dir files reported; same shape')
         check(p2['enabled'] is False,
               'still reports enabled=false (memory-only telemetry)')
     finally:
@@ -2900,6 +2902,11 @@ def main():
         test_storage_inspector_memory_counts,
         test_storage_inspector_api_on_demand_no_side_effects,
     ]
+    # Durable telemetry storage tests (separate module, shared runner/count).
+    import durable_tests
+    durable_tests.bind(check, _Clock, _fake_collectors, _free_port,
+                       _http_json)
+    tests = tests + durable_tests.TESTS
     for t in tests:
         t()
     print('')

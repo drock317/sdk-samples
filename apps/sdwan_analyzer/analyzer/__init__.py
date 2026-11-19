@@ -6,7 +6,8 @@
 #
 # - collectors:  read-only NCOS status/config snapshots. No business logic.
 # - normalize:   turn raw NCOS shapes into stable internal records.
-# - storage:     persistence interface ONLY (no format chosen yet). See module docstring.
+# - storage:     store interfaces + in-memory defaults; durable.py/persistence.py hold
+#                the durable JSONL backend (tmp/telemetry). See their docstrings.
 # - service:     composes collectors + normalize + storage into the app-facing API.
 # - web:         http.server presentation. Calls service, NEVER NCOS directly.
 #
@@ -14,4 +15,4 @@
 # never reaches NCOS APIs. Collection/storage/business logic stay out of the
 # presentation layer.
 
-VERSION = '0.3.4'
+VERSION = '0.4.3'

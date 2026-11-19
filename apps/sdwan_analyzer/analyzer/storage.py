@@ -1,13 +1,14 @@
-"""Historical storage interface — NO persistence format chosen yet.
+"""Historical storage interface + bounded in-memory default stores.
 
-Historical recording is a major SD-WAN Analyzer requirement, but the final
-persistence format, retention model, and sampling interval have NOT been
-selected. This module therefore defines ONLY the interface the rest of the
-app codes against, plus a bounded in-memory default so the skeleton runs
-without committing to a storage mechanism.
+This module defines the interface the rest of the app codes against and the
+in-memory implementations (used when no durable root is configured, and by
+tests). The DURABLE backend (stdlib-only segmented JSONL under
+``tmp/telemetry``) lives in durable.py and subclasses these; the filesystem
+primitives are in persistence.py. See those modules for the layout,
+retention and recovery model.
 
-Do NOT add SQLite (or any concrete backend) here until the storage design
-step is authorized.
+The historical notes below describe the options originally considered and
+are kept for context.
 
 ------------------------------------------------------------------------
 NCOS SDK PERSISTENT-STORAGE OPTIONS & CONSTRAINTS (from project docs)
@@ -117,36 +118,77 @@ class InMemoryHistoryStore(HistoryStore):
 class ConfigVersionStore(object):
     """Change-versioned static/config objects (in-memory, bounded).
 
-    update() persists a new version ONLY when the semantic fingerprint
-    differs from the current version, so identical Traffic Classes, WAN
-    rules, steering definitions, etc. are not re-stored on every sample.
-    Observations carry just the version number.
+    A version number identifies one DISTINCT semantic configuration of an
+    object (by fingerprint), not a point in time:
+
+      * fingerprint == the CURRENT version's      -> unchanged, same version;
+      * fingerprint == ANY retained earlier version -> that existing version
+        becomes current again (no new version, no new payload stored);
+      * a fingerprint never retained before        -> a new version.
+
+    So A -> B -> A yields v1, v2, v1 (not v3). Only the newest `max_versions`
+    per object are retained: a fingerprint that has aged out of that window
+    may legitimately get a new number later (deleted history is never
+    searched). Identical Traffic Classes, WAN rules, steering definitions,
+    etc. are never re-stored per sample; observations carry only the number.
     """
 
     def __init__(self, max_versions=20):
         self._max = max_versions
         self._versions = {}   # name -> deque of version dicts (oldest first)
         self._counter = {}    # name -> last version number issued
+        self._current = {}    # name -> version number that is CURRENT
 
     def update(self, name, fingerprint, payload, ts):
-        """Record `payload` as a new version if `fingerprint` changed.
+        """Return {'version': int, 'fingerprint': str, 'changed': bool}.
 
-        Returns {'version': int, 'fingerprint': str, 'changed': bool}.
+        `changed` is True whenever the current version moved (a new version
+        OR a return to an earlier retained one).
+        """
+        return self._update(name, fingerprint, payload, ts)[0]
+
+    def _update(self, name, fingerprint, payload, ts):
+        """Core of update(); returns (result, is_new_version).
+
+        Subclasses persist only when is_new_version is True: reusing a
+        retained version appends nothing.
         """
         buf = self._versions.setdefault(name, deque(maxlen=self._max))
-        if buf and buf[-1]['fingerprint'] == fingerprint:
-            return {'version': buf[-1]['version'],
-                    'fingerprint': fingerprint, 'changed': False}
+        cur = self.current(name)
+        if cur is not None and cur['fingerprint'] == fingerprint:
+            return ({'version': cur['version'],
+                     'fingerprint': fingerprint, 'changed': False}, False)
+        for v in buf:
+            if v['fingerprint'] == fingerprint:
+                self._current[name] = v['version']
+                return ({'version': v['version'],
+                         'fingerprint': fingerprint, 'changed': True},
+                        False)
         number = self._counter.get(name, 0) + 1
         self._counter[name] = number
         buf.append({'version': number, 'fingerprint': fingerprint,
                     'ts': ts, 'payload': payload})
-        return {'version': number, 'fingerprint': fingerprint,
-                'changed': True}
+        self._current[name] = number
+        return ({'version': number, 'fingerprint': fingerprint,
+                 'changed': True}, True)
 
     def current(self, name):
         buf = self._versions.get(name)
-        return buf[-1] if buf else None
+        if not buf:
+            return None
+        number = self._current.get(name)
+        if number is not None:
+            for v in buf:
+                if v['version'] == number:
+                    return v
+        return buf[-1]
+
+    def fingerprint_for(self, name, version):
+        """Fingerprint of a retained version, or None when not retained."""
+        for v in self._versions.get(name, ()):
+            if v['version'] == version:
+                return v['fingerprint']
+        return None
 
     def versions(self, name):
         return list(self._versions.get(name, ()))
@@ -160,9 +202,14 @@ class ConfigVersionStore(object):
                 'max_versions_per_object': self._max}
 
     def summary(self):
-        return {n: {'version': b[-1]['version'],
-                    'fingerprint': b[-1]['fingerprint'], 'ts': b[-1]['ts']}
-                for n, b in self._versions.items() if b}
+        out = {}
+        for n, b in list(self._versions.items()):
+            cur = self.current(n)
+            if cur is not None:
+                out[n] = {'version': cur['version'],
+                          'fingerprint': cur['fingerprint'],
+                          'ts': cur['ts']}
+        return out
 
 
 class RecordingStore(object):
@@ -183,6 +230,16 @@ class RecordingStore(object):
 
     def max_samples(self):
         return self._max_samples
+
+    # Durability hooks. The in-memory store has nothing to persist; the
+    # durable store (durable.DurableRecordingStore) overrides them. The
+    # controller calls them at lifecycle points, so RecordingController stays
+    # free of filesystem logic.
+    def job_changed(self, job, final=False, force_sync=False):
+        pass
+
+    def housekeeping(self, now):
+        pass
 
     def add_job(self, job):
         self._jobs[job['job_id']] = job

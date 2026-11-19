@@ -18,3 +18,5 @@ sdk_settings.ini
 
 # Kiro MCP settings — may hold credentials, keep local only.
 .kiro/settings/mcp.json
+# SD-WAN Analyzer runtime telemetry (created by local runs/tests; never commit).
+apps/sdwan_analyzer/tmp/

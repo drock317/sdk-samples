@@ -38,6 +38,7 @@ import cp
 
 from . import VERSION
 from . import collectors
+from . import durable
 from . import inspector
 from . import normalize
 from . import recording
@@ -156,19 +157,61 @@ class _RawCache(object):
 
 class AnalyzerService(object):
     def __init__(self, store=None, schedule_minutes=DEFAULT_SCHEDULE_MINUTES,
-                 config_store=None, clock=None, app_root=None):
-        self._store = store if store is not None else storage.default_store()
-        self._config_store = (config_store if config_store is not None
-                              else storage.ConfigVersionStore())
+                 config_store=None, clock=None, app_root=None,
+                 telemetry_root=None, telemetry_retention=None):
         self._clock = clock if clock is not None else time.time
-        self._rec_store = storage.RecordingStore()
-        self._recording = recording.RecordingController(self, self._rec_store)
-        self._web_port_status = None
         # Root of the files the Storage Inspector may describe (the app's own
         # directory). Injectable for tests.
         self._app_root = (app_root if app_root is not None else
                           os.path.dirname(os.path.dirname(
                               os.path.abspath(__file__))))
+
+        # Durable telemetry (tmp/telemetry). None => in-memory stores only
+        # (the default; tests and any init failure). A relative root is
+        # resolved against the app directory so the location never depends on
+        # the process cwd.
+        self._durable = None
+        self._durable_init_error = None
+        if telemetry_root:
+            try:
+                if os.path.isabs(telemetry_root):
+                    root = telemetry_root
+                    shown = telemetry_root
+                    try:
+                        rel = os.path.relpath(root, self._app_root)
+                        if not rel.startswith('..'):
+                            shown = rel.replace(os.sep, '/')
+                    except ValueError:
+                        pass
+                else:
+                    root = os.path.join(self._app_root, telemetry_root)
+                    shown = telemetry_root.replace(os.sep, '/')
+                tel = durable.TelemetryStorage(
+                    root, display_root=shown, clock=self._clock,
+                    retention=telemetry_retention)
+                if tel.prepare():
+                    self._durable = tel
+                else:
+                    self._durable_init_error = dict(tel.init_error or {
+                        'type': 'Error', 'message': 'prepare failed'})
+                    cp.log('service: durable telemetry unavailable ({}); '
+                           'using in-memory stores'.format(
+                               tel.health.last_write_error))
+            except Exception as e:
+                cp.log('service: durable telemetry init error: {}'.format(e))
+                self._durable = None
+                self._durable_init_error = {'type': type(e).__name__,
+                                            'message': str(e)[:200]}
+        d = self._durable
+        self._store = store if store is not None else (
+            d.history_store if d else storage.default_store())
+        self._config_store = (config_store if config_store is not None
+                              else (d.config_store if d
+                                    else storage.ConfigVersionStore()))
+        self._rec_store = (d.recording_store if d
+                           else storage.RecordingStore())
+        self._recording = recording.RecordingController(self, self._rec_store)
+        self._web_port_status = None
 
         if schedule_minutes not in SCHEDULE_CHOICES:
             schedule_minutes = DEFAULT_SCHEDULE_MINUTES
@@ -202,6 +245,32 @@ class AnalyzerService(object):
         # section -> {collected_ts, sample_source} of the pass that last
         # refreshed it. Advances only for sections actually collected.
         self._freshness = {}
+
+        # Startup recovery (config versions, Recording metadata, history ring,
+        # dedupe tails, retention). Loads NO Recording samples into RAM.
+        if self._durable is not None:
+            try:
+                summary = self._durable.recover(self._swans_seen,
+                                                self._event_seen)
+                cp.log('service: durable telemetry ready ({}); recovery: '
+                       '{}'.format(self._durable.display_root, summary))
+            except Exception as e:
+                cp.log('service: durable recovery error: {}'.format(e))
+
+    def begin_shutdown(self):
+        """Shutdown has been requested (SIGTERM): storage must no longer
+        create directories. Only sets a flag; safe from a signal handler."""
+        if self._durable is not None:
+            self._durable.begin_shutdown()
+
+    def shutdown(self):
+        """Graceful stop: finish any Recording and fsync/close storage."""
+        self.begin_shutdown()
+        try:
+            self._recording.shutdown()
+        finally:
+            if self._durable is not None:
+                self._durable.shutdown()
 
     def set_web_port_provider(self, provider):
         """Register a zero-arg callable that returns web port status."""
@@ -817,8 +886,15 @@ class AnalyzerService(object):
                 continue
         if memory is None:
             memory = {'error': 'memory counts unavailable'}
-        return inspector.build_report(memory, self._app_root,
-                                      now=self._clock())
+        return inspector.build_report(
+            memory, self._app_root, now=self._clock(),
+            persistent=(self._durable.inspector_info()
+                        if self._durable is not None else
+                        ({'init_error': self._durable_init_error.get(
+                            'message'),
+                          'init_error_type': self._durable_init_error.get(
+                              'type')}
+                         if self._durable_init_error else None)))
 
     def _storage_memory(self):
         hist = self._store.stats()

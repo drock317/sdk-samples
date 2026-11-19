@@ -2,3 +2,5 @@
 # Local test harness + fixtures are development-only and must not ship to
 # the router (keeps the package small and avoids packaging test data).
 tests/
+# Runtime telemetry (tmp/telemetry) is created on the router and must never ship.
+tmp/

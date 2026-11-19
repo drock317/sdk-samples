@@ -5,16 +5,16 @@ NCOS routers: WAN paths, SD-WAN interfaces, WAN bonding (WBOND), member
 interfaces, traffic steering, underlay connectivity, cellular state, and how
 these change over time.
 
-> **Status: BACKEND build (v0.3.3).** Targeted collectors, normalization,
+> **Status: BACKEND build (v0.4.3).** Targeted collectors, normalization,
 > logical Traffic Steering grouping, semantic fingerprints, a cached snapshot,
 > section JSON endpoints, and (new in 0.3.0) the **data-acquisition model**
 > below: startup + scheduled + manual collection, source-tagged observations,
 > timestamp envelopes, interface and cellular/CA telemetry, SWANS dedupe and
 > change-versioned config. **Recording jobs (backend)** are new in 0.3.2. v0.3.3 is a
 > hardening/API patch (bounded client sockets, current interface + cellular
-> telemetry APIs, numeric RF values). Durable
-> storage and the polished UI remain deferred; the in-memory store is
-> temporary.
+> telemetry APIs, numeric RF values). **v0.4.0 added durable telemetry
+> storage; v0.4.1-0.4.3 harden it** (state ownership, config version reuse, safe shutdown during upgrade, time-based dedupe recovery) (see *Durable telemetry storage* below). The polished UI remains
+> deferred.
 
 ## Architecture
 
@@ -30,8 +30,11 @@ NCOS collectors -> normalization -> historical storage -> application API -> pre
 - **normalize.py** — converts raw NCOS shapes into stable internal records.
   Reuses the validated WAN friendly-naming / cellular-classification concepts
   from Speedtest Analyzer (not its speed-test code).
-- **storage.py** — history **interface only**. No persistence format chosen
-  yet. Ships a bounded in-memory (non-durable) default so the skeleton runs.
+- **storage.py** — store interfaces plus bounded in-memory defaults (used by
+  tests and as the fallback when durable storage cannot initialise).
+- **persistence.py / durable.py** — the durable backend (stdlib only):
+  segmented JSONL under `tmp/telemetry`. Only these modules touch the
+  filesystem for telemetry.
 - **service.py** — the application API. Composes the layers. The **only**
   layer the web tier may call.
 - **web.py** — minimal `http.server` dev page + JSON API. Calls `service`
@@ -66,9 +69,12 @@ not ready"}` until the first snapshot has been composed.
   call (nothing stored, no timer, no router I/O, no history entry).
   `memory` (counts only: history observations, config versions, Recording
   jobs/samples/active job, dedupe entries, configured limits), `persistent`
-  (`enabled: false` while telemetry is memory-only; `root` `data/`,
-  `root_exists`, `file_count`, `total_bytes`, `files[]` ready for future
-  durable storage) and `application_files` (metadata only: `relative_path`,
+  (0.4.0: `enabled: true`, `root` `tmp/telemetry`, `status` ok/degraded,
+  `total_bytes`, `file_count`, `files[]`, per-area subtotals `history`,
+  `recordings` (+`jobs`), `config`, `events`, `state`, `quarantine`,
+  `write_errors`, `last_write_error`, `last_fsync_ts`, `retention` limits,
+  `recovery` summary, `free_space`, `clock_sane`; `enabled: false` only when
+  the durable backend could not initialise) and `application_files` (metadata only: `relative_path`,
   `size_bytes`, `modified_ts`, `type`). Strict allowlist rooted at the app's
   own directory; symlinks are never followed; credentials, keys, certs,
   `sdk_settings.ini` and unknown file types are excluded (counted only).
@@ -86,7 +92,8 @@ not ready"}` until the first snapshot has been composed.
 - `GET /api/bonding` — WBOND bonds with member runtime detail
 - `GET /api/identities` — resolved destination identities
 - `GET /api/changes` — topology/config change flags vs previous snapshot
-- `GET /api/history` — recent source-tagged observations (in-memory, non-durable)
+- `GET /api/history` — the most recent source-tagged observations (a RAM ring
+  of ~20; the full durable history is on disk and is paged in a later phase)
 - `POST /api/refresh/<group>` — manual refresh of one group
   (`traffic_classes`, `steering`, `bonding`, `wan_paths`, `overview`);
   ~5 s cooldown per group (`429` while cooling down)
@@ -315,9 +322,68 @@ observation) and the schedule simply advances; scheduled collection resumes
 after the job ends. The current merged state and `section_freshness` are
 updated by Recording passes like any other collection.
 
-**Limitations.** Jobs, events and samples are in memory only: lost on app
-restart or router reboot (an in-flight Recording does not resume). Bounded
-to 20 jobs and 3000 samples per job.
+**Persistence (0.4.0).** Jobs, events and samples are durable
+(`tmp/telemetry/recordings/<job_id>/`). A Recording that was active when the
+app stopped uncleanly comes back as `state=failed`, `stop_reason=app_restart`
+(never resumed); a graceful stop ends it as `stopped`/`app_shutdown`.
+Bounded to 3000 samples per job; samples are read from disk, not held in RAM.
+
+## Durable telemetry storage (0.4.0)
+Lifecycle: survives an app restart and a router reboot; an application
+update/reinstall **may wipe it (accepted)** — there is no cross-version
+migration. Everything lives under the app-local `tmp/` (never packaged).
+```
+tmp/telemetry/
+  state.json                  schema + clean/unclean exit markers (atomic)
+  config_versions.jsonl       one line per NEW semantic config version
+  events.jsonl (+ .1)         app/storage/recovery/retention events (256 KB)
+  history/YYYY-MM-DD.jsonl    startup/scheduled/manual observations (UTC day)
+  recordings/<job_id>/metadata.json, samples.jsonl
+```
+- Compact **persist form**: one JSON object per line, `collected_ts` first,
+  config refs as `{name: version}`, redundant envelope/null fields dropped,
+  collector timestamps hoisted. The API representation is unchanged.
+- Small files are written atomically (`.tmp`, fsync, validate, replace);
+  JSONL files are append-only. A torn last line is repaired on open and kept
+  in `<file>.corrupt`; earlier records are never rewritten.
+- fsync: history/config/events on every write; Recording samples flushed per
+  sample and fsynced about every 30 s (and on stop/expiry/failure/shutdown).
+- Retention (whole files only; the active Recording and today's history file
+  are never deleted): history 7 days or 32 MB; Recordings 10 completed jobs
+  or 32 MB; swept at startup, UTC day rollover and Recording completion.
+- `state.json` carries a per-process `run_id` (+ `pid`). A process claims it
+  at startup and, on shutdown, writes its clean-stop marker ONLY if the file
+  still carries its own `run_id`; if a newer process already replaced it (NCOS
+  can start the new instance before the old one finishes stopping) the state
+  is left alone and a `state_ownership_mismatch` event is logged. A new
+  process also waits (<= 5 s) for a still-live predecessor to finish before
+  judging `previous_exit`.
+- Shutdown never creates directories. Once SIGTERM arrives, no write may
+  recreate `tmp/telemetry`: during an upgrade the installer can remove the
+  tree while the old process is still stopping, and a recreated directory
+  (owned by the old process's user) would make the new version's
+  `tmp/telemetry` unwritable. If the root is gone at shutdown the clean-state
+  write is skipped.
+- If durable storage cannot initialise, `/api/storage` reports
+  `persistent.enabled: false`, `status: disabled`, `init_error_type` and a
+  path-sanitised `init_error`; the app keeps running on in-memory stores.
+- Dedupe recovery after a restart rebuilds SWANS / steering-event keys from
+  disk (the dedupe sets themselves are never persisted): the last ~64 KB of
+  the newest history file, and, for Recordings, a TIME window - newest
+  Recording samples back to (newest sample - 10 min), scanned backward and
+  capped at 4 MiB for the whole startup. Several back-to-back Recordings
+  inside that window all contribute; one that ended > 30 min ago is skipped.
+  Malformed lines are skipped and counted (`dedupe_skipped_lines`).
+- Config version numbers identify DISTINCT semantic configurations: a
+  fingerprint equal to the current version is unchanged; equal to any
+  retained earlier version it reuses that number (no new record, the current
+  pointer just moves); only a never-retained fingerprint gets a new version.
+  A -> B -> A is v1, v2, v1. (Versions aged out of the 20/object window may
+  legitimately be numbered anew.) Startup collection is NOT delayed: partial
+  boot-time state is simply another distinct version.
+- Write failures never stop collection; they are counted and shown in
+  `/api/storage` (`status: degraded`). Observations stamped with an obviously
+  invalid clock stay in RAM only.
 
 ## Normalized snapshot schema
 

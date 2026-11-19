@@ -25,12 +25,25 @@ from analyzer.service import AnalyzerService
 from analyzer.web import DevWebServer, app_package_ini
 
 _running = True
+_service = None
+
+# Durable telemetry root, relative to the app directory (never shipped:
+# listed in buildignore).
+TELEMETRY_ROOT = 'tmp/telemetry'
 
 
 def _handle_signal(signum, frame):
     global _running
     cp.log('sdwan_analyzer: signal {} received, shutting down'.format(signum))
     _running = False
+    # From here on storage must not (re)create directories: an upgrade may
+    # remove the telemetry tree while this old process is still stopping.
+    svc = _service
+    if svc is not None:
+        try:
+            svc.begin_shutdown()
+        except Exception:
+            pass
 
 
 def _configured_schedule_minutes():
@@ -58,7 +71,14 @@ def main():
             cp.log('sdwan_analyzer: could not set handler for {}: {}'.format(
                 sig, e))
 
-    service = AnalyzerService(schedule_minutes=_configured_schedule_minutes())
+    # Durable telemetry lives under the app-local runtime dir (tmp/telemetry):
+    # it survives an app restart and a router reboot, and may be wiped by an
+    # application update/reinstall (accepted). If it cannot be initialised the
+    # service falls back to in-memory stores and keeps running.
+    service = AnalyzerService(schedule_minutes=_configured_schedule_minutes(),
+                              telemetry_root=TELEMETRY_ROOT)
+    global _service
+    _service = service
     server = DevWebServer(service)
     # Let /api/status report the effective listening port.
     service.set_web_port_provider(server.port_status)
@@ -84,6 +104,7 @@ def main():
                 time.sleep(1)
         if not _running:
             # Stop honoured: leave now, before any collection work starts.
+            service.shutdown()
             cp.log('sdwan_analyzer: stopped (no web interface)')
             return
         # The SDK did not honour the stop. Keep collecting without the web
@@ -133,6 +154,12 @@ def main():
             cp.log('sdwan_analyzer: scheduled collection error: {}'.format(e))
 
     server.stop()
+    # Graceful stop: end any active Recording, fsync and close durable files,
+    # mark a clean exit.
+    try:
+        service.shutdown()
+    except Exception as e:
+        cp.log('sdwan_analyzer: shutdown flush error: {}'.format(e))
     cp.log('sdwan_analyzer: stopped')
 
 
