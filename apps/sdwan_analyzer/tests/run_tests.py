@@ -2907,6 +2907,11 @@ def main():
     durable_tests.bind(check, _Clock, _fake_collectors, _free_port,
                        _http_json)
     tests = tests + durable_tests.TESTS
+    # Durable query API tests (v0.4.4).
+    import query_tests
+    query_tests.bind(check, _Clock, _fake_collectors, _free_port,
+                     _http_json)
+    tests = tests + query_tests.TESTS
     for t in tests:
         t()
     print('')

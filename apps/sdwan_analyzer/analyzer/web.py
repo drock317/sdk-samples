@@ -12,12 +12,19 @@ service boundary as plain JSON.
 
 import json
 import os
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import cp
 
 from . import web_port
+from .query import QueryError
+
+# Exact route for GET /api/recordings/<job_id>/samples. The id is matched
+# loosely here and validated against the generated format in the store, so a
+# traversal attempt is a plain 404 and never reaches a filesystem join.
+_SAMPLES_ROUTE = re.compile(r'^/api/recordings/([^/]+)/samples\Z')
 
 # App name used for the namespaced appdata field (<app_name>_web_port).
 APP_NAME = 'sdwan_analyzer'
@@ -91,8 +98,8 @@ _DEV_PAGE = """<!DOCTYPE html>
 <li><a href="/api/identities">/api/identities</a> (destinations)</li>
 <li><a href="/api/changes">/api/changes</a> (topology/config change flags)</li>
 <li><a href="/api/storage">/api/storage</a> (Storage Inspector: memory counts, app file metadata; generated on demand)</li>
-<li><a href="/api/history">/api/history</a> (source-tagged observations)</li>
-<li><a href="/api/recordings">/api/recordings</a>, <a href="/api/recordings/active">/active</a>, /api/recordings/&lt;id&gt;; POST /api/recordings/start, /api/recordings/&lt;id&gt;/stop (backend-owned, max 30 min)</li>
+<li><a href="/api/history">/api/history</a> (durable, paginated: limit, start, end, sample_source, cursor)</li>
+<li><a href="/api/recordings">/api/recordings</a>, <a href="/api/recordings/active">/active</a>, /api/recordings/&lt;id&gt;, /api/recordings/&lt;id&gt;/samples (paginated); POST /api/recordings/start, /api/recordings/&lt;id&gt;/stop (backend-owned, max 30 min)</li>
 <li>POST /api/refresh/&lt;group&gt; (manual: traffic_classes, steering, bonding, wan_paths, overview)</li>
 </ul>
 </body>
@@ -146,8 +153,14 @@ def _make_handler(service):
 
         def do_GET(self):
             try:
-                path = self.path.split('?', 1)[0]
-                if path in ('/', '/index.html'):
+                path, _, raw_query = self.path.partition('?')
+                m = _SAMPLES_ROUTE.match(path)
+                if m is not None:
+                    self._send_json(service.query_recording_samples(
+                        m.group(1), raw_query))
+                elif path == '/api/history':
+                    self._send_json(service.query_history(raw_query))
+                elif path in ('/', '/index.html'):
                     self._send_html(_DEV_PAGE)
                 elif path in ('/api/status', '/api/health'):
                     self._send_json(service.status())
@@ -179,10 +192,15 @@ def _make_handler(service):
                         self._send_json({'error': 'not found'}, code=404)
                     else:
                         self._send_json(rec)
-                elif path.startswith('/api/history'):
-                    self._send_json({'samples': service.history(limit=100)})
                 else:
                     self._send_json({'error': 'not found'}, code=404)
+            except QueryError as e:
+                # Client error (400 / 404 / 410): a fixed message, never a
+                # filesystem path or traceback.
+                try:
+                    self._send_json({'error': e.message}, code=e.status)
+                except Exception:
+                    pass
             except Exception as e:
                 cp.log('web: request error on {}: {}'.format(self.path, e))
                 try:

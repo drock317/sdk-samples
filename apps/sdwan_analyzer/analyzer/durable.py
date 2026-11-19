@@ -42,6 +42,7 @@ import cp
 
 from . import VERSION
 from . import persistence as P
+from . import query as Q
 from . import recording
 from . import storage
 
@@ -77,11 +78,11 @@ DEDUPE_RECORDING_MAX_BYTES = 4 * 1024 * 1024
 # it to mark its exit before judging how it ended.
 OVERLAP_WAIT_S = 5.0
 OVERLAP_POLL_S = 0.25
-DEFAULT_QUERY_LIMIT = 100
-DEFAULT_QUERY_BYTES = 1000000
+DEFAULT_QUERY_LIMIT = Q.DEFAULT_LIMIT
+DEFAULT_QUERY_BYTES = Q.MAX_SCAN_BYTES
 
 _DAY_FILE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2})\.jsonl\Z')
-_CURSOR_RE = re.compile(r'^(\d{4}-\d{2}-\d{2}):(\d{1,12})\Z')
+_DAY_RE = re.compile(r'^\d{4}-\d{2}-\d{2}\Z')
 
 
 def utc_day(ts):
@@ -777,28 +778,59 @@ class DurableHistoryStore(storage.HistoryStore):
                 rec, fingerprint_lookup=lookup))
         self._t.recovery['history_restored'] = len(self._ring)
 
-    # paged durable reads (foundation for the next phase's API) ---------------------
+    # paged durable reads (GET /api/history) ----------------------------------------
 
     def query(self, start=None, end=None, limit=DEFAULT_QUERY_LIMIT,
-              cursor=None, max_bytes=DEFAULT_QUERY_BYTES):
+              cursor=None, max_bytes=DEFAULT_QUERY_BYTES, sample_source=None,
+              window_start=None, max_accept_bytes=Q.MAX_RESPONSE_BYTES):
         """Decoded observations in [start, end], oldest first, paged.
 
-        Returns {'samples', 'count', 'next_cursor', 'skipped_lines'}.
-        `cursor` is 'YYYY-MM-DD:byte_offset' from a previous call. Bounded by
-        both `limit` and `max_bytes`; never loads a whole history.
+        Returns {'samples', 'count', 'next_cursor', 'skipped_lines',
+        'scanned_bytes'}. Read-only: files are opened 'rb', nothing is
+        repaired, created or written.
+
+        start/end:      inclusive UTC epoch bounds (None = open).
+        window_start:   default lower bound used ONLY when neither start nor
+                        end was given and there is no cursor.
+        sample_source:  exact filter on the persisted source tag.
+        cursor:         opaque token from a previous call (same start/end/
+                        sample_source). It pins the resolved lower bound, so
+                        a default 24 h window does not slide between pages.
+        Bounds per call: `limit` records, `max_bytes` of file data examined
+        (filtered-out and malformed lines included), `max_accept_bytes` of
+        accepted records. A page may hold fewer than `limit` records, or none
+        while next_cursor is set.
+        Raises query.QueryError: 400 invalid cursor, 410 cursor's day file
+        has been removed by retention.
         """
-        files = self.day_files()
-        c_day, c_off = None, 0
+        limit = max(1, int(limit))
+        ctx = Q.context_hash('h', start, end, sample_source)
+        eff_start = start if start is not None else (
+            window_start if end is None else None)
+        c_day, c_off, resync = None, 0, False
         if cursor is not None:
-            m = _CURSOR_RE.match(str(cursor))
-            if m is None:
-                raise ValueError('invalid cursor')
-            c_day, c_off = m.group(1), int(m.group(2))
-        out, stats = [], {}
-        used = 0
-        next_cursor = None
-        lookup = self._t.config_store.fingerprint_for
-        remaining = max(1, int(limit))
+            doc = Q.decode_cursor(cursor, 'h', ctx)
+            c_day = doc.get('d')
+            if not isinstance(c_day, str) or not _DAY_RE.match(c_day):
+                raise Q.bad('invalid cursor')
+            try:
+                day_start_ts(c_day)
+            except ValueError:
+                raise Q.bad('invalid cursor')
+            c_off = Q.int_field(doc, 'o')
+            resync = doc.get('r') is True
+            eff_start = doc.get('s')
+            if eff_start is not None and (
+                    isinstance(eff_start, bool)
+                    or not isinstance(eff_start, (int, float))):
+                raise Q.bad('invalid cursor')
+            if ((eff_start is not None and c_day < utc_day(eff_start))
+                    or (end is not None and c_day > utc_day(end))):
+                raise Q.bad('cursor is outside the query range')
+            now = self._t._clock()
+            if sane_ts(now) and c_day > utc_day(now + 86400):
+                raise Q.bad('invalid cursor')       # a day not yet reached
+        files = self.day_files()
         selected = []
         for name in files:
             day = name[:-6]
@@ -807,28 +839,61 @@ class DurableHistoryStore(storage.HistoryStore):
             ds = day_start_ts(day)
             if end is not None and ds > end:
                 continue
-            if start is not None and ds + 86400 <= start:
+            if eff_start is not None and ds + 86400 <= eff_start:
                 continue
             selected.append(day)
-        for i, day in enumerate(selected):
+        if c_day is not None:
+            if c_day not in selected:
+                raise Q.expired('cursor expired: that history segment has '
+                                'been removed')
+            state = P.offset_state(self.day_path(c_day), c_off)
+            if state == 'missing':
+                raise Q.expired('cursor expired: that history segment has '
+                                'been removed')
+            if state == 'beyond' or (state == 'mid' and not resync):
+                raise Q.bad('invalid cursor')
+        accept = None
+        if sample_source is not None:
+            accept = lambda r: r.get('sample_source') == sample_source
+        floor = max_bytes < P.QUERY_MAX_LINE + 1
+        lookup = self._t.config_store.fingerprint_for
+        out, skipped, scanned, accepted = [], 0, 0, 0
+        next_cursor = None
+
+        def mint(day, off, rs):
+            return Q.encode_cursor({'t': 'h', 'q': ctx, 'd': day, 'o': off,
+                                    's': eff_start, 'r': bool(rs)})
+
+        for day in selected:
+            path = self.day_path(day)
             off = c_off if day == c_day else 0
-            recs, nxt, eof = P.read_range(
-                self.day_path(day), start, end, off, limit=remaining,
-                max_bytes=max(1, max_bytes - used), stats=stats)
-            for r in recs:
-                used += len(P.dumps(r))
+            rs = resync if day == c_day else False
+            if (scanned >= max_bytes or len(out) >= limit
+                    or accepted >= max_accept_bytes):
+                if P.file_size(path) > off:
+                    next_cursor = mint(day, off, rs)
+                    break
+                continue
+            res = P.scan_range(
+                path, off, start_ts=eff_start, end_ts=end, limit=limit - len(out),
+                max_bytes=max_bytes - scanned,
+                max_accept_bytes=max_accept_bytes - accepted, accept=accept,
+                resync=rs, stop_past_end=True, progress_floor=floor)
+            if res['missing']:
+                continue                # removed by retention mid-request
+            scanned += res['scanned_bytes']
+            accepted += res['accepted_bytes']
+            skipped += res['skipped']
+            for r in res['records']:
                 out.append(P.decode_observation(r, fingerprint_lookup=lookup))
-            remaining -= len(recs)
-            if not eof:
-                next_cursor = '{}:{}'.format(day, nxt)
+            if res['past_end']:
                 break
-            if (remaining <= 0 or (used >= max_bytes and out)) \
-                    and i + 1 < len(selected):
-                next_cursor = '{}:0'.format(selected[i + 1])
+            if not res['eof']:
+                next_cursor = mint(day, res['next_offset'], res['resync'])
                 break
         return {'samples': out, 'count': len(out),
-                'next_cursor': next_cursor,
-                'skipped_lines': stats.get('skipped', 0)}
+                'next_cursor': next_cursor, 'skipped_lines': skipped,
+                'scanned_bytes': scanned}
 
     # retention -----------------------------------------------------------------
 
@@ -995,6 +1060,57 @@ class DurableRecordingStore(storage.RecordingStore):
             if limit is not None:
                 out = out[-limit:]
         return out
+
+    def query_samples(self, job_id, limit=DEFAULT_QUERY_LIMIT, group=None,
+                      after=None, cursor=None, max_bytes=DEFAULT_QUERY_BYTES,
+                      max_accept_bytes=Q.MAX_RESPONSE_BYTES):
+        """Bounded, disk-backed Recording sample page (oldest first).
+
+        Same return shape as DurableHistoryStore.query. Never loads the whole
+        sample file and never reads RAM fallback samples. Complete JSONL
+        lines only, so an active Recording can be paged while it appends.
+        Raises query.QueryError: 404 unknown job (or malformed id), 400 bad
+        cursor, 410 the cursor's Recording/sample file no longer exists.
+        """
+        limit = max(1, int(limit))
+        if not P.valid_job_id(job_id):
+            raise Q.QueryError(404, 'not found')
+        ctx = Q.context_hash('r', job_id, group, after)
+        doc = None
+        if cursor is not None:
+            doc = Q.decode_cursor(cursor, 'r', ctx)
+        if job_id not in self._jobs:
+            if doc is not None:
+                raise Q.expired('cursor expired: that Recording has been '
+                                'removed')
+            raise Q.QueryError(404, 'not found')
+        path = self.samples_path(job_id)
+        c_off, resync = 0, False
+        if doc is not None:
+            c_off = Q.int_field(doc, 'o')
+            resync = doc.get('r') is True
+            state = P.offset_state(path, c_off)
+            if state == 'missing':
+                raise Q.expired('cursor expired: Recording samples are '
+                                'gone')
+            if state == 'beyond' or (state == 'mid' and not resync):
+                raise Q.bad('invalid cursor')
+        accept = None
+        if group is not None:
+            accept = lambda r: r.get('recording_group') == group
+        res = P.scan_range(
+            path, c_off, after_ts=after, limit=limit, max_bytes=max_bytes,
+            max_accept_bytes=max_accept_bytes, accept=accept, resync=resync,
+            progress_floor=max_bytes < P.QUERY_MAX_LINE + 1)
+        out = [P.decode_observation(r, job_id=job_id, recording=True)
+               for r in res['records']]
+        nxt = None
+        if not res['eof']:
+            nxt = Q.encode_cursor({'t': 'r', 'q': ctx, 'o': res['next_offset'],
+                                   'r': bool(res['resync'])})
+        return {'samples': out, 'count': len(out), 'next_cursor': nxt,
+                'skipped_lines': res['skipped'],
+                'scanned_bytes': res['scanned_bytes']}
 
     def sample_count(self, job_id):
         return self._counts.get(job_id, 0)

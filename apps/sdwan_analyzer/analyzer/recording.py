@@ -47,6 +47,9 @@ PROFILE = (
     ('swans', 10, ('swans',)),
 )
 
+# Valid sample groups (``recording_group``): the profile groups + 'config'.
+GROUPS = tuple(g for g, _, _ in PROFILE) + ('config',)
+
 EV_STARTED = 'recording_started'
 EV_STOPPED = 'recording_stopped'
 EV_EXPIRED = 'recording_expired'

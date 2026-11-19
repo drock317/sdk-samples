@@ -562,7 +562,7 @@ def test_dur_history_query_paging():
         r = st.query(start=stamps[5], end=stamps[9], limit=100)
         check([s['collected_ts'] for s in r['samples']] == stamps[5:10] and
               r['next_cursor'] is None, 'range query')
-        r = st.query(limit=100, max_bytes=300)
+        r = st.query(start=stamps[0], limit=100, max_bytes=300)
         check(0 < r['count'] < 25 and r['next_cursor'] is not None,
               'byte budget bounds a page')
         raised = False

@@ -59,6 +59,8 @@ OPEN DECISIONS for the storage design step (DEFERRED):
 
 from collections import OrderedDict, deque
 
+from . import query as Q
+
 
 class HistoryStore(object):
     """Abstract history store. Concrete backends implement these methods.
@@ -81,6 +83,10 @@ class HistoryStore(object):
         """Return {'backend': str, 'count': int, 'durable': bool}."""
         raise NotImplementedError
 
+    def query(self, **kwargs):
+        """Paged read for GET /api/history (see durable / in-memory)."""
+        raise NotImplementedError
+
 
 class InMemoryHistoryStore(HistoryStore):
     """Bounded in-memory ring buffer. Default until a durable backend is chosen.
@@ -92,12 +98,74 @@ class InMemoryHistoryStore(HistoryStore):
     def __init__(self, maxlen=720):
         # 720 samples is a placeholder cap only, NOT a chosen retention model.
         self._buf = deque(maxlen=maxlen)
+        # Monotonic sequence number of every appended sample, kept in step
+        # with _buf (same maxlen). Used as the pagination position because a
+        # ring evicts from the left, so list indexes would shift.
+        self._seqs = deque(maxlen=maxlen)
+        self._seq = 0
 
     def append(self, sample):
         try:
+            self._seq += 1
             self._buf.append(sample)
+            self._seqs.append(self._seq)
         except Exception:
             pass
+
+    def query(self, start=None, end=None, limit=Q.DEFAULT_LIMIT, cursor=None,
+              sample_source=None, window_start=None, **_ignored):
+        """In-memory fallback for GET /api/history (durable unavailable).
+
+        Same contract as DurableHistoryStore.query. The cursor is the next
+        sequence number; one that has already been evicted from the ring is
+        expired (410). Bounded: the ring itself is the only data, and a page
+        is at most `limit` samples.
+        """
+        limit = max(1, int(limit))
+        ctx = Q.context_hash('m', start, end, sample_source)
+        eff_start = start if start is not None else (
+            window_start if end is None else None)
+        first = 1
+        if cursor is not None:
+            doc = Q.decode_cursor(cursor, 'm', ctx)
+            first = Q.int_field(doc, 'n', lo=1)
+            eff_start = doc.get('s')
+            if eff_start is not None and (
+                    isinstance(eff_start, bool)
+                    or not isinstance(eff_start, (int, float))):
+                raise Q.bad('invalid cursor')
+            if first > self._seq + 1:
+                raise Q.bad('invalid cursor')
+            oldest = self._seqs[0] if self._seqs else self._seq + 1
+            if first < oldest:
+                raise Q.expired('cursor expired: those samples are no '
+                                'longer retained')
+        items = list(zip(self._seqs, self._buf))
+        out, nxt, skipped = [], None, 0
+        for seq, smp in items:
+            if seq < first:
+                continue
+            if len(out) >= limit:
+                nxt = seq
+                break
+            ts = smp.get('collected_ts') if isinstance(smp, dict) else None
+            if (not isinstance(ts, (int, float)) or isinstance(ts, bool)):
+                skipped += 1
+                continue
+            if eff_start is not None and ts < eff_start:
+                continue
+            if end is not None and ts > end:
+                continue
+            if (sample_source is not None
+                    and smp.get('sample_source') != sample_source):
+                continue
+            out.append(smp)
+        cur = None
+        if nxt is not None:
+            cur = Q.encode_cursor({'t': 'm', 'q': ctx, 'n': nxt,
+                                   's': eff_start})
+        return {'samples': out, 'count': len(out), 'next_cursor': cur,
+                'skipped_lines': skipped, 'scanned_bytes': 0}
 
     def recent(self, limit=100):
         if limit is None or limit >= len(self._buf):
@@ -289,6 +357,47 @@ class RecordingStore(object):
 
     def sample_count(self, job_id):
         return len(self._samples.get(job_id, ()))
+
+    def query_samples(self, job_id, limit=Q.DEFAULT_LIMIT, group=None,
+                      after=None, cursor=None, **_ignored):
+        """In-memory fallback for GET /api/recordings/<id>/samples.
+
+        Same contract as DurableRecordingStore.query_samples. The cursor is
+        the index of the next sample (samples are append-only per job).
+        """
+        limit = max(1, int(limit))
+        ctx = Q.context_hash('n', job_id, group, after)
+        doc = Q.decode_cursor(cursor, 'n', ctx) if cursor is not None \
+            else None
+        buf = self._samples.get(job_id)
+        if buf is None:
+            if doc is not None:
+                raise Q.expired('cursor expired: that Recording has been '
+                                'removed')
+            raise Q.QueryError(404, 'not found')
+        i = Q.int_field(doc, 'o') if doc is not None else 0
+        if i > len(buf):
+            raise Q.bad('invalid cursor')
+        out, nxt = [], None
+        n = len(buf)
+        while i < n:
+            if len(out) >= limit:
+                nxt = i
+                break
+            smp = buf[i]
+            i += 1
+            ts = smp.get('collected_ts')
+            if after is not None and not (isinstance(ts, (int, float))
+                                          and ts > after):
+                continue
+            if group is not None and smp.get('recording_group') != group:
+                continue
+            out.append(smp)
+        cur = None
+        if nxt is not None:
+            cur = Q.encode_cursor({'t': 'n', 'q': ctx, 'o': nxt})
+        return {'samples': out, 'count': len(out), 'next_cursor': cur,
+                'skipped_lines': 0, 'scanned_bytes': 0}
 
     def info(self):
         """Counts only (Storage Inspector): no jobs' contents or samples."""

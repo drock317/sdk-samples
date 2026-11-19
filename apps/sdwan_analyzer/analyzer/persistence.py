@@ -545,60 +545,206 @@ def read_newest(path, n, stats=None):
         window *= 4
 
 
-def read_range(path, start_ts=None, end_ts=None, offset=0, limit=None,
-               max_bytes=None, stats=None):
-    """Records with start_ts <= collected_ts <= end_ts, from a byte offset.
+QUERY_MAX_LINE = 262144            # a line longer than this is never served
+QUERY_SKIP_CHUNK = 65536           # chunk size while skipping an oversized line
 
-    Uses the line-prefix timestamp so out-of-range lines are not parsed.
-    Returns (records, next_offset, eof). `next_offset` is the cursor to
-    resume from (the byte after the last examined line when stopping early).
+
+def scan_range(path, offset=0, start_ts=None, end_ts=None, after_ts=None,
+               limit=None, max_bytes=None, max_accept_bytes=None,
+               accept=None, resync=False, stop_past_end=False,
+               max_line=QUERY_MAX_LINE, progress_floor=False):
+    """Bounded forward scan of a JSONL file from a byte offset.
+
+    Every byte read from the file is counted in ``scanned_bytes`` (accepted,
+    filtered-out, malformed, oversized and skipped alike) and the total never
+    exceeds ``max_bytes`` (unless ``progress_floor``, see below). Lines are
+    read with a length cap, so one huge line can never be pulled into memory.
+
+    Filters (applied on the cheap line prefix when possible):
+      start_ts <= ts <= end_ts   inclusive bounds
+      ts > after_ts              exclusive lower bound
+      accept(record) -> bool     extra predicate on the parsed record
+    stop_past_end: the file is in collection order, so the first line with
+      ts > end_ts ends the scan for good (``past_end``): remaining lines are
+      not examined.
+
+    Limits: ``limit`` accepted records, ``max_accept_bytes`` of accepted line
+    bytes (response bound). A record that would break either bound is NOT
+    consumed: ``next_offset`` stays at its start so the next page returns it.
+
+    Lines longer than ``max_line`` are oversized: counted as skipped and never
+    parsed. If the byte budget ends inside an oversized line, ``resync`` is
+    returned True and ``next_offset`` is mid-line: pass resync=True with that
+    offset to skip the rest of the line before reading records again.
+
+    Only COMPLETE (newline-terminated) lines are consumed; an unterminated
+    tail (a record being appended right now) is left for the next call.
+
+    progress_floor: guarantee that the first line is examined even when
+    max_bytes is smaller than a line (legacy read_range behaviour). Query
+    callers leave it False so the byte ceiling is strict.
+
+    Returns a dict: records, next_offset, eof, scanned_bytes, skipped,
+    accepted_bytes, resync, past_end, missing.
     """
-    out = []
-    total = 0
-    nxt = offset
-    eof = True
+    res = {'records': [], 'next_offset': offset, 'eof': True,
+           'scanned_bytes': 0, 'skipped': 0, 'accepted_bytes': 0,
+           'resync': False, 'past_end': False, 'missing': False}
     try:
         f = open(path, 'rb')
     except OSError:
-        return out, nxt, True
+        res['missing'] = True
+        return res
+    budget = max_bytes if max_bytes is not None else float('inf')
+    out = res['records']
+    scanned = 0
+    pos = offset
+    tail = False
     with f:
         f.seek(offset)
-        pos = offset
-        for line in f:
-            if not line.endswith(b'\n'):
-                break
+        if resync:
+            # Finish skipping an oversized line begun by a previous call.
+            while True:
+                room = budget - scanned
+                if room <= 0:
+                    res.update(next_offset=pos, scanned_bytes=scanned,
+                               resync=True, eof=False)
+                    return res
+                chunk = f.readline(int(min(QUERY_SKIP_CHUNK, room)))
+                if not chunk:
+                    # EOF inside the oversized line (still being written).
+                    res.update(next_offset=pos, scanned_bytes=scanned,
+                               eof=True)
+                    return res
+                scanned += len(chunk)
+                pos += len(chunk)
+                if chunk.endswith(b'\n'):
+                    break
+        while True:
             if limit is not None and len(out) >= limit:
-                eof = False
                 break
-            if max_bytes is not None and out and total >= max_bytes:
-                eof = False
+            room = budget - scanned
+            if progress_floor and scanned == 0 and room < max_line + 1:
+                room = max_line + 1
+            if room <= 0:
+                break
+            want = int(min(max_line + 1, room))
+            line = f.readline(want)
+            if not line:
+                break                           # EOF
+            scanned += len(line)
+            if not line.endswith(b'\n'):
+                if len(line) > max_line:
+                    # Oversized: skip the rest of the line within budget.
+                    res['skipped'] += 1
+                    pos += len(line)
+                    done = False
+                    while True:
+                        room = budget - scanned
+                        if room <= 0:
+                            res['resync'] = True
+                            break
+                        chunk = f.readline(int(min(QUERY_SKIP_CHUNK, room)))
+                        if not chunk:
+                            break               # EOF mid-line: incomplete
+                        scanned += len(chunk)
+                        pos += len(chunk)
+                        if chunk.endswith(b'\n'):
+                            done = True
+                            break
+                    if done:
+                        continue
+                    if not res['resync']:
+                        tail = True     # EOF inside an unterminated line
+                    break
+                # No newline and short: an incomplete tail (EOF) or the byte
+                # budget cut this line short. Neither is consumed.
+                tail = len(line) < want
                 break
             start = pos
             pos += len(line)
-            nxt = pos
             if not line.strip():
                 continue
             ts = peek_ts(line)
             if ts is not None:
-                if start_ts is not None and ts < start_ts:
-                    continue
-                if end_ts is not None and ts > end_ts:
+                if stop_past_end and end_ts is not None and ts > end_ts:
+                    res['past_end'] = True
+                    pos = start                 # not consumed
+                    break
+                if ((start_ts is not None and ts < start_ts)
+                        or (end_ts is not None and ts > end_ts)
+                        or (after_ts is not None and ts <= after_ts)):
                     continue
             rec = _parse_line(line)
             if rec is None:
-                if stats is not None:
-                    stats['skipped'] = stats.get('skipped', 0) + 1
+                res['skipped'] += 1
                 continue
             if ts is None:
                 t = rec.get('collected_ts')
-                if isinstance(t, (int, float)):
-                    if start_ts is not None and t < start_ts:
-                        continue
-                    if end_ts is not None and t > end_ts:
-                        continue
+                if not isinstance(t, (int, float)) or isinstance(t, bool):
+                    res['skipped'] += 1
+                    continue
+                if ((start_ts is not None and t < start_ts)
+                        or (end_ts is not None and t > end_ts)
+                        or (after_ts is not None and t <= after_ts)):
+                    continue
+            if accept is not None and not accept(rec):
+                continue
+            if (max_accept_bytes is not None and out
+                    and res['accepted_bytes'] + len(line) > max_accept_bytes):
+                pos = start                     # not consumed: next page
+                break
             out.append(rec)
-            total += len(line)
-    return out, nxt, eof
+            res['accepted_bytes'] += len(line)
+        try:
+            size = os.fstat(f.fileno()).st_size
+        except OSError:
+            size = pos
+    res['next_offset'] = pos
+    res['scanned_bytes'] = scanned
+    res['eof'] = res['past_end'] or tail or (
+        not res['resync'] and pos >= size)
+    return res
+
+
+def offset_state(path, offset):
+    """Is `offset` a valid resume point in a JSONL file?
+
+    'missing' (no file), 'beyond' (past the end), 'mid' (inside a line) or
+    'ok' (start of file, or directly after a newline).
+    """
+    try:
+        f = open(path, 'rb')
+    except OSError:
+        return 'missing'
+    with f:
+        if offset > os.fstat(f.fileno()).st_size:
+            return 'beyond'
+        if offset == 0:
+            return 'ok'
+        f.seek(offset - 1)
+        return 'ok' if f.read(1) == b'\n' else 'mid'
+
+
+def read_range(path, start_ts=None, end_ts=None, offset=0, limit=None,
+               max_bytes=None, stats=None):
+    """Records with start_ts <= collected_ts <= end_ts, from a byte offset.
+
+    Thin wrapper over scan_range (kept for compatibility). The first line is
+    always examined even if it is longer than max_bytes (progress floor);
+    after that the byte budget is enforced on bytes actually read, including
+    filtered-out and malformed lines. ``stats`` receives ``skipped`` and
+    ``scanned_bytes``.
+    Returns (records, next_offset, eof). `next_offset` is the cursor to
+    resume from.
+    """
+    res = scan_range(path, offset, start_ts=start_ts, end_ts=end_ts,
+                     limit=limit, max_bytes=max_bytes, progress_floor=True)
+    if stats is not None:
+        stats['skipped'] = stats.get('skipped', 0) + res['skipped']
+        stats['scanned_bytes'] = (stats.get('scanned_bytes', 0)
+                                  + res['scanned_bytes'])
+    return res['records'], res['next_offset'], res['eof']
 
 
 # --- persisted observation form -----------------------------------------------

@@ -41,6 +41,7 @@ from . import collectors
 from . import durable
 from . import inspector
 from . import normalize
+from . import query
 from . import recording
 from . import storage
 from . import telemetry
@@ -923,6 +924,33 @@ class AnalyzerService(object):
 
     def history(self, limit=100):
         return self._store.recent(limit=limit)
+
+    # --- bounded read queries (GET /api/history, recording samples) -------
+    # Read-only: no collection, no schedule change, no writes. Raise
+    # query.QueryError (400/404/410) for client mistakes; anything else is an
+    # unexpected failure for the web layer to log and answer with 500.
+
+    def query_history(self, raw_query=''):
+        """Durable history page: normalized observations, oldest first."""
+        p = query.parse_history_params(raw_query)
+        now = self._clock()
+        window = (now - query.DEFAULT_WINDOW_S
+                  if durable.sane_ts(now) else None)
+        res = self._store.query(
+            start=p['start'], end=p['end'], limit=p['limit'],
+            cursor=p['cursor'], sample_source=p['sample_source'],
+            window_start=window)
+        return query.envelope(res['samples'], res['next_cursor'],
+                              res['skipped_lines'])
+
+    def query_recording_samples(self, job_id, raw_query=''):
+        """One bounded page of a Recording's samples, oldest first."""
+        p = query.parse_samples_params(raw_query, recording.GROUPS)
+        res = self._rec_store.query_samples(
+            job_id, limit=p['limit'], group=p['group'], after=p['after'],
+            cursor=p['cursor'])
+        return query.envelope(res['samples'], res['next_cursor'],
+                              res['skipped_lines'])
 
     def status(self):
         """Lightweight health/introspection payload for the dev/status page.

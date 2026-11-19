@@ -5,7 +5,7 @@ NCOS routers: WAN paths, SD-WAN interfaces, WAN bonding (WBOND), member
 interfaces, traffic steering, underlay connectivity, cellular state, and how
 these change over time.
 
-> **Status: BACKEND build (v0.4.3).** Targeted collectors, normalization,
+> **Status: BACKEND build (v0.4.4).** Targeted collectors, normalization,
 > logical Traffic Steering grouping, semantic fingerprints, a cached snapshot,
 > section JSON endpoints, and (new in 0.3.0) the **data-acquisition model**
 > below: startup + scheduled + manual collection, source-tagged observations,
@@ -13,7 +13,7 @@ these change over time.
 > change-versioned config. **Recording jobs (backend)** are new in 0.3.2. v0.3.3 is a
 > hardening/API patch (bounded client sockets, current interface + cellular
 > telemetry APIs, numeric RF values). **v0.4.0 added durable telemetry
-> storage; v0.4.1-0.4.3 harden it** (state ownership, config version reuse, safe shutdown during upgrade, time-based dedupe recovery) (see *Durable telemetry storage* below). The polished UI remains
+> storage; v0.4.1-0.4.3 harden it** (state ownership, config version reuse, safe shutdown during upgrade, time-based dedupe recovery). **v0.4.4 adds the bounded, paginated read APIs** `/api/history` and `/api/recordings/<id>/samples` (see *Query APIs* below). The polished UI remains
 > deferred.
 
 ## Architecture
@@ -92,8 +92,9 @@ not ready"}` until the first snapshot has been composed.
 - `GET /api/bonding` — WBOND bonds with member runtime detail
 - `GET /api/identities` — resolved destination identities
 - `GET /api/changes` — topology/config change flags vs previous snapshot
-- `GET /api/history` — the most recent source-tagged observations (a RAM ring
-  of ~20; the full durable history is on disk and is paged in a later phase)
+- `GET /api/history` (0.4.4) — durable, paginated history; see *Query APIs*.
+- `GET /api/recordings/<job_id>/samples` (0.4.4) — paginated Recording
+  samples; see *Query APIs*.
 - `POST /api/refresh/<group>` — manual refresh of one group
   (`traffic_classes`, `steering`, `bonding`, `wan_paths`, `overview`);
   ~5 s cooldown per group (`429` while cooling down)
@@ -385,6 +386,115 @@ tmp/telemetry/
   `/api/storage` (`status: degraded`). Observations stamped with an obviously
   invalid clock stay in RAM only.
 
+## Query APIs (0.4.4)
+
+Two read-only, paginated endpoints serve the durable data. They never trigger
+collection, never write to disk, and never use the ~20-observation RAM ring
+while durable storage is healthy. Both return the normalized observation
+objects (the same shape as in memory), not raw JSONL records or NCOS payloads.
+
+Response envelope (both endpoints):
+
+```json
+{"samples": [], "count": 0, "next_cursor": null, "has_more": false,
+ "skipped_lines": 0}
+```
+
+`samples` are oldest first (persisted collection order). `next_cursor` is an
+opaque token: pass it back unchanged as `cursor=` with the same filters to get
+the next page; `has_more` is `true` exactly when `next_cursor` is set.
+`skipped_lines` counts malformed or oversized lines passed over while reading
+this page.
+
+### `GET /api/history`
+
+| Parameter | Behaviour |
+|---|---|
+| `limit` | 1-250, default 100 |
+| `start` | inclusive UTC Unix epoch seconds (integer or decimal) |
+| `end` | inclusive UTC Unix epoch seconds |
+| `sample_source` | `scheduled`, `manual` or `startup` |
+| `cursor` | token from the previous page |
+
+With neither `start` nor `end` (and no `cursor`) the window is the most recent
+24 hours of the router clock (no default window if the clock is not sane).
+Explicit bounds may span the whole retained 7-day history. The default window
+is pinned inside the cursor, so it does not slide between pages.
+
+```
+GET /api/history?limit=100
+GET /api/history?start=1790380800&end=1790467199&sample_source=manual
+GET /api/history?limit=100&cursor=<next_cursor from the previous response>
+```
+
+### `GET /api/recordings/<job_id>/samples`
+
+| Parameter | Behaviour |
+|---|---|
+| `limit` | 1-250, default 100 |
+| `group` | one of `wan`, `wbond`, `steering`, `qoe`, `swans`, `config` |
+| `after` | exclusive UTC epoch seconds on `collected_ts` |
+| `cursor` | token from the previous page |
+
+Samples keep their `collected_ts` / `timestamp` and `recording_group`. Active,
+completed, stopped, expired and failed Recordings are all readable while their
+sample file exists. To follow an active Recording, page with `cursor` until
+`has_more` is `false`, then poll with `after=<last collected_ts>`.
+
+```
+GET /api/recordings/rec-1790380800-001/samples?group=wan&limit=50
+GET /api/recordings/rec-1790380800-001/samples?after=1790380830.5
+```
+
+### Cursors
+
+Cursors are base64url JSON and are opaque to clients. A history cursor holds
+the UTC day segment and a byte offset; a Recording cursor holds a byte offset
+into `samples.jsonl`. Both carry a digest of the query parameters they were
+issued for (`start`, `end`, `sample_source` / `group`, `after`, the job), so
+reusing a cursor with different filters is rejected. `limit` may change
+between pages. Cursors are only ever resumed on a record boundary and are
+re-validated against the real files on every use, so a forged cursor can be
+rejected but cannot steer a read outside the telemetry tree. Nothing is
+re-read: each page resumes at the byte after the last line it consumed.
+
+### Resource limits
+
+- at most 250 observations per page;
+- at most 1 MiB of file data examined per request, counting every byte read:
+  accepted, filtered-out, malformed and skipped lines alike;
+- at most 512 KiB of accepted (persisted) records per page, which keeps a
+  response body to roughly 1 MiB (decoded JSON is about 1.6x the persisted
+  size);
+- a line longer than 256 KiB is never a record: it is skipped, counted in
+  `skipped_lines`, and not parsed. The skip can span pages (the cursor then
+  points inside that line and the next request finishes skipping it);
+- only complete (newline-terminated) lines are served, so a Recording that is
+  being appended to is safe to page;
+- no total-count scans, no reverse order, no offset/row pagination.
+
+A page may therefore hold fewer than `limit` samples, and a filtered page can
+be **empty while `has_more` is `true`**: keep following `next_cursor`.
+
+Because history files are in collection order, a query with `end` stops at the
+first sample after `end` and does not look further in that query.
+
+### Errors
+
+All errors are JSON `{"error": "<message>"}` with no filesystem paths.
+
+| Status | When |
+|---|---|
+| 200 | valid query |
+| 400 | bad `limit`/`start`/`end`/`after`/`sample_source`/`group`, unknown or repeated parameter, `start` after `end`, malformed / mismatched / out-of-range cursor |
+| 404 | unknown (or malformed) Recording id, and `/api/recordings/<id>/samples` for a job that is gone |
+| 410 | the cursor's backing data expired: its history day file or its Recording was removed by retention |
+| 500 | unexpected read failure (logged via `cp.log`, body is `{"error": "internal error"}`) |
+
+When durable storage is unavailable, both endpoints fall back to the bounded
+in-memory stores with the same contract (cursors there are sequence positions;
+an evicted position is `410`).
+
 ## Normalized snapshot schema
 
 ```
@@ -503,7 +613,11 @@ schema composition, change detection, the cellular privacy filter, and the
 v0.3.0 acquisition model (startup/scheduled/manual sources, schedule choices,
 no legacy polling, manual-refresh cooldown, interface counters/reset
 detection, cellular CA parsing + cell hash, SWANS dedupe, config
-versioning, collector timeout).
+versioning, collector timeout). `tests/durable_tests.py` covers durable
+storage; `tests/query_tests.py` (0.4.4) covers the query APIs: multi-day
+paging, inclusive bounds, source/group/`after` filters, cursor rejection and
+expiry, malformed and oversized lines, byte ceilings, active-Recording
+appends, fallback mode and read-side-effect freedom.
 
 ## NCOS API paths
 
