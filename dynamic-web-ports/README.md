@@ -1,4 +1,10 @@
 # Dynamic Web Ports for Cradlepoint SDK apps
+> **Superseded for new apps.** Cradlepoint upstream now ships dynamic web ports in the shared
+> `cp.py` (`cp.start_web_server()`, `cp.bind_web_port()`, `cp.stop_app()`). New and synchronized
+> apps use those and must not copy `web_port.py`. This kit is kept only as history and for
+> SD-WAN Analyzer v0.5.0, which still uses its own `analyzer/web_port.py` until the migration in
+> [docs/SDWAN_UPSTREAM_MIGRATION.md](docs/SDWAN_UPSTREAM_MIGRATION.md).
+
 
 Stop hardcoding port 8000. With this kit an SDK web app **finds a free port on
 its first run, saves it in Application Data, and reuses it forever**. An admin

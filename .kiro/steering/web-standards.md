@@ -1,12 +1,29 @@
 # Web Development Standards
 
 - **ALWAYS use Python's built-in `http.server` module** - never use third-party web frameworks (Flask, Bottle, CherryPy, etc.). The native `http.server.HTTPServer` is available on cppython and has zero dependencies
+- **ALWAYS start the web server with `cp.start_web_server(Handler)` - NEVER hardcode a port** - it picks the port, serves in a daemon thread, and returns the server (`server.server_port` is the port). See `main()` in `apps/templates/web_app_template/web_app_template.py`. How the port is chosen:
+  - Appdata `<app_name>_web_port` set (NCM group/device SDK Data): that exact port, retried ~10 s if busy. It never moves to another port, so pinned LAN Manager connections and firewall rules stay valid
+  - Not set: first free port from 8000, saved to `<app_name>_web_port` so it stays the same across reboots. This records a real assignment; it is not writing a default to appdata
+  - On failure (invalid value, port busy) on the router it stops the app via the SDK and never returns - do not `sys.exit()` around it, that causes a `restart = true` loop. Off-router it returns `None`. Pass `required=False` when the app's main job does not need the UI (NTP server, data recorder): it then returns `None` and the app keeps running
+  - The main thread must stay alive after it returns (`while True: time.sleep(60)` or the app's work loop) - code that used to block in `serve_forever()` would otherwise fall off the end of `main()`
+  - Renaming an existing app's port field: pass `legacy_field='old_field_name'` so the old NCM setting is still honoured when `<app_name>_web_port` is unset, and list the old field as deprecated in the readme
+  - Apps with their own server class or tornado: `sock = cp.bind_web_port()` returns the bound socket (same rules, returns `None` on failure). For `http.server`: build with `bind_and_activate=False`, close its placeholder `server.socket`, then assign `server.socket = sock`. For tornado: `sock.setblocking(False)`, then `tornado.httpserver.HTTPServer(app).add_sockets([sock])` (see `apps/tornado_sample`). On `None`, call `cp.stop_app()` and idle - never exit. A second listener in one app uses `cp.bind_web_port(name='api')` → `<app_name>_api_port`
+  - Document `<app_name>_web_port` in the readme's Appdata Fields table (optional; set it to pin the port, delete it to rediscover). Readme URLs say `http://router_ip:<port>`, not `:8000`
+- **Custom server classes must skip the FQDN lookup** (not needed with `cp.start_web_server`, which never binds through `server_bind`) - `http.server.HTTPServer.server_bind()` calls `socket.getfqdn()`, which runs the router's hostname through the `idna` codec. On routers whose hostname does not conform to IDNA (common), this raises `UnicodeError: encoding with 'idna' codec failed (UnicodeError: label too long)` and the server never starts. No SDK web app needs the FQDN (clients connect by IP), so bypass it. Subclass the server and override `server_bind` to call `socketserver.TCPServer.server_bind(self)` then set `server_name`/`server_port` from the bound socket:
+  ```python
+  class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+      daemon_threads = True
+      allow_reuse_address = True
+
+      def server_bind(self):
+          socketserver.TCPServer.server_bind(self)  # skips socket.getfqdn()
+          host, port = self.socket.getsockname()[:2]
+          self.server_name = host
+          self.server_port = port
+  ```
 - **LAN client access to router ports requires firewall zone forwarding** - For a client device on the LAN to reach a port on the router (SDK app web UI, SNMP agent, container-published port, etc.), the firewall must have a forwarding rule from the Primary LAN Zone to the Router Zone. If an app is running but LAN clients get connection timeouts, the zone forwarding is the first thing to check. Zone firewall rules live under `config/security/zfw/forwardings` (zones in `config/security/zfw/zones`) or in the NCOS UI under Security > Zone Firewall; `config/firewall/zone_fwd` is NOT the zone firewall, so an empty list there means nothing. A TCP timeout (not a refusal) to a port the app logged as bound, while SSH and HTTPS still work, is the signature of a missing forwarding rule.
 - **NCM API does NOT support CORS** - the NetCloud Manager API at `us0.cradlepointecm.com` blocks cross-origin browser requests (no `Access-Control-Allow-Origin` header). Browser JS from third-party origins (e.g., GitHub Pages) cannot call NCM APIs directly. Use server-side calls (curl, Python requests) or the NCM web UI for uploads
-- **Port 8000 is only the first-run starting point** - never hardcode it. The effective port comes from the app's `<app_name>_web_port` App Data value, or is discovered starting at 8000 (see the persistent dynamic web port standard at the end of this file)
-- **ALWAYS set SO_REUSEADDR** before binding: `server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)`
-- **Port conflicts on redeployment** - SO_REUSEADDR doesn't prevent "Address in use" errors when redeploying without router reboot. `web_port.bind_web_socket_with_retry` retries a busy configured port (the same port only) for about 60s, which normally covers a redeploy. On first run with no value it moves to the next free port (8001, 8002, ...) and persists it. If a configured port stays held, the app stops itself; fix the value or reboot the router
-- **Background web server pattern** - run `http.server.HTTPServer` in a daemon thread: `Thread(target=server.serve_forever, daemon=True).start()`. Main thread runs the app's primary loop
+- **Background web server pattern** - the server runs in a daemon thread (`cp.start_web_server` does this); the main thread runs the app's primary loop and must not fall off the end of `main()`
 - **Dashboard auto-refresh with server-side timestamps** - compute `_ago` values (seconds since event) on the server, not the client. Client clocks may differ from router. Return `connected_ago`, `last_rx_ago` etc. as integers
 - **Dynamic download filenames** - use router hostname and timestamp: `cp.get('config/system/system_id')` + `datetime.now().strftime('%Y%m%d_%H%M%S')`
 - **Light/dark mode** - use `data-theme` attribute on `<html>` element, persist with `localStorage.setItem('theme', 'light'|'dark')`, load on page init
@@ -27,10 +44,3 @@
 - Serve assets locally (no external dependencies)
 - Implement signal handlers for graceful shutdown
 - Log which port server started on
-- **Persistent dynamic web port (standard)** - Every web app selects its port through the shared `web_port.py` helper (copied in with the web app template), never a hardcoded 8000. The app namespaces its port in Application Data as `<app_name>_web_port`.
-  - A configured `<app_name>_web_port` is authoritative: bind exactly that port or FAIL closed (do not relocate, do not overwrite, do not start the web server on another port). This protects pinned NCM LAN Manager connections. A malformed/out-of-range value also fails closed
-  - If unset (first run), discover a free port by real socket bind from 8000 (bounded range), then persist it with `cp.put_appdata`. The persisted value is reused on every later start - this records an assignment, it is NOT writing a code default to appdata (which coding-standards forbids)
-  - Call `web_port.bind_web_socket_with_retry(app_name, cp.get_appdata, cp.put_appdata, cp.log)` (not the bare `bind_web_socket`). It returns an already-bound socket; hand it to `HTTPServer(..., bind_and_activate=False)` and set `httpd.socket = result.sock` to avoid a check-then-bind race
-  - **NEVER `sys.exit()` on a web-port failure** - apps run with `restart = true`, so NCOS restarts an exited app every few seconds forever and spams the log. A malformed value is logged once; a valid-but-busy port is retried in-process (same port only, ~60s) then logged once. After the final failure call `web_port.stop_app(cp.put, cp.log)` so the app STOPS ITSELF via the SDK (a stopped app is not restarted). A web app must never keep running without a port; only if the stop is not honoured, idle without the web server (still no exit)
-  - Admins set `<app_name>_web_port` via NCM group/device config to standardize a fleet. Log the effective port and its source, and document the field in the app readme's appdata table
-  - See the `web-port` skill for the full integration pattern

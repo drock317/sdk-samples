@@ -33,6 +33,7 @@ The Web App Template Style Guide provides a complete design system with:
 - **Help button** – Opens a modal displaying the app's readme.md content, rendered as formatted HTML
 - **Device info button** – Opens a modal showing router model, serial number, MAC address, firmware version, and SDK app version
 - **App version display** – Version number from package.ini shown below the app title
+- **Dynamic web port** – Finds a free port from 8000 on first run and remembers it, or uses the port you set in NCM SDK Data (see *Web Port* below)
 - **Copyable markup** – Structured HTML ready for rapid prototyping
 - **Consistent design language** – Shared typography, color tokens, and spacing across all components
 - **Production-ready patterns** – Snapshot of UI patterns suitable for internal portals, admin consoles, and monitoring dashboards
@@ -49,7 +50,7 @@ The Web App Template Style Guide provides a complete design system with:
    python3 web_app_template.py
    ```
 
-2. Open a browser and go to: **http://localhost:8000**
+2. Open the URL printed at startup (usually **http://localhost:8000**; the next free port if 8000 is taken). On a router, browse to `http://router_ip:<port>`, where the port is shown in the app log and the Device Info modal.
 
 3. The style guide (`index.html`) loads by default, with a sidebar for browsing components and a search bar for filtering elements.
 
@@ -72,7 +73,6 @@ The Web App Template Style Guide provides a complete design system with:
 4. **Assets** – Ensure your app references:
    - `static/css/style.css` – Main stylesheet
    - `static/libs/font-awesome.min.css` – Icons
-   - `static/libs/jquery-3.5.1.min.js` – jQuery (if your scripts depend on it)
 
 ### Project Structure
 
@@ -81,51 +81,14 @@ web_app_template/
 ├── index.html              # Style guide (full component library)
 ├── your_web_app.html       # Starter template for new apps
 ├── web_app_template.py     # HTTP server with API endpoints
-├── web_port.py             # Persistent dynamic web-port standard (shared, app-agnostic)
 ├── package.ini             # App metadata and version
 ├── start.sh                # Launch script
 ├── static/
 │   ├── css/style.css       # Design system styles
 │   ├── js/script.js        # Application logic
-│   └── libs/               # Font Awesome, jQuery
+│   └── libs/               # Font Awesome (CSS + webfonts)
 └── readme.md
 ```
-
----
-
-## Web Port (Application Data)
-
-On the router, the web server selects its listening port through the shared
-`web_port.py` helper rather than a hardcoded value. The effective port is
-namespaced in Application Data per the SDK standard:
-
-| Field | Type | Required | Purpose |
-|-------|------|----------|---------|
-| `<app_name>_web_port` | string (integer port) | No | Effective web listening port. For this template the field is `web_app_template_web_port`. Device-level App Data is shared, so the field is namespaced per app. |
-
-Behavior:
-
-- **If `<app_name>_web_port` is set**, it is authoritative: the app binds
-  exactly that port. It does not scan, does not silently relocate, and does
-  not overwrite the value if the port is occupied — it logs a clear error and
-  fails web startup safely. This determinism protects an NCM LAN Manager
-  connection pinned to that port. A malformed/out-of-range value fails closed.
-- **Failures never cause a restart loop.** A malformed value is logged once.
-  A valid but busy port is retried (same port only) every 5 s for about 60 s,
-  then logged once. In both cases the app **stops itself** via the SDK
-  (`web_port.stop_app()`) instead of exiting, because NCOS restarts an exited
-  app (`restart = true`) every few seconds but does not restart a stopped one.
-- **If it is not set** (first run), the app discovers a usable port by actual
-  socket bind starting at 8000 (bounded), then persists the result with
-  `cp.put_appdata`. On later restarts the persisted value is reused even if
-  8000 frees up. This is an intentional write of the discovered assignment,
-  not a code default.
-- **NCM** can set `<app_name>_web_port` at group/device level to standardize
-  the port across a fleet; the app consumes the effective value on next
-  startup. No NCM API credentials are used.
-
-The effective port and its source (`configured` | `discovered`) are logged at
-startup. Local (off-router) runs bind port 8000 directly for convenience.
 
 ### API Endpoints
 
@@ -134,7 +97,26 @@ startup. Local (off-router) runs bind port 8000 directly for convenience.
 | `GET /` | Serves `index.html` (style guide) |
 | `GET /your_web_app.html` | Serves the starter template |
 | `GET /api/help` | Returns readme.md content as plain text |
-| `GET /api/info` | Returns JSON with router model, serial number, MAC address, firmware version, and app version |
+| `GET /api/info` | Returns JSON with router model, serial number, MAC address, firmware version, app version, and the web port |
+
+---
+
+## Web Port
+
+The app does not hardcode its port. At startup it reads the SDK Data field `web_app_template_web_port`:
+
+- **Set** – the app binds exactly that port. If the port is busy it retries for about 10 seconds, then stops itself. It never moves to a different port, so NCM LAN Manager connections and firewall rules pinned to that port stay valid. An invalid value (not a number from 1 to 65535) stops the app straight away.
+- **Not set** – on first run the app takes the first free port from 8000 to 8063 and saves it to `web_app_template_web_port`, so it keeps the same port after reboots.
+
+To change the port for one router or a whole group, set the field in NCM SDK Data (Device or Group) and restart the app. To go back to automatic selection, delete the field and restart the app. After fixing a bad value, start the app again (it also retries on the next reboot).
+
+LAN clients need a firewall forwarding rule from the Primary LAN Zone to the Router Zone to reach the port. A connection timeout while the log says the server started usually means that rule is missing.
+
+## Appdata Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `web_app_template_web_port` | No | Web UI port (1–65535). Authoritative when set. When not set, the app discovers a free port from 8000 and saves it here. Apps built from this template use `<app_name>_web_port`. |
 
 ---
 
@@ -148,5 +130,5 @@ startup. Local (off-router) runs bind port 8000 directly for convenience.
 
 ## Version
 
-- **Version:** 1.1.0  
+- **Version:** 1.2.0  
 - **Status:** BETA

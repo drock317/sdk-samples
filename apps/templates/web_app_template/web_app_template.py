@@ -3,33 +3,26 @@
 Web App Template Server
 Serves the web app template using Python's built-in HTTP server
 with API endpoints for help content and device info.
+
+The port is chosen by cp.start_web_server(): the appdata field
+"<app_name>_web_port" is used when set (NCM group/device SDK Data);
+otherwise the first free port from 8000 is used and saved there.
 """
 
 import http.server
-import socketserver
 import os
 import sys
 import json
 import time
+import configparser
 
-import web_port
+import cp
 
-try:
-    import configparser
-except ImportError:
-    import ConfigParser as configparser
+# Check if we're truly on a router by looking for the NCOS socket
+ON_ROUTER = os.path.exists('/var/tmp/cs.sock')
 
-try:
-    import cp
-    # Check if we're truly on a router by looking for the NCOS socket
-    ON_ROUTER = os.path.exists('/var/tmp/cs.sock')
-except ImportError:
-    ON_ROUTER = False
-
-# First-run discovery start port for local (off-router) use. On-router the
-# effective port is resolved through web_port (configured appdata value is
-# authoritative; otherwise discover-and-persist from this base).
-PORT = 8000
+# Effective web port, set in main() and shown in /api/info
+WEB_PORT = None
 
 # Resolve paths relative to this script
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -116,6 +109,7 @@ def _get_device_info():
         'mac_address': 'N/A',
         'firmware_version': 'N/A',
         'app_version': app_version,
+        'web_port': WEB_PORT,
     }
 
     if ON_ROUTER:
@@ -319,93 +313,30 @@ class AppRequestHandler(http.server.BaseHTTPRequestHandler):
                               format % args))
 
 
-def _main_on_router(app_name, version):
-    """Start the HTTP server on the router using the web_port standard.
-
-    The effective port comes from web_port.bind_web_socket:
-      * a configured <app_name>_web_port in App Data is authoritative
-        (bind-exact or fail closed), and
-      * first-run discovery scans from PORT by real socket bind and
-        persists the result for reuse on later starts.
-
-    bind_web_socket returns an already-bound socket, which is handed to
-    HTTPServer(bind_and_activate=False) so the bind itself is the
-    availability test (no check-then-bind race).
-    """
+def main():
+    """Start the web server and keep the main thread alive."""
+    global WEB_PORT
+    app_name, version = _read_package_ini()
     cp.log('Starting {} v{}...'.format(app_name, version))
 
-    result = web_port.bind_web_socket_with_retry(
-        app_name, cp.get_appdata, cp.put_appdata, cp.log,
-        start_port=PORT)
-    if not result.ok:
-        # A web app with no port is useless: stop the app via the SDK. Do NOT
-        # sys.exit(): NCOS restarts an exited app (restart = true) every few
-        # seconds, which would spam the log forever. A stopped app is not
-        # restarted. The reason has already been logged.
-        cp.log('ERROR: web server NOT started ({}). Stopping the app; '
-               'correct {} and start it again.'.format(
-                   result.error, web_port.appdata_field(app_name)))
-        if web_port.stop_app(cp.put, cp.log):
-            time.sleep(30)  # give the SDK time to terminate this process
-        cp.log('SDK stop request was not honoured; idling without the web '
-               'server (no exit, to avoid a restart loop).')
+    # Picks the port from appdata "<app_name>_web_port", or the first free
+    # port from 8000. On the router a failure stops the app, never exits.
+    httpd = cp.start_web_server(AppRequestHandler)
+    if httpd is None:
+        sys.exit(1)  # local run only; the reason is already printed
+    WEB_PORT = httpd.server_port
+
+    if not ON_ROUTER:
+        print("Server running at: http://localhost:{}  (Ctrl+C to stop)"
+              .format(WEB_PORT))
+
+    try:
+        # The app's main work goes here; the web server runs in its thread.
         while True:
-            time.sleep(3600)
-
-    httpd = http.server.HTTPServer(('0.0.0.0', result.port),
-                                   AppRequestHandler,
-                                   bind_and_activate=False)
-    # Close the unused placeholder socket HTTPServer created, then hand over
-    # the pre-bound listening socket (no re-bind).
-    httpd.socket.close()
-    httpd.socket = result.sock
-    cp.log('Web server started on port {} (source: {})'.format(
-        result.port, result.source))
-    try:
-        httpd.serve_forever()
+            time.sleep(1)
     except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            httpd.server_close()
-        except Exception:
-            pass
-
-
-def _main_local(app_name, version):
-    """Start the HTTP server for local (off-router) development.
-
-    No cp/App Data available locally, so this uses the simple bind on PORT.
-    The on-router path is the one that implements the web_port standard.
-    """
-    try:
-        with socketserver.TCPServer(("", PORT), AppRequestHandler) as httpd:
-            print("=" * 60)
-            print("{} v{}".format(app_name, version))
-            print("=" * 60)
-            print("Server running at: http://0.0.0.0:{}".format(PORT))
-            print("Serving directory: {}".format(_SCRIPT_DIR))
-            print("\nPress Ctrl+C to stop the server")
-            print("=" * 60)
-            httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("\n\nServer stopped by user.")
-        sys.exit(0)
-    except OSError as e:
-        if e.errno == 48 or e.errno == 98:  # Address already in use
-            print("\nError: Port {} is already in use.".format(PORT))
-        else:
-            print("\nError: Failed to start server: {}".format(e))
-        sys.exit(1)
-
-
-def main():
-    """Start the HTTP server."""
-    app_name, version = _read_package_ini()
-    if ON_ROUTER:
-        _main_on_router(app_name, version)
-    else:
-        _main_local(app_name, version)
+        httpd.shutdown()
+        httpd.server_close()
 
 
 if __name__ == "__main__":

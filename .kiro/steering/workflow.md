@@ -46,6 +46,55 @@ After creation, modify only `{app_name}.py` and `readme.md`. The rest is generat
 Before writing any app code: run the API Verification Workflow (`api-reference.md`), and
 **ask the user about unknowns** rather than assuming requirements, data formats, or behavior.
 
+## Write the readme for the user, not the developer
+
+`readme.md` is for someone who just wants to **use** the app, not read its source. Write it so a
+person who found the app in NCM can install it, configure it, and know what it does — without
+opening the code. Do not document the implementation (internal functions, code structure, how the
+polling loop works); only what a user needs to operate it.
+
+Follow the house style of the existing app readmes (`5GSpeed`, `client_bandwidth_throttle`):
+
+1. **Title + one-line description** — what the app does, in plain language.
+2. **Features** — a short bullet list of what the user gets. Include the web UI URL
+   (`http://router_ip:<port>`, where the port is in the app log or `<app_name>_web_port`) if
+   the app has one.
+3. **Usage / Steps to Use** — numbered steps from deploy to result, in the order the user does
+   them. Include a screenshot for web apps if one exists.
+4. **Settings** — how to configure it (web Settings panel, NCM SDK Data field, etc.) in user terms.
+5. **Appdata Fields** — a table with columns `Field | Required | Description` (add `Values` when
+   helpful). **Document every appdata field and mark which are required** — this is mandatory per
+   `api-reference.md`. Note the in-code default for optional fields.
+6. **Sample output / results** — show what the user will see, when the app produces output.
+
+Keep it concise and task-oriented. A short "Technical Details" footnote (which APIs it reads,
+where state is stored) is fine at the end, but it is the last thing, not the readme's focus.
+
+## Test locally before deploying (fast iteration)
+
+An app can run **on your computer** against the dev router in `sdk_settings.ini` — `cp.py`
+detects it is off-router and uses HTTP REST. This is the fastest way to shake out API reads,
+data processing, and business logic without a build/install cycle, and it does **not** require
+Developer Mode (REST works regardless; some users develop this way exclusively).
+
+```bash
+.venv/bin/python3 my_app/my_app.py      # run from apps/, NOT from inside the app folder
+```
+
+- **Run from `apps/`** so `cp.py` can find `sdk_settings.ini` (it only looks in the cwd and its
+  parent). Interrupt with Ctrl-C when done.
+- **Works locally**: `cp.get/put/post/delete` (real reads and writes hit the router) and
+  `cp.log()` (prints to stdout). A local run really does publish to `status/...` and change
+  config on the dev router — the effects are live.
+- **Does NOT work locally**: `cp.alert()` (never reaches NCM), `cp.register()`/`cp.unregister()`
+  (needs the router's internal socket), `cp.decrypt()`, serial, and GPIO. A web UI binds to your
+  machine, so LAN clients behind the router can't reach it.
+- **Then deploy** to test the pieces that only work on-router (alerts, events, register, web UI
+  for LAN clients, serial, GPIO) and to confirm it runs under cppython.
+
+Full mechanics, caveats, and the `cp.put()` envelope difference are in `coding-standards.md`
+(*Local Development*).
+
 ## Deploy
 
 **Always deploy after creating or modifying an app. Do not ask — just run it.**
@@ -111,7 +160,7 @@ apps/{app_name}/
 ├── cp.py                # CP module copy
 ├── {app_name}.py        # Main logic
 ├── start.sh             # Uses cppython
-├── readme.md            # Usage and appdata fields
+├── readme.md            # User-facing: usage, settings, appdata fields (see readme section above)
 ├── static/              # Web assets (if applicable)
 └── mylib/               # Subdirectories with Python modules work fine
 ```

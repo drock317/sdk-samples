@@ -6,7 +6,12 @@
 (function () {
     'use strict';
 
-    var STATUS_POLL_MS = 3000;
+    // The UI refreshes in lockstep with the backend monitor loop
+    // (snap.poll_interval, 2s), since in-memory state cannot change any
+    // faster than that - polling quicker would only burn CPU re-fetching
+    // identical data. A floor keeps a bad/zero value from busy-looping.
+    var MIN_STATUS_POLL_MS = 1000;
+    var FALLBACK_STATUS_POLL_MS = 2000;
     var state = {
         metrics: [],
         pollInterval: 2,
@@ -22,7 +27,11 @@
         // everything the user had open. The two configuration pages share
         // one active tab so switching pages stays on the same slot.
         activeSlotTab: '',
-        openSections: {}
+        openSections: {},
+        // null until the first poll, then true/false. False means the
+        // router has no IP Verify feature, so ping tests cannot run and
+        // the UI shows them as unavailable rather than merely "off".
+        ipverifySupported: null
     };
 
     // ---------------------------------------------------------------
@@ -109,6 +118,118 @@
         return Math.max(2, Math.min(100, pct));
     }
 
+    // Signal-quality bands per metric family, from the carrier signal
+    // quality reference (dBm/dB, higher is better). Each band is the
+    // UPPER bound of a poor→excellent run; the span is sized to
+    // METRIC_RANGE so the colored segments fill the whole meter. 5G
+    // variants share their LTE counterpart's bands. These are only for
+    // the visual meter - pass/fail always uses the configured threshold.
+    var METRIC_BANDS = {
+        DBM:     [{ to: -85, cls: 'poor' }, { to: -75, cls: 'fair' }, { to: -65, cls: 'good' }, { to: Infinity, cls: 'excellent' }],
+        RSRP:    [{ to: -111, cls: 'poor' }, { to: -103, cls: 'fair' }, { to: -85, cls: 'good' }, { to: Infinity, cls: 'excellent' }],
+        RSRQ:    [{ to: -12, cls: 'poor' }, { to: -9, cls: 'fair' }, { to: -5, cls: 'good' }, { to: Infinity, cls: 'excellent' }],
+        SINR:    [{ to: 7, cls: 'poor' }, { to: 10, cls: 'fair' }, { to: 12.5, cls: 'good' }, { to: Infinity, cls: 'excellent' }]
+    };
+    METRIC_BANDS.RSRP_5G = METRIC_BANDS.RSRP;
+    METRIC_BANDS.RSRQ_5G = METRIC_BANDS.RSRQ;
+    METRIC_BANDS.SINR_5G = METRIC_BANDS.SINR;
+
+    function metricBandClass(key, value) {
+        var bands = METRIC_BANDS[key];
+        if (!bands) { return ''; }
+        for (var i = 0; i < bands.length; i++) {
+            if (value <= bands[i].to) { return bands[i].cls; }
+        }
+        return 'excellent';
+    }
+
+    // Build the colored band segments once per metric (they don't change
+    // with the live value), sized by where each band's upper bound falls
+    // on the meter's METRIC_RANGE span.
+    var BAND_LABEL = { poor: 'Poor', fair: 'Fair', good: 'Good', excellent: 'Excellent' };
+
+    function metricBoundPct(key, bound) {
+        var range = METRIC_RANGE[key] || [-120, 0];
+        var lo = range[0], hi = range[1];
+        return Math.max(0, Math.min(100, ((bound - lo) / (hi - lo)) * 100));
+    }
+
+    // Colored band segments plus a quality label (Poor/Fair/Good/
+    // Excellent) centered on each one, so the meaning of each color is
+    // readable straight off the meter.
+    function metricBandSegments(key) {
+        var bands = METRIC_BANDS[key];
+        var range = METRIC_RANGE[key] || [-120, 0];
+        if (!bands) { return ''; }
+        var hi = range[1];
+        var prev = 0;
+        // Approximate % of the (min 14rem) meter body one character of
+        // the band label needs at its font size. Used to decide whether a
+        // band is wide enough for its whole word; a half-clipped word
+        // reads worse than none, and the boundary numbers below still
+        // convey the range either way.
+        var pctPerChar = 100 * (0.42 / 14);  // ~0.42rem per char / 14rem body
+        return bands.map(function (b) {
+            var bound = b.to === Infinity ? hi : b.to;
+            var pct = metricBoundPct(key, bound);
+            var width = Math.max(0, pct - prev);
+            prev = pct;
+            var label = BAND_LABEL[b.cls] || b.cls;
+            var fits = width >= label.length * pctPerChar;
+            var labelHtml = fits
+                ? '<span class="dwv-meter-band-label">' + esc(label) + '</span>'
+                : '';
+            return '<span class="dwv-meter-band ' + b.cls + '" style="width:' + width.toFixed(1) + '%">' +
+                labelHtml +
+            '</span>';
+        }).join('');
+    }
+
+    // Boundary numbers (the value where one band becomes the next) placed
+    // right under each color transition, so the ranges are legible
+    // without hovering. The outer edges (±Infinity) have no number.
+    function metricBoundTicks(key) {
+        var bands = METRIC_BANDS[key];
+        if (!bands) { return ''; }
+        var ticks = [];
+        for (var i = 0; i < bands.length - 1; i++) {
+            var bound = bands[i].to;
+            var pct = metricBoundPct(key, bound);
+            ticks.push('<span class="dwv-meter-tick" style="left:' + pct.toFixed(1) + '%">' +
+                esc(bound) + '</span>');
+        }
+        return ticks.join('');
+    }
+
+    // Inline color-coded signal meter with the quality bands and their
+    // boundary numbers labeled directly on it, a marker at the current
+    // value, and the number beside it. Used in the Signal Thresholds
+    // "Now" column. Falls back to the bare number for metrics with no
+    // bands.
+    function metricMeterHtml(key, value, unit) {
+        if (value === null || value === undefined || value === '') {
+            return '<span class="dwv-test-note">not reported</span>';
+        }
+        var num = Number(value);
+        if (!METRIC_BANDS[key] || isNaN(num)) {
+            return '<span class="dwv-meter-num">' + esc(value) +
+                (unit ? ' ' + esc(unit) : '') + '</span>';
+        }
+        var pct = metricPercent(key, num);
+        var cls = metricBandClass(key, num);
+        return '<span class="dwv-meter">' +
+            '<span class="dwv-meter-body">' +
+                '<span class="dwv-meter-track">' +
+                    metricBandSegments(key) +
+                    '<span class="dwv-meter-marker" style="left:' + pct.toFixed(1) + '%"></span>' +
+                '</span>' +
+                '<span class="dwv-meter-ticks">' + metricBoundTicks(key) + '</span>' +
+            '</span>' +
+            '<span class="dwv-meter-num ' + cls + '">' + esc(value) +
+                (unit ? ' ' + esc(unit) : '') + '</span>' +
+        '</span>';
+    }
+
     // ---------------------------------------------------------------
     // dashboard rendering
     // ---------------------------------------------------------------
@@ -159,9 +280,10 @@
         // Counting down a wait the operator cannot otherwise see, since
         // the slot looks perfectly healthy on signal while it is held.
         if (slot.failback_hold) {
-            badges.push('<span class="dwv-badge warn" title="Left on a connectivity failure; ' +
-                'signal cannot tell whether that is fixed, so the app waits before returning">' +
-                '<i class="fas fa-hourglass-half"></i> Hold ' + fmtDuration(slot.failback_hold) +
+            badges.push('<span class="dwv-badge warn" title="Failback held: the app left this ' +
+                'slot (or a switch to it failed) for a reason its signal cannot show, so it waits ' +
+                'before returning">' +
+                '<i class="fas fa-hourglass-half"></i> Failback hold ' + fmtDuration(slot.failback_hold) +
                 '</span>');
         }
         return badges.join('');
@@ -199,17 +321,41 @@
     function renderTests(slot) {
         var rows = [];
         var cfg = slot.config;
+        // Set on a slot the app just left because its connectivity test
+        // failed. The failing ping/HTTP verdict is kept visible (red) on
+        // the now-standby slot so the dashboard still shows why it moved,
+        // with the failback-holdoff countdown when one is active. Used by
+        // both the ping and HTTP rows below.
+        var fo = slot.ping_failover;
 
         if (cfg.ping_enabled && cfg.ping_targets.length) {
+            // Ping runs through the router's IP Verify subsystem. On a
+            // model that lacks it (ipverify_supported === false) the test
+            // can never run, so say so plainly rather than leaving a grey
+            // "waiting" icon that never resolves.
+            var pingUnsupported = state.ipverifySupported === false;
             cfg.ping_targets.forEach(function (target) {
                 var verdict = slot.ping.hasOwnProperty(target) ? slot.ping[target] : null;
                 var note = '';
-                if (verdict === null) {
+                if (pingUnsupported) {
+                    note = '<span class="dwv-test-note">not run (router does not ' +
+                        'support IP Verify)</span>';
+                } else if (verdict === false && fo) {
+                    // Failed its own test and that is why the app moved
+                    // off this slot. Name the reason and, when a failback
+                    // holdoff is counting down, how long it is held.
+                    note = fo.hold_remaining
+                        ? '<span class="dwv-test-note bad">failed &mdash; holding off ' +
+                          'failback for ' + esc(fmtDuration(fo.hold_remaining)) + '</span>'
+                        : '<span class="dwv-test-note bad">failed its connectivity ' +
+                          'test, so the app switched off this slot</span>';
+                } else if (verdict === null) {
                     note = slot.connected
                         ? '<span class="dwv-test-note">waiting for a result</span>'
                         : '<span class="dwv-test-note">not run (slot is not connected)</span>';
                 }
-                rows.push('<div class="dwv-test">' + verdictIcon(verdict) +
+                rows.push('<div class="dwv-test">' +
+                    verdictIcon(pingUnsupported ? null : verdict) +
                     '<span class="dwv-test-target">ping ' + esc(target) + '</span>' + note + '</div>');
             });
         }
@@ -217,7 +363,17 @@
         if (cfg.http_enabled && cfg.http_url) {
             var verdict = slot.http_verdict;
             var note;
-            if (!slot.connected) {
+            // Same as ping: if HTTP is what failed and drove the switch,
+            // keep a red "failed" on the now-standby slot instead of the
+            // grey "not run" so the dashboard still says why it moved.
+            if (!slot.connected && fo && fo.http === false) {
+                verdict = false;
+                note = fo.hold_remaining
+                    ? '<span class="dwv-test-note bad">failed &mdash; holding off ' +
+                      'failback for ' + esc(fmtDuration(fo.hold_remaining)) + '</span>'
+                    : '<span class="dwv-test-note bad">failed its connectivity ' +
+                      'test, so the app switched off this slot</span>';
+            } else if (!slot.connected) {
                 note = '<span class="dwv-test-note">not run (slot is not connected)</span>';
             } else if (slot.http.error) {
                 note = '<span class="dwv-test-note">' + esc(slot.http.error) +
@@ -268,8 +424,7 @@
                 '<span class="dwv-test-target">failback on recovery</span>' +
                 '<span class="dwv-test-note">' + (
                     slot.failback_hold
-                        ? 'held for ' + fmtDuration(slot.failback_hold) +
-                          ' after its connectivity failure'
+                        ? 'failback held for ' + fmtDuration(slot.failback_hold)
                         : fb === null ? 'no thresholds set'
                         : noReading ? 'waiting for a reading to judge on'
                         : fb === false ? 'not above its threshold yet'
@@ -311,11 +466,14 @@
         '<div class="' + cls + '">' +
             '<div class="dwv-slot-head">' +
                 '<div class="dwv-slot-title">' +
-                    '<span class="dwv-slot-name">' + esc(slot.port) + ' / ' + esc(slot.sim) + '</span>' +
-                    '<span class="dwv-slot-sub">' +
+                    '<span class="dwv-slot-name">' +
                         esc(slot.carrier || 'unknown carrier') +
-                        (slot.service_detail ? ' · ' + esc(slot.service_detail) :
-                            (slot.service_type ? ' · ' + esc(slot.service_type) : '')) +
+                        ' <span class="dwv-slot-id">(' + esc(slot.port) + ' / ' +
+                        esc(slot.sim) + ')</span>' +
+                    '</span>' +
+                    '<span class="dwv-slot-sub">' +
+                        (slot.service_detail ? esc(slot.service_detail) :
+                            (slot.service_type ? esc(slot.service_type) : '')) +
                         (slot.rf_band ? ' · ' + esc(slot.rf_band) : '') +
                     '</span>' +
                 '</div>' +
@@ -325,6 +483,16 @@
                 '<dl class="dwv-kv">' +
                     '<dt>State</dt><dd>' + esc(slot.connection_state || '—') +
                         (slot.reason ? ' <span class="dwv-test-note">(' + esc(slot.reason) + ')</span>' : '') + '</dd>' +
+                    // Why the modem rejected or dropped this slot, straight
+                    // from NCOS - the one place to see a failure the app
+                    // did not cause (a bad APN, a carrier reject). Only
+                    // shown on a slot that is not connected, so a healthy
+                    // slot is not decorated with a stale error.
+                    (slot.error_text && !slot.connected
+                        ? '<dt>Error</dt><dd class="dwv-slot-error">' +
+                          '<i class="fas fa-triangle-exclamation"></i> ' +
+                          esc(slot.error_text) + '</dd>'
+                        : '') +
                     '<dt>WAN IP</dt><dd>' + esc(slot.ip_address || '—') + '</dd>' +
                     '<dt>Uptime</dt><dd>' + fmtUptime(slot.uptime) + '</dd>' +
                     '<dt>DSDS instance</dt><dd>' + esc(slot.dsds_instance !== null && slot.dsds_instance !== undefined ? slot.dsds_instance : '—') +
@@ -385,16 +553,10 @@
                 'so no slot can fail and nothing will switch automatically. Set up ping or HTTP ' +
                 'checks under <strong>Connectivity Tests</strong>, or a threshold under ' +
                 '<strong>Signal Thresholds</strong>.';
-        } else if (snap.failback_hold_slot) {
-            var held = snap.slots.filter(function (s) {
-                return s.key === snap.failback_hold_slot; })[0];
-            hint.innerHTML = '<i class="fas fa-hourglass-half"></i> The app left <strong>' +
-                esc(held ? held.sim : snap.failback_hold_slot) + '</strong> because its ' +
-                'connectivity tests failed. Those tests cannot run while it is on standby and its ' +
-                'signal looks fine either way, so failback to it is held for ' +
-                fmtDuration(snap.failback_hold_remaining) + ' to stop the modem flapping. ' +
-                '<strong>Switch SIM Now</strong> overrides it.';
         } else {
+            // The failback holdoff is shown by the "Failback hold" stat
+            // in the Monitor row and the badge on the held slot's card,
+            // so no banner is needed for it here.
             hint.innerHTML = '';
         }
 
@@ -411,8 +573,8 @@
             var active = snap.slots.filter(function (s) { return s.connected; })[0];
             if (active) {
                 badge.className += ' ok';
-                text.textContent = active.port + '/' + active.sim +
-                    (active.carrier ? ' · ' + active.carrier : '');
+                text.textContent = (active.carrier ? active.carrier + ' · ' : '') +
+                    active.port + '/' + active.sim;
             } else {
                 badge.className += ' bad';
                 text.textContent = 'no slot connected';
@@ -532,28 +694,52 @@
     // config. That also means a threshold input left off-screen still
     // carries its stored value, instead of being blanked by a save.
 
+    function is5gMetric(m) { return /_5G$/.test(m.key); }
+
+    function thresholdMetricRow(slot, field, cfg, live, m) {
+        var present = live.hasOwnProperty(m.key);
+        var value = cfg.hasOwnProperty(m.key) ? cfg[m.key] : '';
+        return '<tr class="' + (present ? 'is-present' : '') + '">' +
+            '<td>' + esc(m.label) + ' <span class="dwv-test-note">' + esc(m.unit) + '</span></td>' +
+            '<td class="dwv-live-val" data-metric-cell="' + esc(m.key) + '">' +
+                (present ? metricMeterHtml(m.key, live[m.key].value, m.unit)
+                    : '<span class="dwv-test-note">not reported</span>') + '</td>' +
+            '<td><input type="number" step="any" class="form-input" ' +
+                'data-slot="' + esc(slot.key) + '" data-field="' + esc(field) + '" ' +
+                'data-metric="' + esc(m.key) + '" value="' + esc(value) + '" ' +
+                'placeholder="off"></td>' +
+            '</tr>';
+    }
+
+    function thresholdGroupHeader(title) {
+        return '<tr class="dwv-metric-group"><td colspan="3">' + esc(title) + '</td></tr>';
+    }
+
     function thresholdTable(slot, field, valueHeader) {
         var cfg = slot.config[field] || {};
         var live = {};
         slot.metrics.forEach(function (m) { live[m.key] = m; });
 
-        var rows = state.metrics.map(function (m) {
-            var present = live.hasOwnProperty(m.key);
-            var value = cfg.hasOwnProperty(m.key) ? cfg[m.key] : '';
-            return '<tr class="' + (present ? 'is-present' : '') + '">' +
-                '<td>' + esc(m.label) + ' <span class="dwv-test-note">' + esc(m.unit) + '</span></td>' +
-                '<td class="dwv-live-val">' + (present ? esc(live[m.key].value)
-                    : '<span class="dwv-test-note">not reported</span>') + '</td>' +
-                '<td><input type="number" step="any" class="form-input" ' +
-                    'data-slot="' + esc(slot.key) + '" data-field="' + esc(field) + '" ' +
-                    'data-metric="' + esc(m.key) + '" value="' + esc(value) + '" ' +
-                    'placeholder="off"></td>' +
-                '</tr>';
-        }).join('');
+        // Split into the LTE/3G family and the 5G family so the two are
+        // easy to tell apart. Each family gets its own labeled group; a
+        // family header is only drawn when that family has any metrics.
+        var lte = [], nr = [];
+        state.metrics.forEach(function (m) {
+            (is5gMetric(m) ? nr : lte).push(m);
+        });
+
+        var rowsFor = function (m) { return thresholdMetricRow(slot, field, cfg, live, m); };
+        var body = '';
+        if (lte.length) {
+            body += thresholdGroupHeader('LTE / 3G') + lte.map(rowsFor).join('');
+        }
+        if (nr.length) {
+            body += thresholdGroupHeader('5G') + nr.map(rowsFor).join('');
+        }
 
         return '<table class="dwv-threshold-table">' +
             '<thead><tr><th>Metric</th><th>Now</th><th>' + valueHeader + '</th></tr></thead>' +
-            '<tbody>' + rows + '</tbody>' +
+            '<tbody>' + body + '</tbody>' +
         '</table>';
     }
 
@@ -656,13 +842,17 @@
         var cfg = slot.config;
         return {
             id: function (f) { return 's-' + key.replace(/[^a-zA-Z0-9]/g, '_') + '-' + f; },
-            field: function (name, label, type, attrs) {
+            field: function (name, label, type, attrs, value) {
                 var id = this.id(name);
+                // `value` lets a caller show something other than the raw
+                // stored value (e.g. pkt_timeout stored in tenths of a
+                // second but edited in ms); it defaults to the stored one.
+                var shown = value === undefined ? cfg[name] : value;
                 return '<div class="form-field">' +
                     '<label for="' + id + '">' + label + '</label>' +
                     '<input type="' + type + '" class="form-input" id="' + id + '" ' +
                     'data-slot="' + esc(key) + '" data-key="' + esc(name) + '" ' +
-                    (attrs || '') + ' value="' + esc(cfg[name]) + '">' +
+                    (attrs || '') + ' value="' + esc(shown) + '">' +
                     '</div>';
             },
             toggle: function (name, label) {
@@ -712,8 +902,14 @@
                             'min="1" max="255"') +
                     b.field('ping_pkt_size', 'Packet size, bytes (&ge;36)', 'number',
                             'min="36" max="1500"') +
-                    b.field('ping_pkt_timeout', 'Per-packet timeout (tenths of a second)',
-                            'number', 'min="1" max="255"') +
+                    // Stored (and sent to the router) in tenths of a
+                    // second, but edited here in milliseconds. data-unit
+                    // tells collectSlots() to convert ms back to tenths;
+                    // step/min/max are the ms equivalents of the router's
+                    // 1-255 decisecond range.
+                    b.field('ping_pkt_timeout', 'Per-packet timeout (ms)', 'number',
+                            'min="100" max="25500" step="100" data-unit="ms-ds"',
+                            Math.round((Number(cfg.ping_pkt_timeout) || 10) * 100)) +
                 '</div>' +
                 '<p class="dwv-hint">' +
                     '<strong>Echo requests per attempt</strong> is IP Verify\'s own ' +
@@ -725,7 +921,10 @@
                     'routinely.' +
                 '</p>' +
                 '<p class="dwv-hint">' +
-                    'Per-packet timeout is in <em>tenths of a second</em>, so 10 means 1.0s. ' +
+                    '<strong>Per-packet timeout</strong> is how long the router waits for an ' +
+                    'echo reply before counting that packet as lost &mdash; a reply that ' +
+                    'arrives later is a failure, not a slow pass. The router stores it in ' +
+                    'tenths of a second, so values round to the nearest 100&nbsp;ms. ' +
                     'Packet size has a hard floor of 36 bytes on the router.' +
                 '</p>') +
             why('How the ping test is run', '' +
@@ -987,8 +1186,9 @@
             var on = s.key === state.activeSlotTab;
             return '<button type="button" class="tab-btn' + (on ? ' active' : '') + '" ' +
                 attr + '="' + esc(s.key) + '">' +
-                '<i class="fas fa-sim-card"></i> ' + esc(s.port) + ' / ' + esc(s.sim) +
-                (s.carrier ? ' <span class="dwv-tab-sub">' + esc(s.carrier) + '</span>' : '') +
+                '<i class="fas fa-sim-card"></i> ' +
+                (s.carrier ? esc(s.carrier) + ' ' : '') +
+                '<span class="dwv-tab-sub">(' + esc(s.port) + ' / ' + esc(s.sim) + ')</span>' +
                 (s.preferred ? ' <i class="fas fa-star dwv-tab-star" title="Preferred SIM"></i>' : '') +
                 (s.connected ? ' <i class="fas fa-circle dwv-tab-dot" title="Connected"></i>' : '') +
                 '</button>';
@@ -1094,6 +1294,10 @@
     }
 
     function refreshLiveThresholdValues(snap) {
+        // Unit per metric key, so the live meter can label its number the
+        // same way the initial render did.
+        var units = {};
+        state.metrics.forEach(function (m) { units[m.key] = m.unit; });
         // Update only the read-only "Now" column; never touch inputs.
         snap.slots.forEach(function (slot) {
             var live = {};
@@ -1110,7 +1314,7 @@
                 if (!liveCell) { return; }
                 var key = input.getAttribute('data-metric');
                 if (live.hasOwnProperty(key)) {
-                    liveCell.textContent = live[key];
+                    liveCell.innerHTML = metricMeterHtml(key, live[key], units[key]);
                     cell.classList.add('is-present');
                 } else {
                     liveCell.innerHTML = '<span class="dwv-test-note">not reported</span>';
@@ -1175,7 +1379,16 @@
                     .filter(function (v) { return v !== null; });
             } else if (el.type === 'number') {
                 var parsed = num(el.value);
-                if (parsed !== null) { cfg[key] = parsed; }
+                if (parsed !== null) {
+                    // A field edited in ms but stored in tenths of a
+                    // second (pkt_timeout) is converted back on the way
+                    // out, and clamped to the router's 1-255 range so a
+                    // sub-100ms or huge entry still yields a valid value.
+                    if (el.getAttribute('data-unit') === 'ms-ds') {
+                        parsed = Math.max(1, Math.min(255, Math.round(parsed / 100)));
+                    }
+                    cfg[key] = parsed;
+                }
             } else {
                 cfg[key] = el.value;
             }
@@ -1315,6 +1528,7 @@
             // The snapshot carries the authoritative config, so the forms
             // and the dashboard never disagree.
             state.pollInterval = snap.poll_interval;
+            state.ipverifySupported = snap.ipverify_supported;
             snap.slots.forEach(function (s) { state.config.slots[s.key] = s.config; });
             renderDashboard(snap);
             buildSlotForms(snap);
@@ -1382,19 +1596,35 @@
             forms.addEventListener('change', updateSummaries);
         });
 
-        setInterval(function () {
-            // Pause polling while a field is focused so a refresh cannot
-            // overwrite what the user is typing.
+        // Self-scheduling loop rather than a fixed setInterval: each tick
+        // waits for its own fetch to finish before arming the next, so a
+        // slow or stalled request can never stack overlapping polls, and
+        // the period tracks the backend cadence (state.pollInterval) once
+        // the first snapshot lands.
+        function tick() {
+            // Pause full refreshes while a field is focused so a refresh
+            // cannot overwrite what the user is typing; still keep the
+            // dashboard live with a lightweight status-only update.
             var active = document.activeElement;
+            var work;
             if (active && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)) {
-                getJSON('api/status').then(function (snap) {
+                work = getJSON('api/status').then(function (snap) {
                     state.slots = snap.slots;
                     renderDashboard(snap);
                 }).catch(function () {});
-                return;
+            } else {
+                work = poll();
             }
-            poll();
-        }, STATUS_POLL_MS);
+            work.then(schedule, schedule);
+        }
+
+        function schedule() {
+            var ms = (state.pollInterval || 0) * 1000 || FALLBACK_STATUS_POLL_MS;
+            if (ms < MIN_STATUS_POLL_MS) { ms = MIN_STATUS_POLL_MS; }
+            setTimeout(tick, ms);
+        }
+
+        schedule();
     }
 
     if (document.readyState === 'loading') {

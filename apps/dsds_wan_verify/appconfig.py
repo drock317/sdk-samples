@@ -147,8 +147,8 @@ SLOT_DEFAULTS = {
     # radio technology uses, and a metric that is not reported is ignored
     # for job 1 rather than failed.
     'signal_enabled': True,
-    'signal_thresholds': {'RSRP': -100.0, 'RSRP_5G': -120.0},
-    'signal_fail_threshold': 3,
+    'signal_thresholds': {'RSRP': -110.0, 'RSRP_5G': -120.0},
+    'signal_fail_threshold': 5,
 
     # Proactively return to this slot once its signal comes back above
     # its own threshold, even though the slot carrying traffic is passing

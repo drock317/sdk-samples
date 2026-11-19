@@ -2,7 +2,7 @@
 
 Speedtest Analyzer provides web-based WAN performance testing and analysis for Cradlepoint routers with multiple test engines, per-WAN testing, scheduling, history, live cellular diagnostics, Carrier Activity, historical Cellular Analysis, scope-aware GeoView context, iPerf3 server management, endpoint reliability tracking, and reporting.
 
-**Version:** 1.1.7
+**Version:** 1.1.6
 **Firmware family tested:** NCOS 7.26.x
 **Architecture:** ARM64 (aarch64)
 
@@ -107,15 +107,7 @@ After installation, allow a short period for NCOS to upload, extract, and start 
 
 ## 2. Access the web interface
 
-The application listens on a TCP port that is **persisted in Application Data** as `speedtest_analyzer_web_port`.
-
-- **First run (no value set):** the app picks the first free port starting at `8000` (8000, 8001, ... within a bounded range), then saves it to `speedtest_analyzer_web_port`. On most routers this is `8000`. The same port is reused on every later restart or reboot.
-- **To choose the port yourself:** set `speedtest_analyzer_web_port` in NCM (Group or Device SDK Data) to the port you want. The value is authoritative: the app binds exactly that port on its next start. No recompile or repackage is needed.
-- **If the configured value is invalid** (letters, or outside 1-65535): the app logs the reason **once** and **stops itself**. It never starts without a port, does not guess another port, and does not overwrite your value.
-- **If the configured port is valid but busy:** the app retries the **same** port every 5 seconds for about 60 seconds (this covers a port that is only briefly held, such as during a redeploy) and re-reads the value each time, so a correction pushed from NCM is picked up. If the port is still busy it logs once and **stops itself**. It never moves to a different port.
-- A stopped app is **not** restarted by NCOS, so there is no restart loop or log spam. Correct `speedtest_analyzer_web_port` (or clear it) and **start the app again**. It will also try again after a router reboot. This keeps an NCM LAN Manager connection pinned to a port from silently breaking.
-
-The effective port and its source (`configured` or `discovered`) are written to the application log at startup (`Web server started on port <n> (source: ...)`).
+The application listens on a TCP port shown in the app log and saved in the `speedtest_analyzer_web_port` SDK appdata field (usually `8000`, or the next free port if `8000` is taken). See [Appdata Fields](#appdata-fields) to choose a specific port.
 
 If connecting through **NCM LAN Manager**, no local firewall zone-forwarding changes are required to access the app.
 
@@ -130,17 +122,11 @@ Then browse to:
 http://<router_ip>:<port>
 ```
 
-Example (default first-run port):
+Example, when the app log shows port 8000:
 
 ```text
 http://192.168.0.1:8000
 ```
-
-### Application Data: web port
-
-| Field | Type | Required | Purpose |
-|-------|------|----------|---------|
-| `speedtest_analyzer_web_port` | string (integer port) | No | Effective web listening port. If set, it is authoritative (bind exactly that port or fail closed). If unset, the app discovers a free port from 8000 and persists it. NCM can set this at Group or Device level to standardize a fleet. Separate from the `speedtest_analyzer_group` / `speedtest_analyzer_device` configuration documents. |
 
 ## 3. Run your first test
 
@@ -1171,6 +1157,16 @@ Factory Reset does **not** remove or modify the NCM Group configuration.
 
 If the router belongs to an NCM Group, the Group configuration becomes effective again after the local Device data is cleared.
 
+## Appdata Fields
+
+| Field | Required | Description |
+|---|---|---|
+| `speedtest_analyzer_web_port` | No | Web UI port (1-65535). If set, the app uses exactly this port. If not set, it uses the first free port from 8000 and saves it here. Delete it to pick a port automatically again. |
+
+The startup log shows the port in use, for example `Bound port 8001 (discovered, saved to speedtest_analyzer_web_port)` followed by `Web server started on port 8001`. If `speedtest_analyzer_web_port` is set and that port is busy, the app retries for about 10 seconds and never moves to another port. If the value is not a number from 1 to 65535, or the port stays busy, the app stops itself and logs why. Fix or delete the field, then start the app.
+
+To change the port for one router or a group, set `speedtest_analyzer_web_port` in NCM SDK Data (device or group) and restart the app. Delete the field and restart to go back to automatic selection.
+
 ---
 
 # Basic Troubleshooting
@@ -1188,7 +1184,8 @@ If connecting directly from the local LAN:
 - Verify the client is behind the router.
 - Verify Primary LAN Zone to Router Zone forwarding is allowed.
 - Verify Router Zone to Primary LAN Zone forwarding is allowed.
-- Verify the app's TCP port is reachable (`speedtest_analyzer_web_port`, default `8000`; the log shows the effective port at startup).
+- Verify the app's web port (shown in the app log) is reachable.
+- If the app stopped at startup, check the log for an invalid or busy `speedtest_analyzer_web_port`. Fix or delete the field, then start the app.
 
 ## iPerf3 cannot connect
 
@@ -1241,7 +1238,7 @@ For detailed troubleshooting and implementation behavior, see [TECHNICAL_GUIDE.m
 - Cradlepoint router capable of running the SDK application
 - NCOS 7.26.x recommended
 - ARM64/aarch64 platform for the bundled iPerf3 binary
-- LAN-to-Router firewall access for the app's TCP port (`speedtest_analyzer_web_port`, default `8000`)
+- LAN-to-Router firewall access for the app's web port
 - Reachable iPerf3 endpoint when using iPerf3
 - Internet access to the native Cradlepoint Netperf service when using Netperf
 - Compatible licensed Ookla binary for optional Ookla testing
@@ -1258,16 +1255,6 @@ For detailed troubleshooting and implementation behavior, see [TECHNICAL_GUIDE.m
 # Changelog — 1.x
 
 The README keeps a concise, user-facing changelog for the current Speedtest Analyzer `1.1.x` release family. The complete engineering history, including the pre-release Speed Test 2.x development lineage, is maintained in [TECHNICAL_GUIDE.md](TECHNICAL_GUIDE.md).
-
-## v1.1.7
-
-- Added the shared **persistent dynamic web-port** standard. The web port is no longer hardcoded to `8000`; it is resolved at startup from the new Application Data field `speedtest_analyzer_web_port`.
-- A configured `speedtest_analyzer_web_port` (set locally or from an NCM Group/Device SDK Data entry) is authoritative: the app binds exactly that port and fails closed, without relocating or overwriting the value, if the port is unavailable or malformed.
-- A malformed value is logged once and the app stops itself. A valid but busy port is retried (same port only) for about 60 seconds, then logged once and the app stops itself. A stopped app is not restarted by NCOS, so there is no restart loop. The app never runs without a web port.
-- When no value is set, the app discovers a free port by real socket bind starting at `8000` and persists it, so later restarts and reboots reuse the same port even if `8000` frees up. A router that previously used `8000` continues to use `8000`.
-- Handed the pre-bound listening socket to the server so the bind itself is the availability test (no check-then-bind race). The numeric hostname fallback for invalid NCOS hostnames is preserved.
-- Added the shared `web_port.py` module (standard library only, identical to the web app template copy).
-- No change to the configuration documents (`speedtest_analyzer_group` / `speedtest_analyzer_device`), history schema, testing, GeoView, or reporting behavior.
 
 ## v1.1.6
 

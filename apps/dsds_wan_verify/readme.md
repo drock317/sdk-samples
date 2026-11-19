@@ -1,11 +1,11 @@
 # dsds_wan_verify
 
 Connectivity verification and automatic failover for **Dual SIM Dual Standby (DSDS)** modems,
-with a web UI on port 8000.
+with a web UI on a port shown in the app log (usually 8000).
 
 <img width="1634" height="923" alt="image" src="https://github.com/user-attachments/assets/b6b7587e-dcee-44f8-b1b8-a88dca6e4854" />
 <img width="1634" height="923" alt="image" src="https://github.com/user-attachments/assets/7315c5be-e936-4f26-b402-de33c775fd72" />
-<img width="1634" height="923" alt="image" src="https://github.com/user-attachments/assets/91ea9fad-41fc-4fd9-bc28-f6e3aa7ef3d4" />
+<img width="1573" height="846" alt="image" src="https://github.com/user-attachments/assets/098c3bbb-405e-48da-95b6-f91fdfef2d77" />
 
 The app watches the SIM slot currently carrying traffic and, when it fails, switches to the
 other slot. Each slot can be checked three ways, and each check is switchable per slot:
@@ -20,9 +20,11 @@ other slot. Each slot can be checked three ways, and each check is switchable pe
 
 1. **Deploy the app.** It starts working immediately on its built-in defaults — ping `8.8.8.8`
    on both slots, with automatic failover on — so review them before leaving it unattended.
-2. **Open the web UI.** From a LAN client, go to `http://<router-lan-ip>:8000`. If the page
-   times out, see [LAN access](#lan-access). You can also reach it through Remote Connect LAN
-   Manager to `127.0.0.1` port 8000.
+2. **Open the web UI.** From a LAN client, go to `http://<router-lan-ip>:<port>`. The port is
+   shown in the app log and saved in `dsds_wan_verify_web_port` (usually 8000, or the next free
+   port if that is taken; see [Web server port](#web-server-port)). If the page times out, see
+   [LAN access](#lan-access). You can also reach it through Remote Connect LAN Manager to
+   `127.0.0.1` on the same port.
 3. **Set your tests.** On **Connectivity Tests**, pick a slot tab and edit the **Ping Test**
    targets or add an **HTTP Test** URL (use **Test Now** to check a URL before saving).
 4. **Set your signal thresholds.** On **Signal Thresholds**, adjust the minimum signal per slot.
@@ -38,7 +40,7 @@ Out of the box, with nothing configured, the app is already a working failover s
 | Ping | on, both slots, target `8.8.8.8` |
 | Signal threshold | on, both slots: `RSRP -100`, `RSRP_5G -120` |
 | Automatic return (failback) | on, SIM 1 only |
-| Settle time after a switch | 20s |
+| Settle time after a switch | 10s |
 | Failback holdoff | 1 hour |
 | HTTP | off (no default URL) |
 
@@ -47,7 +49,8 @@ Two things to know before it runs unattended:
 - **It will switch SIMs on its own** when the connected slot's tests fail. Each switch costs
   about 30 seconds of downtime.
 - Defaults live in code and are **never written to appdata**, so an NCM group config always
-  wins.
+  wins. The only value the app writes is the web port it picks on first start (see
+  [Web server port](#web-server-port)).
 
 ---
 
@@ -84,7 +87,15 @@ probe never leaves the modem and the test fails even though the link is up. If p
 pass on a private APN, point it at a target reachable *inside* that network, or use the HTTP test,
 which is bound the same way.
 
-**Settle time** (default 20s) tells the app to ignore a slot's test results for a short while
+**IP Verify support.** Ping runs entirely through the router's IP Verify feature, which not every
+NCOS model has. At startup the app reads `config/ipverify`; when that comes back `null` the feature
+is absent, so the app skips ping tests altogether — it creates no IP Verify objects and reads no
+ping results — and logs that ping is disabled. The HTTP and signal tests are unaffected (the app
+performs HTTP itself), so a slot still fails over on a failing HTTP test or low signal. On the
+dashboard the ping rows read "not run (router does not support IP Verify)". Enable an HTTP test on
+each slot if you rely on connectivity failover on such a model.
+
+**Settle time** (default 10s) tells the app to ignore a slot's test results for a short while
 right after switching to it. A freshly connected slot legitimately fails tests for a few seconds
 while it registers on the carrier, so this is the main guard against the modem flapping back and
 forth. Lower it only if you want faster reactions and accept the flapping risk.
@@ -109,6 +120,13 @@ The holdoff is armed in two cases, both of which signal cannot judge from standb
 After the holdoff is armed the app waits this long before returning. If the slot carrying traffic
 then fails too, the app returns early rather than sit on a dead link.
 
+When a slot is left because its *connectivity* test failed, its card keeps that failing test
+marked in red on the dashboard — "failed — holding off failback for *Nm Ns*" while the holdoff
+counts down — so the reason for the switch stays visible instead of reverting to a grey "waiting
+for a result". The red mark clears once the holdoff expires or the slot reconnects and produces a
+fresh result. A slot with no holdoff (the non-preferred SIM) keeps the red mark until it
+reconnects.
+
 **Suspended slots are not switch targets.** A SIM that fails to register — most often a bad APN —
 is parked by NCOS on a suspended backoff timer (`suspended (N secs)`) before it returns to
 `standby`. The modem accepts a switch request aimed at a suspended slot but never completes it, so
@@ -117,6 +135,14 @@ standby first. If a switch is requested and the modem does not begin switching w
 seconds (the slot summaries normally change almost immediately), the app treats the switch as
 failed, logs it, and retries once the target is switchable again rather than waiting out the full
 switch timeout.
+
+**Failed switches say why.** When a switch does not complete, the Event Log entry gives the reason
+the target SIM did not come up: the modem's own error (for example `the modem reported "CPPM
+failed: no carrier"`), or, when the modem gives none, how far the SIM got (never handed the radio,
+handed the radio but never given an IP address) and the last state it was in. If the modem posts
+its error only after the switch is over, a follow-up entry adds it. If the modem gives up and goes
+back to the original SIM, the app notices and reports the failure then instead of waiting out the
+full timeout.
 
 ---
 
@@ -134,20 +160,40 @@ changes (NCM push, REST, manual edit, or deletion) within about 10 seconds witho
 
 ### Web server port
 
-The web UI listens on **port 8000** by default. To change it, set a separate appdata field
-**`dsds_wan_verify_port`** to the port number as a string, e.g. `8080`. This is a standalone field
-(not part of the `dsds_wan_verify` config JSON) so it can be pushed from an NCM group on its own.
-The value must be 1024–65535; anything unset, empty, non-numeric, or out of range falls back to
-8000 and is logged. **The port is read once at startup**, so changing it takes an app restart —
-unlike the per-slot config, it is not reloaded live. Remember to open the new port in the Zone
-Firewall forward (see [LAN access](#lan-access)).
+The web UI port is kept in a separate appdata field, **`dsds_wan_verify_web_port`** (not part of
+the `dsds_wan_verify` config JSON), so it can be pushed from an NCM group on its own.
+
+- **Set:** the app uses exactly that port, any number from 1 to 65535. If the port is busy it
+  retries for about 10 seconds and never moves to another port.
+- **Not set:** on first start the app takes the first free port from 8000 and saves it to
+  `dsds_wan_verify_web_port`, so the port stays the same after reboots.
+- **Invalid or busy:** if the value is not a number from 1 to 65535, or the port stays busy, the
+  app stops and logs why. Fix or delete the field, then start the app.
+
+The startup log shows the port, for example:
+
+```text
+Bound port 8001 (discovered, saved to dsds_wan_verify_web_port)
+Web server started on port 8001
+```
+
+To change the port for one router or a group, set `dsds_wan_verify_web_port` in NCM SDK Data
+(device or group) and restart the app. Delete the field and restart to go back to automatic
+selection. **The port is read once at startup**, so unlike the per-slot config it is not reloaded
+live. Make sure the Zone Firewall forward lets LAN clients reach the app's web port (see
+[LAN access](#lan-access)).
+
+| Field | Required | Description |
+|---|---|---|
+| `dsds_wan_verify_web_port` | No | Web UI port (1-65535). If set, the app uses exactly this port. If not set, it uses the first free port from 8000 and saves it here. Delete it to pick a port automatically again. |
+| `dsds_wan_verify_port` | No | Deprecated. Older name for the web port, used only when `dsds_wan_verify_web_port` is not set. It used to reject ports below 1024; the new field accepts 1-65535. |
 
 ### Per slot (`slots["<port>|<sim>"]`, e.g. `slots["int1|sim1"]`)
 
 | Field | Default | Description |
 |---|---|---|
 | `priority` | the SIM number | Which slot the app prefers. **Lower = higher priority** (1–99). The dashboard **Preferred SIM** control sets this. |
-| `settle_seconds` | `20` | Ignore this slot's test results for this long after switching to it (0–900). |
+| `settle_seconds` | `10` | Ignore this slot's test results for this long after switching to it (0–900). |
 | `failback_holdoff_seconds` | `3600` | After leaving this slot on a connectivity failure, wait this long before returning (0–86400, `0` = no wait). |
 | `test_combine` | `all` | `all` = ping and HTTP must both pass; `any` = either is enough. |
 | `ping_enabled` | `true` | Run a ping test on this slot. |
@@ -158,10 +204,10 @@ Firewall forward (see [LAN access](#lan-access)).
 | `ping_retry_interval` | `5` | Seconds between retries (5–30). |
 | `ping_pkt_per_try` | `1` | ICMP requests per attempt (1–255); the attempt passes if any is answered. |
 | `ping_pkt_size` | `36` | Payload bytes (minimum 36). |
-| `ping_pkt_timeout` | `10` | Per-packet timeout in tenths of a second (1–255). |
+| `ping_pkt_timeout` | `10` | Per-packet reply timeout, stored in tenths of a second (1–255); the router counts a reply that arrives after this as a lost packet. The web UI edits this field in milliseconds and converts (so stored `10` shows as `1000` ms). |
 | `signal_enabled` | `true` | Use a signal threshold on this slot. |
 | `signal_thresholds` | `{"RSRP": -100, "RSRP_5G": -120}` | Metric → minimum value. |
-| `signal_fail_threshold` | `3` | Consecutive low readings before acting (1–100). |
+| `signal_fail_threshold` | `5` | Consecutive low readings before acting (1–100). |
 | `signal_failback_enabled` | `true` on SIM 1 | Return to this slot when its signal recovers. |
 | `http_enabled` | `false` | Run an HTTP test on this slot. |
 | `http_url` | `''` | Full URL (`http://` assumed if no scheme). |
@@ -217,11 +263,11 @@ writes the whole config; the **Preferred SIM** selector applies immediately with
 
 ### LAN access
 
-If the app is running but LAN clients time out on port 8000, add a Zone Firewall forward from the
+If the app is running but LAN clients time out on the app's web port, add a Zone Firewall forward from the
 Primary LAN Zone to the Router Zone under **Security → Zone Firewall** (or at
 `config/firewall/zone_fwd`).
 
-The UI has no authentication — anyone who can reach port 8000 can change the config and force a
+The UI has no authentication — anyone who can reach the app's web port can change the config and force a
 switch. Keep the zone forward scoped to trusted networks.
 
 ### JSON API

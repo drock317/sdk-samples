@@ -45,19 +45,49 @@ METRIC_UNITS = {key: unit for key, _, unit in SIGNAL_METRICS}
 # the dsds_switch PUT. While either appears, no test result is meaningful.
 SWITCHING_SUMMARIES = ('dual sim switch', 'sibling transitioning')
 
+# connection_state values that mean a slot is no longer sitting connected
+# and is in the middle of coming up or going down. A DSDS switch tears the
+# outgoing slot down (2.6s -> 'disconnecting', 6s -> 'disconnected') a
+# handful of seconds BEFORE either slot reports a SWITCHING_SUMMARIES
+# summary (~7s). On a modem where that summary is late or brief, keying the
+# "did it start?" check on the summary alone can miss the whole switch and
+# declare 'did not start' while the modem is plainly mid-transition - which
+# then makes the app abandon a switch that completes moments later and
+# misread the completion as an external slot change. So the transition is
+# also recognized by the outgoing slot leaving 'connected'.
+TRANSITIONING_STATES = ('disconnecting', 'disconnected', 'connecting')
+
 # A switch took 31s end to end on the test unit. Allow generous headroom
 # before calling it stuck, since a cold registration on a new carrier can
 # take considerably longer than a warm one.
 SWITCH_TIMEOUT = 150
 
-# After the dsds_switch PUT, one of the slots enters a switching summary
-# (SWITCHING_SUMMARIES) within ~1-2s on the test unit. If nothing is
-# switching by this deadline, the request did not take - most often
-# because the target slot was suspended on a backoff timer and could not
-# be brought up - so the switch is declared failed here rather than after
-# the full SWITCH_TIMEOUT. Measured onset was under 2s; the headroom
-# covers a busier modem.
-SWITCH_START_TIMEOUT = 12
+# After the dsds_switch PUT, the switch becomes observable - the outgoing
+# slot starts tearing down (~2.6s) and a switching summary follows (~7s).
+# If nothing is moving by this deadline, the request did not take - most
+# often because the target slot was suspended on a backoff timer and could
+# not be brought up - so the switch is declared failed here rather than
+# after the full SWITCH_TIMEOUT.
+#
+# switch_in_progress(slots, from_key) now also detects the earlier
+# teardown phase, not just the switching summary, so onset is seen within
+# a few seconds. The timeout is nonetheless generous (30s) because a busy
+# modem was observed not surfacing the summary for well over 12s, and a
+# premature 'did not start' is costly: the app abandons a switch that
+# then completes on its own and misreads the completion as an external
+# slot change, arming a bogus failback holdoff.
+SWITCH_START_TIMEOUT = 30
+
+# Once a switch has started, the modem can abandon it and put the original
+# slot back. If the outgoing slot sits 'connected' again for this long with
+# no switching summary on either slot, the switch is over (reverted) and
+# there is no point waiting out the rest of SWITCH_TIMEOUT.
+SWITCH_REVERT_CONFIRM = 6
+
+# Caps on what a switch trace keeps, so a long, churning switch cannot grow
+# it without bound.
+TRACE_MAX_ERRORS = 4
+TRACE_MAX_STATES = 10
 
 
 def slot_key(port, sim):
@@ -238,9 +268,33 @@ def active_slot(slots):
     return None
 
 
-def switch_in_progress(slots):
-    """True if any slot reports a DSDS switch in flight."""
-    return any(slot.get('switching') for slot in slots.values())
+def switch_in_progress(slots, from_key=None):
+    """True if a DSDS switch is in flight.
+
+    A switch is "in flight" when any slot reports a SWITCHING_SUMMARIES
+    summary. When `from_key` is given (the slot the switch was requested
+    on), the transition is also recognized earlier: the outgoing slot
+    leaving 'connected' for a transitional state, or no slot being
+    connected at all. Those precede the switching summary by several
+    seconds, so including them stops a slow or brief summary from reading
+    as "the switch never started".
+
+    Without `from_key`, only the summary is used, because off a specific
+    switch a slot in a transitional state could be ordinary churn rather
+    than a swap in progress.
+    """
+    if any(slot.get('switching') for slot in slots.values()):
+        return True
+    if from_key is not None:
+        outgoing = slots.get(from_key) or {}
+        if outgoing.get('connection_state') in TRANSITIONING_STATES:
+            return True
+        # The outgoing slot was connected when the switch was requested;
+        # once nothing is connected, the teardown has begun even if no
+        # slot has reached a switching summary yet.
+        if not any(slot.get('connected') for slot in slots.values()):
+            return True
+    return False
 
 
 def switch_target_blocked(target):
@@ -248,10 +302,12 @@ def switch_target_blocked(target):
 
     A dsds_switch is accepted by the modem even when the destination
     cannot come up, and then simply never completes - which is what made
-    the app sit through the full SWITCH_TIMEOUT. The two cases worth
-    catching before asking are a missing SIM and a slot suspended on a
-    registration backoff (bad APN, no service). A suspended slot returns
-    to 'standby' when its timer expires, so this is transient, not fatal.
+    the app sit through the full SWITCH_TIMEOUT. The cases worth catching
+    before asking are a missing SIM, a slot suspended on a registration
+    backoff (bad APN, no service), and a slot that has no service at all
+    (e.g. a SIM disabled at the network). A suspended slot returns to
+    'standby' when its timer expires, so this is transient, not fatal;
+    a no-service slot clears the moment it registers again.
 
     Returns a short human-readable reason string, or None when the target
     looks ready to switch to.
@@ -263,6 +319,21 @@ def switch_target_blocked(target):
     if target.get('suspended'):
         summary = target.get('summary') or 'suspended'
         return '%s is %s' % (slot_label(target), summary)
+    # A SIM disabled at the network (or otherwise out of service) sits in
+    # 'standby' - so it is neither nosim nor suspended - but reports no
+    # service type and no signal metrics at all. Switching to it is
+    # accepted and never completes, which is exactly the wasted ~30s
+    # attempt this screen exists to prevent. The connected slot is never
+    # screened here (it reports no service type while connected on some
+    # radios, and it is not a switch *target* anyway), and a merely weak
+    # slot still reporting a service type and signal is left switchable -
+    # the signal threshold, not this gate, decides whether weak is too
+    # weak.
+    if not target.get('connected') \
+            and not target.get('service_type') \
+            and not (target.get('signal') or {}):
+        return '%s has no service (out of service or disabled at the ' \
+               'network)' % slot_label(target)
     return None
 
 
@@ -308,7 +379,7 @@ def wait_for_switch(from_key, to_key=None, timeout=SWITCH_TIMEOUT, poll=2.0,
                     start_timeout=SWITCH_START_TIMEOUT):
     """Block until the sibling slot connects, or the switch is called off.
 
-    Returns (ok, elapsed_seconds, slots, reason). Observed progression
+    Returns (ok, elapsed_seconds, slots, reason, trace). Observed progression
     after the PUT on the test unit:
         2.6s  old slot -> 'disconnecting'
         6.0s  old slot -> 'disconnected' / 'standby'
@@ -317,7 +388,7 @@ def wait_for_switch(from_key, to_key=None, timeout=SWITCH_TIMEOUT, poll=2.0,
        28.3s  new slot gets an IP
        30.7s  new slot -> 'connected'
 
-    Failure is returned in three ways, distinguished by `reason`:
+    Failure is returned in four ways, distinguished by `reason`:
 
     * `'did not start'` - no slot entered a switching summary within
       `start_timeout`. The PUT was accepted but nothing moved, which on
@@ -332,23 +403,53 @@ def wait_for_switch(from_key, to_key=None, timeout=SWITCH_TIMEOUT, poll=2.0,
       cannot come up" signal, far faster than the full timeout, and it
       means the target's link is broken even though its signal looks fine
       from standby - exactly the case the failback holdoff is for.
+    * `'reverted'` - the switch started, then the original slot came
+      back up as the connected slot with nothing switching any more: the
+      modem gave up on the target and restored the slot it left.
     * `'timed out'` - a switch did start but no slot had connected by
       `timeout`, and the target never reported suspended either.
+
+    The fifth value is a trace of what the target slot did during the
+    wait (see _new_trace), which describe_switch_failure() turns into the
+    reason shown to the user. NCOS often clears or has not yet written
+    the target's error_text by the time the wait ends, so the trace keeps
+    every error it showed along the way rather than only the last
+    snapshot's.
     """
     start = time.time()
     slots = {}
     switch_seen = False
+    reverted_since = None
+    trace = _new_trace()
+
+    def done(ok, reason):
+        trace['restored'] = bool((slots.get(from_key) or {}).get('connected'))
+        return ok, time.time() - start, slots, reason, trace
+
     while time.time() - start < timeout:
         slots = discover_slots()
+        if to_key:
+            _record_trace(trace, slots.get(to_key))
         current = active_slot(slots)
         if current and current['key'] != from_key:
-            return True, time.time() - start, slots, None
-        if switch_in_progress(slots):
+            return done(True, None)
+        in_progress = switch_in_progress(slots, from_key=from_key)
+        if in_progress:
             switch_seen = True
+            reverted_since = None
         elif not switch_seen and time.time() - start >= start_timeout:
             # Nothing ever entered a switching state, so the request did
             # not take. No point waiting out the remaining timeout.
-            return False, time.time() - start, slots, 'did not start'
+            return done(False, 'did not start')
+        elif switch_seen and current and current['key'] == from_key:
+            # The switch had started and the original slot is connected
+            # again with nothing switching: the modem abandoned it. Hold
+            # off a few seconds before believing it, so a single poll
+            # between phases is not read as a revert.
+            if reverted_since is None:
+                reverted_since = time.time()
+            elif time.time() - reverted_since >= SWITCH_REVERT_CONFIRM:
+                return done(False, 'reverted')
         # Once the switch has started, a target that goes suspended has
         # failed to register. Don't wait for it: the modem will keep it
         # on a backoff timer and eventually restore the original slot, so
@@ -356,6 +457,90 @@ def wait_for_switch(from_key, to_key=None, timeout=SWITCH_TIMEOUT, poll=2.0,
         if switch_seen and to_key:
             target = slots.get(to_key) or {}
             if target.get('suspended'):
-                return False, time.time() - start, slots, 'target failed'
+                return done(False, 'target failed')
         time.sleep(poll)
-    return False, time.time() - start, slots, 'timed out'
+    return done(False, 'timed out')
+
+
+def _new_trace():
+    """Empty record of what a switch target did during wait_for_switch()."""
+    return {
+        # Distinct error_text values, in the order they appeared.
+        'errors': [],
+        # Distinct 'connection_state, summary' steps, in order.
+        'states': [],
+        # Whether the modem ever handed the radio to the target.
+        'active_sib': False,
+        # The last IP address the target was given, if any.
+        'ip': None,
+        'suspended': False,
+        # Filled in when the wait ends: is the original slot connected?
+        'restored': False,
+    }
+
+
+def _record_trace(trace, target):
+    """Fold one poll of the target slot into the switch trace."""
+    if not target:
+        return
+    err = target.get('error_text')
+    if err and err not in trace['errors'] \
+            and len(trace['errors']) < TRACE_MAX_ERRORS:
+        trace['errors'].append(err)
+    state = target.get('connection_state') or 'unknown'
+    summary = target.get('summary')
+    step = '%s, %s' % (state, summary) \
+        if summary and summary != state else state
+    if (not trace['states'] or trace['states'][-1] != step) \
+            and len(trace['states']) < TRACE_MAX_STATES:
+        trace['states'].append(step)
+    if target.get('active_sib'):
+        trace['active_sib'] = True
+    if target.get('ip_address'):
+        trace['ip'] = target['ip_address']
+    if target.get('suspended'):
+        trace['suspended'] = True
+
+
+def describe_switch_failure(trace, final_target=None):
+    """Plain-language reason a switch target did not come up.
+
+    Built from what the target was actually seen doing during the wait,
+    most specific first:
+
+    1. any error text the modem reported for it (e.g. "CPPM failed: no
+       carrier") - the router's own reason, always preferred;
+    2. otherwise, how far the target got: given an IP but never
+       'connected', handed the radio but never given an IP (the data
+       session did not come up), or never handed the radio at all;
+
+    followed by the last state it was seen in. `final_target` is the
+    target's slot from the last poll, used only if the trace has no
+    error text of its own.
+
+    Returns a string, or None when there is nothing to say.
+    """
+    if not trace:
+        return None
+    errors = list(trace.get('errors') or [])
+    final_err = (final_target or {}).get('error_text')
+    if final_err and final_err not in errors:
+        errors.append(final_err)
+
+    if errors:
+        why = 'the modem reported "%s"' % '", then "'.join(errors)
+    elif trace.get('ip'):
+        why = 'it was given an IP address (%s) but never finished ' \
+              'connecting' % trace['ip']
+    elif trace.get('active_sib'):
+        why = 'the modem moved the radio to it, but no data connection ' \
+              'came up (it was never given an IP address)'
+    elif trace.get('suspended'):
+        why = 'it went suspended instead of connecting'
+    else:
+        why = 'the modem never handed the radio to it'
+
+    states = trace.get('states') or []
+    if states:
+        why += '; last state: %s' % states[-1]
+    return why

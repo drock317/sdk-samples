@@ -2,7 +2,7 @@
 
 Engineering and advanced operational reference for the Cradlepoint Speedtest Analyzer SDK application.
 
-**Documentation version:** 1.1.7
+**Documentation version:** 1.1.6
 **Application release family:** 1.1.x
 **Firmware family currently documented:** NCOS 7.26.x
 **Architecture:** ARM64 (aarch64)
@@ -1697,8 +1697,7 @@ If connecting directly from the local LAN, verify:
 - The client is connected behind the router.
 - Primary LAN Zone to Router Zone forwarding is allowed.
 - Router Zone to Primary LAN Zone forwarding is allowed.
-- The app's TCP port is reachable. The effective port is `speedtest_analyzer_web_port` (default `8000`) and is logged at startup as `Web server started on port <n> (source: configured|discovered)`.
-- If the log shows `configured port <n> ... is not available` followed by `giving up`, or `configured ... is invalid`, the app intentionally did not start the web server on another port and stopped itself (it will show as Stopped in NCM / the router). Fix or clear `speedtest_analyzer_web_port` and start the app again.
+- TCP port `8000` is reachable.
 
 ## 13.2 iPerf3 cannot connect
 
@@ -1779,7 +1778,6 @@ Beginning with Speedtest Analyzer 1.0.0:
 
 | Release Family | Major Focus |
 |---|---|
-| **1.1.7 — Persistent dynamic web port** | Shared `web_port.py` standard: web port resolved from App Data `speedtest_analyzer_web_port` (configured value authoritative and fail-closed; first-run discovery from 8000 with persistence), pre-bound socket hand-off to avoid a check-then-bind race, NCM Group/Device configurable without repackaging. |
 | **1.1.6 — Private 5G SA compatibility** | R980-5GD / Private 5G SA carrier normalization, canonical NR/LTE serving-cell identity, History NR-PCell fallback, `HM_PLMN`, NSSAI metadata, and NR DL/UL frequency enrichment while preserving the existing history schema and Cellular Analysis architecture. |
 | **1.1.5 — Live NCM configuration reconciliation** | Read-only background reconciliation of the canonical NCM Group / Device documents, exact-name App Data loading, revision plus content-fingerprint change detection, effective-config-only hot apply, fleet-safe poll jitter, and strict zero-write Group/Device safety boundaries. |
 | **1.1.x — Cellular Analysis, GeoView, configuration, measurement telemetry, and SD-WAN tunnel testing** | Historical serving-cell analysis, traffic-aware handoff preservation, selected-cell RF/radio-resource summaries, self-contained HTML/PDF-ready reporting, scope-aware GeoView presentation with Local Only and Geolocation Services modes, site-wide OpenCellID resolution/cache/contribution workflows, Google Site Address geocoding and interactive Maps JavaScript presentation, protected Device credentials, the two-key NCM Group / Device configuration model introduced in v1.1.2, v1.1.3 iPerf3 TCP RTT/retransmission/Jitter/interval telemetry, v1.1.4 Manual iPerf3 testing of connected individual SD-WAN tunnels, v1.1.5 live NCM canonical-config reconciliation, and v1.1.6 Private 5G SA normalization/metadata compatibility. |
@@ -1796,22 +1794,6 @@ Beginning with Speedtest Analyzer 1.0.0:
 This section is the permanent engineering history for Speedtest Analyzer and its unreleased Speed Test development lineage.
 
 Speedtest Analyzer `1.0.0` was created from the validated Speed Test `2.7.6` development baseline before external publication. The version reset represents a product-brand and SDK-package identity reset rather than a rewrite of the throughput, routing, scheduling, telemetry, history, or server architectures.
-
-## v1.1.7
-
-Adopted the shared persistent dynamic web-port standard. The web server no longer binds a hardcoded `PORT = 8000`; the port is resolved at startup through `web_port.bind_web_socket()`.
-
-- New App Data field `speedtest_analyzer_web_port` (string integer). It is a separate key from the canonical configuration documents `speedtest_analyzer_group` / `speedtest_analyzer_device`, which are unchanged. `cp.get_appdata` matches names exactly (case-insensitive), so there is no loose-match overlap with those keys.
-- **Configured value is authoritative.** The app binds exactly that port and never scans for or relocates to another one, and never overwrites the value.
-- **No restart loop.** The previous behavior (`sys.exit(1)` on web start failure) combined with `restart = true` would have made NCOS restart the app every 3 to 5 seconds on a persistent bad value. The app now never exits for a web-port failure. `web_port.bind_web_socket_with_retry()` classifies failures through `PortResult.retryable`:
-  - *Not retryable* (non-numeric or out-of-range value): logged once; no web server; no waiting; the app stops itself.
-  - *Retryable* (valid port that cannot be bound, or first-run discovery exhausted): the same port is retried every 5 s for up to 60 s with App Data re-read each attempt (so an NCM correction is picked up), identical log lines are collapsed, and one final `giving up` line is logged.
-  - In every final-failure case the app **stops itself** through the SDK (`web_port.stop_app()` sends `control/system/sdk/action` = `stop <uuid>`, with the uuid read from `package.ini`). A stopped app is not restarted by the NCOS restart policy, so there is no loop and the app never lingers half-alive without a port. It is started again by the admin after correcting the value, and also by `auto_start` on the next router reboot (one log cycle per boot).
-  - If the SDK ignores the stop request, the app falls back to idling without the web interface (still no exit, so still no restart loop) and logs that the stop was not honoured. Self-stop was verified on a device in Developer Mode; behavior on a device not in Developer Mode must be verified separately.
-- **First run (no value).** A free port is discovered by actual socket bind starting at `8000` within a bounded range (`8000..8063`), then persisted with `cp.put_appdata`. Later starts and reboots reuse the persisted value. An existing router that was serving on `8000` continues on `8000`.
-- **No check-then-bind race.** `bind_web_socket()` returns an already-bound listening socket. `ResilientHTTPServer` is built with `bind_and_activate=False` and adopts that socket via `adopt_bound_socket()`, which sets the same `server_address`, `server_name` (including the numeric fallback for unencodable NCOS hostnames) and `server_port` that `server_bind()` previously set.
-- `web_port.py` is a standard-library-only, dependency-injected shared module, byte-identical to `apps/templates/web_app_template/web_port.py`.
-- Unchanged: configuration ownership/reconciliation, history schema, testing engines, GeoView, reporting, and WAN behavior.
 
 ## v1.1.6
 
