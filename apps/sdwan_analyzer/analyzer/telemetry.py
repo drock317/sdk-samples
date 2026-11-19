@@ -73,8 +73,14 @@ class BoundedSeen(object):
 
 # --- WAN state + interface counters --------------------------------------
 
-def wan_state(raw_devices, primary_uid, collected_ts):
-    """Per-WAN connection state records plus the primary WAN uid."""
+def wan_state(raw_devices, primary_uid, collected_ts, primary_known=True):
+    """Per-WAN connection state records plus the primary WAN uid.
+
+    `primary_known=False` means primary_device was not read successfully in
+    this pass (not requested, or failed): the primary identity is then
+    omitted (no `primary_wan`, no `is_primary`) rather than re-stamped from a
+    cached value or guessed as False.
+    """
     out = []
     if isinstance(raw_devices, dict):
         for uid, dev in raw_devices.items():
@@ -87,20 +93,39 @@ def wan_state(raw_devices, primary_uid, collected_ts):
                 'object_class': normalize.object_class(uid, dev),
                 'connection_state': normalize._s(
                     status.get('connection_state')) or 'unknown',
-                'is_primary': uid == primary_uid,
             }
+            if primary_known:
+                rec['is_primary'] = uid == primary_uid
             rec.update(envelope(collected_ts))
             out.append(rec)
+    if not primary_known:
+        return {'paths': out}
     return {'primary_wan': primary_uid, 'paths': out}
 
 
-def interface_records(raw_devices, prev_counters, collected_ts):
+def valid_acquired_at(value):
+    """Return `value` as a float if it is a usable fractional Unix time."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value in (float('inf'), float('-inf')) or value <= 0:
+        return None
+    return float(value)
+
+
+def interface_records(raw_devices, prev_counters, collected_ts,
+                      acquired_at=None):
     """Normalize per-device interface counters.
 
     Returns (records, new_counters). `prev_counters` is {uid: {field: n}}
     from the previous observation; a counter lower than before sets
     reset_suspected = True (no negative deltas are ever produced).
+
+    `acquired_at` is the fractional Unix time captured immediately after the
+    successful status/wan/devices read. When valid, each record gets a
+    `collected_at` field (additive; collected_ts/metric_ts are unchanged).
+    When absent or invalid the field is omitted: precision is never invented.
     """
+    at = valid_acquired_at(acquired_at)
     records = []
     new_counters = {}
     prev_counters = prev_counters if isinstance(prev_counters, dict) else {}
@@ -128,6 +153,8 @@ def interface_records(raw_devices, prev_counters, collected_ts):
             cur[f] is not None and prev.get(f) is not None
             and cur[f] < prev[f] for f in COUNTER_FIELDS)
         rec.update(envelope(collected_ts))
+        if at is not None:
+            rec['collected_at'] = at
         records.append(rec)
         new_counters[uid] = cur
     return records, new_counters

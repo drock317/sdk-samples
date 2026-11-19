@@ -1806,8 +1806,13 @@ def test_recording_cadence_tagging_dedupe():
         def gaps(keys):
             ts = env.calls(keys)
             return [b - a for a, b in zip(ts, ts[1:])]
-        check(set(gaps(('wan_devices',))) == {5} and
-              len(env.calls(('wan_devices',))) == 7, 'WAN cadence 5 s')
+        wan_keys = ('wan_devices', 'primary_device')
+        check(set(gaps(wan_keys)) == {5} and
+              len(env.calls(wan_keys)) == 7, 'WAN cadence 5 s '
+              '(wan_devices + primary_device in one serial group)')
+        check(not env.calls(('wan_devices',)) and
+              not env.calls(('primary_device',)),
+              'primary_device is read with the WAN group, not on its own')
         check(set(gaps(('wan_bonding',))) == {5}, 'WBOND cadence 5 s')
         steer = ('steering_rules', 'steering_events', 'steering_stats',
                  'steering_intents')
@@ -2912,6 +2917,19 @@ def main():
     query_tests.bind(check, _Clock, _fake_collectors, _free_port,
                      _http_json)
     tests = tests + query_tests.TESTS
+    # v0.5.0: acquisition timing, failed-read behavior, counter math.
+    import acquisition_tests
+    acquisition_tests.bind(check, _Clock, _tel_devices)
+    tests = tests + acquisition_tests.TESTS
+    import counters_tests
+    counters_tests.bind(check)
+    tests = tests + counters_tests.TESTS
+    import failed_read_tests
+    failed_read_tests.bind(check)
+    tests = tests + failed_read_tests.TESTS
+    import primary_config_tests
+    primary_config_tests.bind(check)
+    tests = tests + primary_config_tests.TESTS
     for t in tests:
         t()
     print('')

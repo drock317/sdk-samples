@@ -413,12 +413,20 @@ class AnalyzerService(object):
                        for k in sec_keys):
                     self._freshness[sec] = {'collected_ts': now,
                                             'sample_source': source}
-            if all(k in keys for k in collectors.CONFIG_KEYS):
+            if all(k in results and getattr(results[k], 'ok', True)
+                   for k in collectors.CONFIG_KEYS):
+                # Reconciliation counts only when EVERY config read
+                # succeeded; a failed one leaves the timestamp alone so the
+                # next scheduled pass is again eligible (no hour of delay).
                 self._last_config_ts = now
             tel = self._wan_telemetry(keys, results, now)
             snap = self.recompose()
+            # Collectors read SUCCESSFULLY in this pass. Only these may feed
+            # a newly timestamped historical measurement.
+            ok_keys = frozenset(k for k, r in results.items()
+                                if getattr(r, 'ok', True))
             obs = self._build_observation(source, keys, snap, now,
-                                          group, job_id, tel)
+                                          group, job_id, tel, ok_keys)
             obs['collector_errors'] = errors
             obs['duration_ms'] = int((time.time() - t0) * 1000)
             if source == 'recording' and job_id:
@@ -454,53 +462,75 @@ class AnalyzerService(object):
 
         The same records feed the persisted observation and the current-state
         cache, so there is a single parsing path (telemetry.py). Counter
-        reset detection state advances exactly once per pass. Returns
-        (interfaces, cellular) or None when wan_devices was not collected.
+        reset detection state advances exactly once per pass.
+
+        Returns (interfaces, cellular), or None when wan_devices was not
+        requested OR its read FAILED. A failed read must never produce
+        newly timestamped measurements from last-known-good raw data: the
+        counter baseline (`_prev_counters`) is not advanced, the current-state
+        caches keep their last-known-good values, and the observation simply
+        omits wan/interfaces/cellular (the failure is in collector_errors).
         """
         if 'wan_devices' not in keys:
             return None
+        res = results.get('wan_devices')
+        if res is None or not getattr(res, 'ok', True):
+            return None
         devices = self._raw().get('wan_devices')
         interfaces, self._prev_counters = telemetry.interface_records(
-            devices, self._prev_counters, now)
+            devices, self._prev_counters, now,
+            acquired_at=getattr(res, 'acquired_at', None))
         cell = telemetry.cellular_records(devices, now)
-        res = results.get('wan_devices')
-        if res is not None and getattr(res, 'ok', True):
-            self._cur_interfaces = interfaces
-            self._cur_cellular = cell
+        self._cur_interfaces = interfaces
+        self._cur_cellular = cell
         return interfaces, cell
 
     def _build_observation(self, source, keys, snap, now, group, job_id,
-                           tel=None):
+                           tel=None, ok_keys=None):
         """Source-tagged compact observation. Never a raw API snapshot.
 
         Only sections whose collectors ran in this pass are populated (a
         targeted refresh yields a partial observation). Static/config data is
         referenced by version number, never copied per sample.
+
+        FAILED-READ INVARIANT: a collector whose read failed in this pass
+        (not in `ok_keys`) never contributes a measurement to the
+        observation. The cached last-known-good value keeps serving the
+        current state (/api/snapshot, section freshness) but is not
+        re-stamped with `now`. The affected section is omitted, not zero
+        filled; the failure is in `collector_errors`. `ok_keys=None` means
+        every requested key succeeded (direct callers/tests).
         """
         data = self._raw()
-        have = set(keys)
+        ok = set(keys) if ok_keys is None else set(ok_keys) & set(keys)
         obs = {'sample_source': source, 'job_id': job_id,
                'refresh_group': group, 'timestamp': now,
                'collected_ts': now}
-        if 'wan_devices' in have:
+        if 'wan_devices' in ok and tel is not None:
+            # tel is None when the wan_devices read failed.
             devices = data.get('wan_devices')
+            # Primary identity only from a primary_device read that
+            # succeeded in THIS pass; otherwise omitted (never re-stamped).
+            primary_known = 'primary_device' in ok
             obs['wan'] = telemetry.wan_state(
-                devices, data.get('primary_device'), now)
-            if tel is None:
-                tel = self._wan_telemetry(('wan_devices',),
-                                          {'wan_devices': None}, now)
+                devices, data.get('primary_device'), now,
+                primary_known=primary_known)
             obs['interfaces'], obs['cellular'] = tel
-        if 'swans' in have:
+        if 'swans' in ok:
             obs['swans_samples'] = telemetry.swans_new_samples(
                 data.get('swans'), self._swans_seen, now)
-        if 'qoe' in have:
+        if 'qoe' in ok:
             obs['qoe'] = telemetry.qoe_records(data.get('qoe'), now)
-        if 'wan_bonding' in have:
+        if 'wan_bonding' in ok:
             obs['wbond'] = telemetry.wbond_runtime(snap.get('bonding'), now)
-        if 'steering_rules' in have:
-            ts = snap.get('traffic_steering', {})
+        ts = snap.get('traffic_steering', {})
+        if {'steering_rules', 'steering_stats', 'steering_events'} <= ok:
+            # Runtime per rule combines rules (steering_to), stats (flows,
+            # preferred WAN) and events (latest reason): all three must be
+            # fresh, otherwise cached parts would be re-stamped.
             obs['steering'] = telemetry.steering_runtime(
                 ts.get('logical_rules'), now)
+        if 'steering_events' in ok:
             obs['steering_events'] = telemetry.steering_new_events(
                 ts.get('events'), self._event_seen, now)
         obs['config_versions'] = self._update_config_versions(snap, now)

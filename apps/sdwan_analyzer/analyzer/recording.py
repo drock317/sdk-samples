@@ -39,7 +39,7 @@ STATES = ('recording', 'completed', 'stopped', 'expired', 'failed')
 
 # group -> (cadence seconds, collector keys). Order = serial read order.
 PROFILE = (
-    ('wan', 5, ('wan_devices',)),
+    ('wan', 5, ('wan_devices', 'primary_device')),
     ('wbond', 5, ('wan_bonding',)),
     ('steering', 10, ('steering_rules', 'steering_events', 'steering_stats',
                       'steering_intents')),

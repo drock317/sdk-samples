@@ -53,6 +53,7 @@ the whole status/wan tree in a loop.
 """
 
 import threading
+import time
 
 import cp
 
@@ -75,16 +76,23 @@ class CollectResult(object):
         value: the raw value returned by cp.get() (may be None/{}/[] and
             still be a valid success).
         error (str|None): failure reason when not ok.
+        acquired_at (float|None): fractional Unix time read from the
+            router clock immediately after THIS read returned successfully
+            (not the end of the collection pass). None for failed reads and
+            for results built without a real read (derived/split results,
+            test doubles): precision is never fabricated.
     """
 
-    __slots__ = ('ok', 'value', 'error', 'error_type')
+    __slots__ = ('ok', 'value', 'error', 'error_type', 'acquired_at')
 
-    def __init__(self, ok, value=None, error=None, error_type=None):
+    def __init__(self, ok, value=None, error=None, error_type=None,
+                 acquired_at=None):
         self.ok = ok
         self.value = value
         self.error = error
         # One of ERR_TIMEOUT / ERR_BUSY / ERR_API when not ok.
         self.error_type = error_type
+        self.acquired_at = acquired_at
 
 
 # Wall-clock bound for one collector read (seconds). Shared cp.py is NOT
@@ -136,7 +144,11 @@ def _get_result(path):
     """
     done, value, err, etype = _bounded_call(path, READ_TIMEOUT_S)
     if done:
-        return CollectResult(True, value=value, error=None)
+        # Captured immediately after the read returns, before any parsing
+        # or other reads. The counters were sampled by NCOS at some instant
+        # inside this call, so this is an upper bound on the sampling time.
+        return CollectResult(True, value=value, error=None,
+                             acquired_at=time.time())
     cp.log('collectors: error reading {}: {}'.format(path, err))
     return CollectResult(False, value=None, error=err, error_type=etype)
 

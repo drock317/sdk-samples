@@ -5,7 +5,7 @@ NCOS routers: WAN paths, SD-WAN interfaces, WAN bonding (WBOND), member
 interfaces, traffic steering, underlay connectivity, cellular state, and how
 these change over time.
 
-> **Status: BACKEND build (v0.4.4).** Targeted collectors, normalization,
+> **Status: BACKEND build (v0.5.0).** Targeted collectors, normalization,
 > logical Traffic Steering grouping, semantic fingerprints, a cached snapshot,
 > section JSON endpoints, and (new in 0.3.0) the **data-acquisition model**
 > below: startup + scheduled + manual collection, source-tagged observations,
@@ -15,6 +15,13 @@ these change over time.
 > telemetry APIs, numeric RF values). **v0.4.0 added durable telemetry
 > storage; v0.4.1-0.4.3 harden it** (state ownership, config version reuse, safe shutdown during upgrade, time-based dedupe recovery). **v0.4.4 adds the bounded, paginated read APIs** `/api/history` and `/api/recordings/<id>/samples` (see *Query APIs* below). The polished UI remains
 > deferred.
+>
+> **v0.5.0 analytics foundation.** Adds fractional counter acquisition time
+> (`collected_at`), fixes a defect where a failed collector read re-stamped
+> cached values as fresh measurements (WAN counters, QoE, WBOND, steering, SWANS),
+> and adds the pure counter delta/rate module `analyzer/counters.py` (a library:
+> nothing in the service, storage or API calls it yet). See `docs/ARCHITECTURE-AND-ROADMAP.md`
+> and `docs/analytics/`.
 
 ## Architecture
 
@@ -135,8 +142,11 @@ source-tagged **observation** (never a raw API snapshot).
 
 **Runtime telemetry** (every observation): WAN state + primary WAN, interface
 counters, SWANS path samples, QoE, WBOND runtime weights/flows, steering
-runtime state/flows, cellular/CA telemetry. No rates, averages, percentiles or
-anomaly scores are computed yet.
+runtime state/flows, cellular/CA telemetry. Nothing computed is stored or
+served: no rates, averages, percentiles or anomaly scores in any API or stored
+observation. The only calculation code is the pure library
+`analyzer/counters.py` (v0.5.0), which is not wired to collection, storage or
+the web tier.
 
 **Static/config data** (Traffic Classes, destination identities, WAN rules,
 steering definitions, WBOND membership/configured weights, overlay→underlay
@@ -174,13 +184,37 @@ and `timestamp_source`. With a native NCOS measurement time (SWANS `epoch`,
 steering event `epoch`) `metric_ts` is that value and `timestamp_source =
 ncos`; otherwise `metric_ts = collected_ts` and `timestamp_source =
 collector` (QoE, interface counters, cellular, WBOND, steering runtime).
+`collected_ts` is integer seconds read after the whole pass finishes.
+
+**`collected_at` (v0.5.0, interface records only).** An additive fractional
+Unix timestamp taken from the clock immediately after the successful
+`status/wan/devices` read returns (`CollectResult.acquired_at`), before
+parsing and before any other read in the pass. It is an upper bound on the
+instant NCOS sampled the counters, not the completion time of the pass.
+`collected_ts`, `metric_ts` and `timestamp_source` are unchanged. It is
+persisted inside each interface record (no storage migration). Records written
+before v0.5.0, or acquired without a real read, simply lack the field and are
+never given a made-up value; rate calculations then fall back to
+`collected_ts` and report reduced precision.
 
 **Interface telemetry.** From `status/wan/devices/*/stats` for every object
 class (`physical`, `sdwan`, `wbond`): `rx_bytes`/`tx_bytes`
 (`in`/`out`), `rx_packets`/`tx_packets`, `rx_errors`/`tx_errors`,
 `rx_drops`/`tx_drops`, plus `connection_state`. Counters stay raw. If a
-counter is lower than in the previous observation, `reset_suspected = true`
-(no negative deltas). No Mbps yet.
+counter is lower than in the previous pass, `reset_suspected = true`
+(no negative deltas); it is a hint only (the baseline is the previous pass of
+any source). Byte counters are verified bytes (`in`/`out`); see
+`docs/analytics/counter-semantics.md`. Counters of different object classes
+overlap (an overlay and WBOND carry traffic already counted on the physical
+path), so they must never be summed.
+
+**A failed `wan_devices` read emits nothing new (v0.5.0 fix).** Before this
+fix the observation re-stamped last-known-good counters with the new
+`collected_ts`. Now the observation omits `wan`, `interfaces` and `cellular`
+for that pass (the failure is in `collector_errors`), `_prev_counters` is not
+advanced, and the current state and section freshness keep their last values.
+The same rule now applies to every runtime section; see *Failed-read
+invariant* below.
 
 **Cellular / CA telemetry** (`analyzer/cellular.py`, carrier parsing copied
 from Speedtest Analyzer's validated logic, not imported): per cellular WAN
@@ -268,6 +302,37 @@ full `/api/` tree is ever fetched.
 (bounded in memory, R1900-safe). The live `/api/snapshot` still carries the
 richer current data.
 
+## Failed-read invariant (v0.5.0)
+
+A failed NCOS collector read never creates a newly timestamped historical
+measurement from last-known-good cached values. Two views are kept apart:
+
+- **Current state** (`/api/snapshot`, section endpoints, `section_freshness`)
+  keeps serving the last-known-good value and its original freshness. A failure
+  does not advance freshness and does not blank the data.
+- **Historical observations** (`/api/history`, Recording samples) omit the
+  section fed by the failed collector. Nothing is zero filled and no timestamp
+  is invented; the failure is listed in the observation's `collector_errors`.
+
+| Observation section | Needs (all must succeed in that pass) |
+|---|---|
+| `wan`, `interfaces`, `cellular` | `wan_devices` |
+| `wan.primary_wan`, `paths[].is_primary` | `primary_device` read successfully in the same pass; otherwise (failed, or not requested by a targeted refresh) both are omitted, never guessed as false |
+| `swans_samples` | `swans` |
+| `qoe` | `qoe` |
+| `wbond` | `wan_bonding` |
+| `steering` | `steering_rules`, `steering_stats` and `steering_events` |
+| `steering_events` | `steering_events` |
+
+Dedupe state (SWANS and steering events) and the counter baseline are not
+touched by a failed pass. Not covered by the invariant: config version refs
+(`config_versions`, derived from cached config, a version changes only when a
+fingerprint changes). Config reconciliation (about hourly) is recorded only when every
+config read succeeded, so a failed one is retried at the next scheduled pass and the on-demand `/api/cellular_detail` reads.
+The Recording `wan` group reads `primary_device` together with `wan_devices` every 5 s, so
+Recording samples carry the primary identity. A primary change is seen at the first poll after it;
+the exact failover instant is not known.
+
 ## Recording jobs (v0.3.2, backend only)
 
 A Recording is a temporary high-resolution capture for speed tests, transfers,
@@ -300,7 +365,7 @@ timeout/busy guard; a failing or busy collector is counted in
 
 | Group | Source | Cadence |
 |-------|--------|---------|
-| `wan` | `status/wan/devices` (state, counters, cellular/CA) | 5 s |
+| `wan` | `status/wan/devices` (state, counters, cellular/CA) + `status/wan/primary_device` | 5 s |
 | `wbond` | `status/sdwan_adv/wan_bonding` | 5 s |
 | `steering` | `status/wan/steering` (one read, split locally) | 10 s |
 | `qoe` | `status/sdwan_adv/qoe` | 10 s |
@@ -602,6 +667,13 @@ Local, standard-library-only harness (not shipped — excluded via
 .venv/bin/python3 apps/sdwan_analyzer/tests/run_tests.py
 ```
 
+`run_tests.py` also runs `durable_tests.py`, `query_tests.py`, and (v0.5.0)
+`acquisition_tests.py` (acquisition timing, WAN failed-read/recovery, persisted
+records, legacy compatibility), `failed_read_tests.py` (failed-read invariant
+for every runtime section, including persisted history and Recording) and
+`counters_tests.py` (hand-calculated counter math). The suite has been run on CPython 3.8.20 (the cppython
+version) as well as the workstation interpreter.
+
 `tests/fixtures.py` models the validated R1900 scenario (physical Ethernet +
 cellular, two SD-WAN overlays, an 80/20 WBOND, and the LAB01/YouTube/TEST
 Applications/Management steering rules). `tests/run_tests.py` drives the real
@@ -720,12 +792,20 @@ mocks. They still require on-device confirmation (see below).
 
 ## Deferred to later phases
 
-- Durable historical storage (format, retention, sampling interval — see the
-  options block in `storage.py`). `HistoryStore` stays in-memory for now.
+Already delivered (removed from this list): durable historical storage and
+durable Recording storage (v0.4.0-0.4.3), the query APIs (v0.4.4), and the pure
+counter delta/rate library (v0.5.0, library only).
+
 - SD-WAN/WBOND overlay source-IP resolution wiring (control-plane
   `local_ip`/`remote_ip`; documented in collectors, only needed for active
   testing, not visibility).
-- Recording UI, durable Recording storage, Recording analysis.
-- Averages, percentiles, bandwidth rates and anomaly scoring.
+- Recording UI and Recording analysis.
+- Exposing computed counter rates through the service/API (undecided), and
+  all other calculations: averages, percentiles, rollups of any period,
+  utilization percentages and anomaly scoring. No rollup formula is defined.
+- A default collection-gap threshold (gap handling is a caller policy).
+- Counter wrap handling (counter width is unknown, so a decrease is never
+  corrected).
 - Device validation catalog (captive-modem model naming) for friendly names.
-- The production UI and the template design system (`static/`).
+- The production UI and the template design system (`static/`), pending the
+  approved design artboards.

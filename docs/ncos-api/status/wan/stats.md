@@ -24,14 +24,19 @@ Aggregate traffic statistics for the active WAN connection.
 | `ierrors` | integer | Receive errors |
 | `oerrors` | integer | Transmit errors |
 | `idrops` | integer | Received packets dropped |
-| `bps` | integer | Bytes per second (ingress) |
-| `ibps` | integer | Ingress bytes/sec |
-| `obps` | integer | Egress bytes/sec |
+| `bps` | integer | Bits per second, ingress + egress (`ibps` + `obps`) |
+| `ibps` | integer | Ingress **bits**/sec |
+| `obps` | integer | Egress **bits**/sec |
 | `collisions` | integer | Collision count |
 | `imcasts` | integer | Incoming multicast |
 | `omcasts` | integer | Outgoing multicast |
 | `noproto` | integer | Unknown protocol |
-| `ts` | float | Timestamp (system uptime) |
+| `ts` | float | Device clock in seconds with sub-second precision (advances in real time; behaves like uptime) |
+
+> Units verified on an R1900 (2026-11-19): `8 x delta(in) / delta(ts)` equals the reported
+> `ibps` (and likewise `out`/`obps`), so `in`/`out` are bytes and `ibps`/`obps` are bits per
+> second, not bytes per second. This object sums **every** WAN device, including `sdwan` and
+> `wbond` overlays, so it double counts traffic. See `docs/analytics/counter-semantics.md`.
 
 ### SDK Example
 ```python
