@@ -47,6 +47,7 @@ from . import recording
 from . import storage
 from . import telemetry
 from . import topology
+from . import wbond
 
 # User-selectable continuous-history intervals (minutes). No 1-minute mode.
 SCHEDULE_CHOICES = (1, 5, 15, 30, 60)
@@ -997,6 +998,17 @@ class AnalyzerService(object):
         if snap is None:
             return None
         return topology.build(snap, devices, health)
+
+    def query_wbond(self):
+        """WBOND runtime analysis (read-only, cached). None until a snapshot."""
+        with self._lock:
+            snap = self._snapshot
+            devices = self._raw().get('wan_devices')
+            health = dict(self._config_raw.health())
+            health.update(self._runtime_raw.health())
+        if snap is None:
+            return None
+        return wbond.build(snap, devices, health)
 
     def query_recording_samples(self, job_id, raw_query=''):
         """One bounded page of a Recording's samples, oldest first."""

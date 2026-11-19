@@ -144,6 +144,7 @@ _DEV_PAGE = """<!DOCTYPE html>
 <li><a href="/api/changes">/api/changes</a> (topology/config change flags)</li>
 <li><a href="/api/storage">/api/storage</a> (Storage Inspector: memory counts, app file metadata; generated on demand)</li>
 <li><a href="/api/history">/api/history</a> (durable, paginated: limit, start, end, sample_source, cursor)</li>
+<li><a href="/api/analytics/wbond">/api/analytics/wbond</a> (WBOND runtime analysis, read-only)</li>
 <li><a href="/api/analytics/topology">/api/analytics/topology</a> (current WAN / overlay / WBOND relationships, read-only)</li>
 <li>/api/analytics/interfaces?uid=&lt;interface uid&gt; (calculated RX/TX rates, read-only; limit, start, end, max_gap_s, cursor)</li>
 <li><a href="/api/recordings">/api/recordings</a>, <a href="/api/recordings/active">/active</a>, /api/recordings/&lt;id&gt;, /api/recordings/&lt;id&gt;/samples (paginated); POST /api/recordings/start, /api/recordings/&lt;id&gt;/stop (backend-owned, max 30 min)</li>
@@ -240,6 +241,13 @@ def _make_handler(service):
                             {'error': 'snapshot not ready'}, code=503)
                     else:
                         self._send_json(topo)
+                elif path == '/api/analytics/wbond':
+                    wb = service.query_wbond()
+                    if wb is None:
+                        self._send_json(
+                            {'error': 'snapshot not ready'}, code=503)
+                    else:
+                        self._send_json(wb)
                 elif path == '/api/analytics/interfaces':
                     self._send_json(service.query_interface_rates(raw_query))
                 elif path == '/api/history':

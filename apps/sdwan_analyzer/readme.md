@@ -123,6 +123,7 @@ not ready"}` until the first snapshot has been composed.
 - `GET /api/history` (0.4.4) — durable, paginated history; see *Query APIs*.
 - `GET /api/analytics/interfaces` (0.6.0) — calculated interface RX/TX rates; see *Query APIs*.
 - `GET /api/analytics/topology` (0.8.0) — current physical WAN / SD-WAN overlay / WBOND relationships with known state; unverified links are returned as `unresolved`. See `docs/analytics/topology.md`.
+- `GET /api/analytics/wbond` (0.8.1) — read-only WBOND runtime analysis: per-bond state, per-member overlay/physical WAN, configured vs router-reported runtime values, and data freshness. See `docs/analytics/wbond.md`.
 - `GET /api/recordings/<job_id>/samples` (0.4.4) — paginated Recording
   samples; see *Query APIs*.
 - `POST /api/refresh/<group>` — manual refresh of one group

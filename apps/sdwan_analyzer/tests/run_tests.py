@@ -2931,6 +2931,9 @@ def main():
     import topology_tests
     topology_tests.bind(check, _free_port)
     tests = tests + topology_tests.TESTS
+    import wbond_tests
+    wbond_tests.bind(check, _free_port)
+    tests = tests + wbond_tests.TESTS
     import ui_tests
     ui_tests.bind(check, _Clock, _free_port)
     tests = tests + ui_tests.TESTS
