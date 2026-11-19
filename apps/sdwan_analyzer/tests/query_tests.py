@@ -992,7 +992,7 @@ def test_q_storage_report_and_lifecycle_unchanged():
         check(d['state'] in ('completed', 'expired', 'stopped') and
               d['sample_count'] == len(svc.recording_samples(jid)),
               'Recording lifecycle and counts unchanged')
-        check(svc.status()['version'] == '0.6.0', 'version 0.6.0')
+        check(svc.status()['version'] == '0.7.2', 'version 0.7.2')
 
 
 TESTS = [

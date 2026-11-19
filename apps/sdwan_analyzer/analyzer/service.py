@@ -12,7 +12,7 @@ There are exactly three ways data enters the system, and NO background
 cache-refresh poller:
 
 1. Scheduled collection -- one normal observation every N minutes, N in
-   SCHEDULE_CHOICES (5/15/30/60). Aligned to the local clock. A startup
+   SCHEDULE_CHOICES (1/5/15/30/60). Aligned to the local clock. A startup
    observation is collected first so the UI is never empty.
 2. Manual refresh -- targeted, per-group, ~5 s cooldown, tagged 'manual'.
    It never changes the schedule.
@@ -48,7 +48,7 @@ from . import storage
 from . import telemetry
 
 # User-selectable continuous-history intervals (minutes). No 1-minute mode.
-SCHEDULE_CHOICES = (5, 15, 30, 60)
+SCHEDULE_CHOICES = (1, 5, 15, 30, 60)
 DEFAULT_SCHEDULE_MINUTES = 15
 
 # Config/static objects are re-read on ~hourly reconciliation (plus startup

@@ -23,6 +23,27 @@ these change over time.
 > nothing in the service, storage or API calls it yet). See `docs/ARCHITECTURE-AND-ROADMAP.md`
 > and `docs/analytics/`.
 
+> **v0.7.0 adds the first web page: Throughput trends.** Open `http://router_ip:<port>`
+> (the port is in the app log and in `sdwan_analyzer_web_port`). The earlier endpoint list is now at `/dev`.
+
+## Throughput trends (v0.7.0)
+
+Shows how much traffic an interface carried over time.
+
+1. Open `http://router_ip:<port>` in a browser on the LAN.
+2. Pick an **interface**: a physical WAN, an SD-WAN overlay, or a WBOND.
+3. Pick a **time range**: 1h, 6h, 24h, or 7d.
+4. Read the chart: RX (received) and TX (transmitted). The unit (bps, Kbps, Mbps or Gbps) is chosen automatically from the highest value shown, and is the same for both lines and the whole axis. Tooltip values use the best unit for each value. Hover, or focus the chart and use the arrow keys, to see each measurement and its time interval.
+
+What to expect:
+
+- A measurement is the average rate between two stored samples, so the chart has one point per collection interval (1 to 60 minutes, default 15).
+- A **gap** means there is no valid measurement for that period: a missing or failed read, a counter reset, samples too far apart (more than 2 hours), or counters that cannot be trusted. Gaps are never drawn as zero. A real zero (idle link) is drawn as zero.
+- The page loads at most 3000 measurements per view. If a range has more, a notice says the newest were not loaded.
+- Times are shown in your browser's time zone. The range is measured from the router's clock.
+- The page shows only data the analyzer has already stored. It never reads the router on its own.
+- LAN access needs the Primary LAN Zone to Router Zone forwarding rule in the router firewall.
+
 ## Architecture
 
 One-directional data flow; each layer depends only on the one to its left:
@@ -118,8 +139,8 @@ only sleeps; the UI always shows the latest saved normalized state.
 
 1. **Startup** — one full current-state collection, normalized and saved as
    `sample_source = startup`, so the UI is never empty.
-2. **Scheduled** — one normal observation every **5, 15, 30 or 60 minutes**
-   (no continuous 1-minute mode), aligned to the local clock
+2. **Scheduled** — one normal observation every **1, 5, 15, 30 or 60 minutes**
+   (1 minute is intended for development; it writes 15 times more history than the default), aligned to the local clock
    (e.g. 15 min: 18:00, 18:15, ...). Default 15. Optional App Data
    `sdwan_analyzer_interval_minutes` selects it (read-only; the default is
    applied in code and never written). `sample_source = scheduled`.
@@ -774,7 +795,7 @@ for overlays; the WAN object key (e.g. `wbond-wbond0_hub0`) is the
 | Field | Type | Required | Purpose |
 |-------|------|----------|---------|
 | `sdwan_analyzer_web_port` | string (integer port) | No | Effective web listening port. Namespaced by app per convention `<app_name>_web_port` (device-level appdata is shared). |
-| `sdwan_analyzer_interval_minutes` | string (5, 15, 30 or 60) | No | Scheduled collection interval. Default 15 (applied in code, never written). Invalid values fall back to 15. |
+| `sdwan_analyzer_interval_minutes` | string (1, 5, 15, 30 or 60) | No | Scheduled collection interval. Default 15 (applied in code, never written). Invalid values fall back to 15. |
 
 Web-port behavior (see `analyzer/web_port.py`, the shared dynamic web port
 module, byte-identical to the copy in Speedtest Analyzer 1.1.7 and the kit's

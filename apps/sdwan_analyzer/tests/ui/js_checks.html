@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>js checks</title></head>
+<body><pre id="out">RUNNING</pre>
+<script src="../../static/js/analyzer/format.js"></script>
+<script src="../../static/js/analyzer/series.js"></script>
+<script>
+(function () {
+    var lines = [];
+    function check(cond, msg) { lines.push((cond ? 'PASS: ' : 'FAIL: ') + msg); }
+    var S = window.SdwanSeries, F = window.SdwanFormat;
+    function rate(s, e, rx, tx, status, rxSt, txSt) {
+        return {start_ts: s, end_ts: e, interval_s: e - s, status: status || 'ok', reduced_precision: false,
+                rx: {status: rxSt || 'ok', bits_per_s: rx}, tx: {status: txSt || 'ok', bits_per_s: tx}};
+    }
+
+    // direction: zero is valid, non-ok never becomes a value
+    check(S.direction({status: 'ok', bits_per_s: 0}).value === 0, 'valid zero measurement is kept as 0');
+    check(S.direction({status: 'counter_decrease', bits_per_s: null}).value === null, 'counter reset is a gap');
+    check(S.direction({status: 'ok', bits_per_s: null}).value === null, 'ok without a number is a gap, not zero');
+    check(S.direction({status: 'gap_exceeded', bits_per_s: 5}).value === null, 'non-ok status never plotted even with a number');
+    check(S.direction({status: 'ok', bits_per_s: -1}).value === null, 'negative value rejected');
+    check(S.direction(null).value === null, 'missing direction is a gap');
+
+    // buildIntervals
+    var b = S.buildIntervals([
+        rate(20, 30, 2, 2), rate(0, 10, 1, 1), {start_ts: null, end_ts: null, status: 'invalid_time'},
+        rate(10, 20, 5, 5, 'suspect_input')]);
+    check(b.intervals.length === 3 && b.unplaced === 1, 'rates without end time are counted, not drawn');
+    check(b.intervals[0].end === 10 && b.intervals[2].end === 30, 'intervals sorted by end time');
+    check(b.intervals[1].rx === null && b.intervals[1].tx === null && b.intervals[1].rxStatus === 'suspect_input',
+          'suspect_input is a gap in both directions');
+
+    // runs: gaps break the line; zero stays in the line; non-contiguous intervals break
+    var iv = S.buildIntervals([
+        rate(0, 10, 1, 4), rate(10, 20, 0, 0), rate(20, 30, null, null, 'counter_decrease', 'counter_decrease', 'counter_decrease'),
+        rate(30, 40, 3, 6), rate(40, 50, 3, 6), rate(60, 70, 7, 8)]).intervals;
+    var rr = S.runs(iv, 'rx');
+    check(rr.length === 3, 'rx: gap and non-contiguous interval split into 3 runs (got ' + rr.length + ')');
+    check(rr[0].length === 2 && rr[0][1].v === 0, 'zero throughput stays on the line');
+    check(rr[1].length === 2 && rr[2].length === 1, 'run lengths 2, 2, 1');
+    check(S.runs(iv, 'tx').length === 3, 'tx runs match');
+
+    // one direction invalid only
+    var half = S.buildIntervals([rate(0, 10, 1, null, 'counter_decrease', 'ok', 'counter_decrease'),
+                                 rate(10, 20, 2, 2)]).intervals;
+    check(half[0].rx === 1 && half[0].tx === null, 'valid direction kept when the other is invalid');
+    check(S.runs(half, 'rx').length === 1 && S.runs(half, 'tx').length === 1, 'only the invalid direction breaks');
+
+    // summarize
+    var sm = S.summarize(iv);
+    check(sm.total === 6 && sm.bothValid === 5 && sm.anyGap === 1, 'summary counts');
+    check(sm.reasons.counter_decrease === 1, 'same reason on both directions counted once');
+    check(S.hasAnyValue(iv) === true && S.hasAnyValue(S.buildIntervals([rate(0, 1, null, null, 'missing_value', 'missing_value', 'missing_value')]).intervals) === false,
+          'hasAnyValue');
+
+    // nearest
+    check(S.nearest(iv, 5) === 0 && S.nearest(iv, 15) === 1 && S.nearest(iv, 100) === 5 && S.nearest([], 1) === -1,
+          'nearest interval lookup');
+    check(S.nearest(iv, 55) === 4 || S.nearest(iv, 55) === 5, 'nearest in a hole picks a neighbour');
+
+    // formatting
+    // units: thresholds are decimal and inclusive at the lower bound
+    var U = function (v) { return F.pickUnit(v).name; };
+    check(U(0) === 'bps' && U(null) === 'bps' && U(NaN) === 'bps', 'no data or only zeros: bps');
+    check(U(0.5) === 'bps' && U(999.999) === 'bps', 'below 1000 bps: bps');
+    check(U(1000) === 'Kbps' && U(999999) === 'Kbps', '1000 bps to just under 1 Mbps: Kbps');
+    check(U(1e6) === 'Mbps' && U(999999999) === 'Mbps', '1 Mbps to just under 1 Gbps: Mbps');
+    check(U(1e9) === 'Gbps' && U(2.5e12) === 'Gbps', '1 Gbps and above: Gbps');
+    check(F.pickUnit(1e6).div === 1e6 && F.pickUnit(1000).div === 1000 && F.pickUnit(5).div === 1, 'unit divisors are decimal');
+
+    // conversions (auto unit per value)
+    check(F.rate(0) === '0 bps', 'zero is shown as zero: ' + F.rate(0));
+    check(F.rate(12345678) === '12.346 Mbps', 'rate 12.346 Mbps: ' + F.rate(12345678));
+    check(F.rate(250040000) === '250.0 Mbps', 'rate >= 100: ' + F.rate(250040000));
+    check(F.rate(2.5e9) === '2.500 Gbps', 'rate in Gbps: ' + F.rate(2.5e9));
+    check(F.rate(1250) === '1.250 Kbps', 'rate in Kbps: ' + F.rate(1250));
+    check(F.rate(999) === '999.0 bps' || F.rate(999) === '999 bps', 'rate in bps: ' + F.rate(999));
+    check(F.rate(999999.9) === '1 Mbps', 'no "1000.0 Kbps" at the boundary: ' + F.rate(999999.9));
+    // small non-zero values keep their precision and are never shown as 0
+    check(F.rate(412) === '412.0 bps', 'small bps: ' + F.rate(412));
+    check(F.rate(0.5) === '0.5 bps', 'sub-bps value not rounded to zero: ' + F.rate(0.5));
+    check(F.rate(0.000412) !== '0 bps' && F.rate(0.000412).indexOf('0.000412') === 0, 'tiny value keeps digits: ' + F.rate(0.000412));
+    check(F.rate(10000) === '10.000 Kbps', 'exactly 10 Kbps: ' + F.rate(10000));
+    check(F.rate(null) === '' && F.rate('x') === '', 'rate of non-number is empty');
+    // forced unit (axis): same unit for any value
+    check(F.rate(1500, F.pickUnit(5e6)) === '0.0015 Mbps', 'forced unit keeps small values: ' + F.rate(1500, F.pickUnit(5e6)));
+    check(F.tick(0) === '0' && F.tick(2.5) === '2.5' && F.tick(0.25) === '0.25' && F.tick(150) === '150', 'tick labels');
+
+    var ax = F.niceAxis(7.3, 4);
+    check(ax.max >= 7.3 && ax.ticks[0] === 0, 'niceAxis covers data from zero: ' + JSON.stringify(ax));
+    check(F.niceAxis(0, 4).max > 0, 'niceAxis of no data still has a scale');
+    var tk = F.timeTicks(1790380800, 1790380800 + 86400, 8);
+    check(tk.ticks.length >= 2 && tk.ticks.length <= 9 &&
+          tk.ticks[0] >= 1790380800 && tk.ticks[tk.ticks.length - 1] <= 1790380800 + 86400, 'time ticks inside range, bounded: ' + tk.ticks.length);
+
+    document.getElementById('out').textContent = lines.join('\n') + '\nDONE';
+}());
+</script></body></html>

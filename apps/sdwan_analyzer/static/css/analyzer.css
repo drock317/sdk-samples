@@ -1,0 +1,108 @@
+/* SD-WAN Analyzer: app-specific styles. Supplements static/css/style.css and
+ * static/css/eds-tokens.css (load order: style, eds-tokens, analyzer). Colours come
+ * from the --eds-* tokens; flat fills only, no gradients. Data-viz colours are fills
+ * and strokes, never text colours. */
+
+:root {
+    --sa-rx: var(--eds-blue, #1174e6);
+    --sa-tx: var(--eds-teal, #23969a);
+    --sa-gap: var(--eds-gray-4, #e0e0e0);
+    --sa-grid: var(--eds-gray-4, #e0e0e0);
+    --sa-axis: var(--eds-gray-2, #767676);
+    --sa-surface: var(--eds-white, #ffffff);
+}
+[data-theme="dark"] {
+    --sa-rx: var(--eds-blue-3, #48a8fa);
+    --sa-tx: var(--eds-teal, #23969a);
+    --sa-gap: var(--eds-gray-2, #767676);
+    --sa-grid: var(--eds-gray-1, #242424);
+    --sa-axis: var(--eds-gray-3, #a0a0a0);
+    --sa-surface: var(--eds-gray-1, #242424);
+}
+
+/* Flat buttons: the template adds a gradient overlay on .btn */
+.sa-btn:before { display: none; }
+.sa-btn { box-shadow: none; }
+
+/* Page layout */
+.sa-view { display: flex; flex-direction: column; gap: 1.5rem; }
+.sa-panel { min-height: 0; box-shadow: none; }
+.sa-panel-content { padding: 1.25rem 1.5rem; }
+.sa-panel-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+
+/* Controls */
+.sa-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem 1.5rem; }
+.sa-field { display: flex; flex-direction: column; gap: 0.375rem; min-width: 0; }
+.sa-field:first-child { flex: 1 1 18rem; max-width: 32rem; }
+.sa-label { font-size: 0.8125rem; font-weight: 500; color: var(--text-primary); }
+.sa-field-action { margin-left: auto; }
+
+.sa-segmented { display: inline-flex; border: 1px solid var(--border-color); border-radius: var(--radius-md); overflow: hidden; }
+.sa-segment {
+    min-width: 3.25rem; padding: 0.625rem 1rem; border: 0; border-right: 1px solid var(--border-color);
+    background: transparent; color: var(--text-primary); font: inherit; font-size: 0.875rem; font-weight: 500; cursor: pointer;
+}
+.sa-segment:last-child { border-right: 0; }
+.sa-segment:hover:not(:disabled) { background: var(--chip-surface); }
+.sa-segment.active { background: var(--primary-color); color: var(--eds-white, #fff); }
+[data-theme="dark"] .sa-segment.active { color: var(--eds-black, #000); }
+.sa-segment:disabled, .sa-btn:disabled, .form-select:disabled { opacity: 0.5; cursor: not-allowed; }
+.sa-segment:focus-visible, .sa-btn:focus-visible, .sa-chart:focus-visible, .form-select:focus-visible {
+    outline: 2px solid var(--primary-color); outline-offset: 2px;
+}
+
+/* States */
+.sa-state { text-align: center; padding: 3rem 1rem; color: var(--text-primary); }
+.sa-state-title { font-size: 1.0625rem; font-weight: 500; margin: 0 0 0.5rem; }
+.sa-state-detail { margin: 0 auto 1rem; max-width: 40rem; font-size: 0.9375rem; }
+.sa-state-error { border-left: 4px solid var(--eds-red, #c52a32); text-align: left; padding-left: 1.25rem; }
+.sa-state-error .sa-state-detail { margin-left: 0; }
+.sa-state-empty { border: 1px dashed var(--border-color); border-radius: var(--radius-md); }
+
+/* Meta + notices */
+.sa-meta { margin: 0 0 0.75rem; font-size: 0.875rem; }
+.sa-notes { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.75rem; }
+.sa-notice { margin: 0; padding: 0.5rem 0.75rem; font-size: 0.8125rem; border-left: 4px solid var(--eds-blue, #1174e6); background: var(--chip-surface); }
+.sa-notice-warning { border-left-color: var(--eds-orange, #e66e19); }
+
+/* Chart */
+.sa-chart-wrap { position: relative; width: 100%; }
+.sa-chart { display: block; max-width: 100%; touch-action: pan-y; }
+.sa-legend { display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; list-style: none; margin: 0 0 0.5rem; padding: 0; font-size: 0.8125rem; }
+.sa-legend li { display: inline-flex; align-items: center; gap: 0.5rem; }
+.sa-swatch { display: inline-block; width: 1.5rem; height: 0.1875rem; flex: none; }
+.sa-swatch-rx { background: var(--sa-rx); }
+.sa-swatch-tx { background: var(--sa-tx); }
+.sa-swatch-gap { height: 0.75rem; width: 0.75rem; background: var(--sa-gap); border: 1px solid var(--sa-axis); }
+
+.sa-grid { stroke: var(--sa-grid); stroke-width: 1; }
+.sa-grid-x { stroke-dasharray: 2 4; }
+.sa-axis { stroke: var(--sa-axis); stroke-width: 1; }
+.sa-tick, .sa-axis-title { fill: var(--text-primary); font-size: 11px; font-family: inherit; }
+.sa-axis-title { font-size: 12px; font-weight: 500; }
+.sa-gap-band { fill: var(--sa-gap); opacity: 0.6; }
+.sa-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.sa-line.sa-rx, .sa-mark.sa-rx { stroke: var(--sa-rx); }
+.sa-line.sa-tx, .sa-mark.sa-tx { stroke: var(--sa-tx); }
+.sa-dot.sa-rx { fill: var(--sa-rx); }
+.sa-dot.sa-tx { fill: var(--sa-tx); }
+.sa-mark { fill: var(--sa-surface); stroke-width: 2; pointer-events: none; }
+.sa-cross { stroke: var(--sa-axis); stroke-width: 1; pointer-events: none; }
+.sa-overlay { fill: transparent; cursor: crosshair; }
+
+.sa-tooltip {
+    position: absolute; z-index: 2; pointer-events: none; min-width: 14rem; max-width: 20rem; padding: 0.625rem 0.75rem;
+    background: var(--sa-surface); color: var(--text-primary); border: 1px solid var(--sa-axis);
+    border-radius: var(--radius-md); font-size: 0.8125rem; line-height: 1.4;
+}
+.sa-tooltip[hidden] { display: none; }
+.sa-tip-time { font-weight: 500; }
+.sa-tip-sub { font-size: 0.75rem; }
+.sa-tip-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.25rem; }
+
+@media (max-width: 768px) {
+    .sa-panel-content { padding: 1rem; }
+    .sa-field-action { margin-left: 0; }
+    .sa-field:first-child { flex-basis: 100%; max-width: none; }
+    .sa-segment { min-width: 2.75rem; padding: 0.625rem 0.75rem; }
+}

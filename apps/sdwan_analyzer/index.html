@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SD-WAN Analyzer</title>
+    <link rel="stylesheet" type="text/css" href="static/css/style.css" />
+    <!-- eds-tokens.css, fonts and logos are the local Ericsson brand kit; the page falls back to Arial without them -->
+    <link rel="stylesheet" type="text/css" href="static/css/eds-tokens.css" />
+    <link rel="stylesheet" type="text/css" href="static/css/analyzer.css" />
+    <link rel="icon" type="image/svg+xml" href="static/img/ericsson-econ-black.svg">
+    <link href="static/libs/font-awesome.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <header class="app-header">
+            <div class="header-content">
+                <div class="brand-logo">
+                    <img class="logo-on-light" src="static/img/ericsson-horizontal-black.svg" alt="Ericsson" onerror="this.style.display='none'">
+                    <img class="logo-on-dark" src="static/img/ericsson-horizontal-white.svg" alt="Ericsson" onerror="this.style.display='none'">
+                </div>
+                <div class="logo-section">
+                    <h1 id="app-title">SD-WAN Analyzer</h1>
+                    <span class="app-version" id="app-version"></span>
+                </div>
+                <div class="header-actions">
+                    <button type="button" class="dark-mode-toggle" id="dark-mode-toggle" title="Toggle dark mode" aria-label="Toggle dark mode">
+                        <i class="fas fa-moon"></i>
+                    </button>
+                </div>
+            </div>
+        </header>
+        <main class="app-main">
+            <aside class="sidebar" id="app-sidebar">
+                <div class="sidebar-header">
+                    <h2><a href="#" id="homepage-link" style="color: inherit; text-decoration: none; display: flex; align-items: center; gap: 0.5rem;"><i class="fas fa-chart-line"></i> <span class="sidebar-label">Throughput trends</span></a></h2>
+                    <button type="button" class="sidebar-toggle" id="sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar">
+                        <i class="fas fa-chevron-left"></i>
+                    </button>
+                </div>
+                <nav class="sidebar-nav" aria-label="Pages">
+                    <!-- Future pages: add an <li class="nav-parent"> here and a matching
+                         <section class="element-section" id="..."> below (see the web app template). -->
+                    <ul class="nav-list" id="nav-list"></ul>
+                </nav>
+            </aside>
+            <div class="content-area">
+                <div class="content-panel" id="content-panel">
+                    <!-- The landing page keeps id="homepage": the template script shows it on load. -->
+                    <section class="element-section active" id="homepage">
+                        <h2 class="section-title">Throughput trends</h2>
+                        <div class="sa-view" id="throughput-trends-root">
+                            <noscript><p>The throughput trends view needs JavaScript.</p></noscript>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script src="static/js/script.js"></script>
+    <script src="static/js/analyzer/api.js"></script>
+    <script src="static/js/analyzer/format.js"></script>
+    <script src="static/js/analyzer/series.js"></script>
+    <script src="static/js/analyzer/ui.js"></script>
+    <script src="static/js/analyzer/line-chart.js"></script>
+    <script src="static/js/analyzer/throughput-trends.js"></script>
+    <script src="static/js/analyzer/app.js"></script>
+</body>
+</html>

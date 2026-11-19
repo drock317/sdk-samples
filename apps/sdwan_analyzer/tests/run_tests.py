@@ -1184,12 +1184,12 @@ def test_schedule_selection():
     clock = _Clock(1790380800 + 7 * 60)
     svc = _fresh(clock)
     check(svc.schedule_minutes() == 15, 'default 15 minutes')
-    check(service_mod.SCHEDULE_CHOICES == (5, 15, 30, 60),
-          'choices are 5/15/30/60')
-    for m in (5, 15, 30, 60):
+    check(service_mod.SCHEDULE_CHOICES == (1, 5, 15, 30, 60),
+          'choices are 1/5/15/30/60')
+    for m in (1, 5, 15, 30, 60):
         check(svc.set_schedule_minutes(m) is True and
               svc.schedule_minutes() == m, '{} min accepted'.format(m))
-    for bad in (1, 2, 10, 120, 0, None, '15'):
+    for bad in (2, 10, 120, 0, None, '15'):
         check(svc.set_schedule_minutes(bad) is False,
               'rejected: {!r}'.format(bad))
     check(svc.schedule_minutes() == 60, 'rejected values leave schedule')
@@ -1200,7 +1200,7 @@ def test_schedule_selection():
           nxt - clock.t <= 15 * 60, 'next run aligned to the 15-min boundary')
     check(not svc.scheduled_due(nxt - 1) and svc.scheduled_due(nxt),
           'due exactly at the boundary')
-    check(AnalyzerService(schedule_minutes=1).schedule_minutes() == 15,
+    check(AnalyzerService(schedule_minutes=2).schedule_minutes() == 15,
           'invalid constructor interval falls back to default')
 
 
@@ -2289,9 +2289,9 @@ def test_cellular_current_state_api():
                   body['modems'], 'GET /api/cellular serves current state')
             import urllib.request
             with urllib.request.urlopen(
-                    'http://127.0.0.1:{}/'.format(port), timeout=5) as r:
+                    'http://127.0.0.1:{}/dev'.format(port), timeout=5) as r:
                 page = r.read().decode('utf-8')
-            check('/api/cellular' in page, 'root page lists /api/cellular')
+            check('/api/cellular' in page, 'dev page lists /api/cellular')
             code, wan = _http_json(port, '/api/wan')
             check(code == 200 and wan['interfaces'],
                   'GET /api/wan includes interfaces')
@@ -2477,7 +2477,7 @@ def test_web_get_post_and_connection_close():
             check(b'Connection: close' in head and closed,
                   'POST sends Connection: close and closes')
             resp, closed = _raw_request(
-                srv.port, b'GET / HTTP/1.1\r\nHost: x\r\n\r\n')
+                srv.port, b'GET /dev HTTP/1.1\r\nHost: x\r\n\r\n')
             check(b'Connection: close' in resp.partition(b'\r\n\r\n')[0] and
                   closed and b'/api/cellular' in resp,
                   'HTML page also closes the connection')
@@ -2803,9 +2803,9 @@ def test_storage_inspector_api_on_demand_no_side_effects():
               'collection, freshness or Recording change')
         import urllib.request
         with urllib.request.urlopen(
-                'http://127.0.0.1:{}/'.format(port), timeout=5) as r:
+                'http://127.0.0.1:{}/dev'.format(port), timeout=5) as r:
             check('/api/storage' in r.read().decode('utf-8'),
-                  'root page lists /api/storage')
+                  'dev page lists /api/storage')
         import inspect as _inspect
         src = _inspect.getsource(inspector)
         check(not any(('import ' + m) in src for m in (
@@ -2928,6 +2928,9 @@ def main():
     analytics_tests.bind(check, _Clock)
     analytics_tests.bind_port(_free_port)
     tests = tests + analytics_tests.TESTS
+    import ui_tests
+    ui_tests.bind(check, _Clock, _free_port)
+    tests = tests + ui_tests.TESTS
     import failed_read_tests
     failed_read_tests.bind(check)
     tests = tests + failed_read_tests.TESTS

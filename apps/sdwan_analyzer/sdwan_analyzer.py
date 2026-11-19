@@ -47,7 +47,7 @@ def _handle_signal(signum, frame):
 
 
 def _configured_schedule_minutes():
-    """Optional App Data sdwan_analyzer_interval_minutes (5/15/30/60).
+    """Optional App Data sdwan_analyzer_interval_minutes (1/5/15/30/60).
 
     Read-only: defaults are applied in code and never written to appdata.
     Anything missing/invalid falls back to the service default.

@@ -14,17 +14,61 @@ import json
 import os
 import re
 import threading
+from urllib.parse import unquote
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import cp
 
-from . import web_port
+from . import VERSION, web_port
 from .query import QueryError
 
 # Exact route for GET /api/recordings/<job_id>/samples. The id is matched
 # loosely here and validated against the generated format in the store, so a
 # traversal attempt is a plain 404 and never reaches a filesystem join.
 _SAMPLES_ROUTE = re.compile(r'^/api/recordings/([^/]+)/samples\Z')
+
+# Application shell (v0.7.0): index.html in the app folder plus static/ assets,
+# served read-only. Only files below static/ with a known extension are served.
+_APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_INDEX_FILE = os.path.join(_APP_DIR, 'index.html')
+_STATIC_DIR = os.path.join(_APP_DIR, 'static')
+_STATIC_PREFIX = '/static/'
+_MAX_STATIC_BYTES = 2 * 1024 * 1024
+_MIME_TYPES = {
+    '.html': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.ico': 'image/x-icon',
+    '.woff': 'font/woff',
+    '.woff2': 'font/woff2',
+    '.ttf': 'font/ttf',
+}
+
+
+def resolve_static(url_path):
+    """Map a /static/... URL path to an absolute file path, or None.
+
+    None for anything that is not a regular file with an allowed extension
+    strictly inside static/ (traversal, absolute paths, NUL, backslashes,
+    symlinks leaving the folder, directories).
+    """
+    if not url_path.startswith(_STATIC_PREFIX):
+        return None
+    rel = unquote(url_path[len(_STATIC_PREFIX):])
+    if (not rel or '\x00' in rel or '\\' in rel or rel.startswith('/')
+            or any(part in ('', '.', '..') for part in rel.split('/'))):
+        return None
+    ext = os.path.splitext(rel)[1].lower()
+    if ext not in _MIME_TYPES:
+        return None
+    base = os.path.realpath(_STATIC_DIR)
+    full = os.path.realpath(os.path.join(base, rel))
+    if not full.startswith(base + os.sep) or not os.path.isfile(full):
+        return None
+    return full
+
 
 # App name used for the namespaced appdata field (<app_name>_web_port).
 APP_NAME = 'sdwan_analyzer'
@@ -84,6 +128,7 @@ _DEV_PAGE = """<!DOCTYPE html>
 <h1>SD-WAN Analyzer</h1>
 <p>Backend build. Structured cached snapshot + section JSON APIs; UI deferred.</p>
 <ul>
+<li><a href="/">/</a> Throughput trends UI (v0.7.0; this page is /dev)</li>
 <li><a href="/api/status">/api/status</a> (includes effective web port)</li>
 <li><a href="/api/health">/api/health</a></li>
 <li><a href="/api/snapshot">/api/snapshot</a> (latest MERGED current state, not the last observation)</li>
@@ -136,6 +181,34 @@ def _make_handler(service):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_file(self, full, code=200):
+            """Serve one static file (already validated by resolve_static).
+
+            ETag from mtime+size: an unchanged file is answered 304, so a page
+            reload does not re-send the large template assets over the router.
+            """
+            st = os.stat(full)
+            if st.st_size > _MAX_STATIC_BYTES:
+                self._send_json({'error': 'not found'}, code=404)
+                return
+            etag = '"{:x}-{:x}"'.format(int(st.st_mtime), st.st_size)
+            ctype = _MIME_TYPES[os.path.splitext(full)[1].lower()]
+            self.send_response(304 if self.headers.get('If-None-Match') == etag
+                               else code)
+            self.send_header('ETag', etag)
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'close')
+            self.close_connection = True
+            if self.headers.get('If-None-Match') == etag:
+                self.end_headers()
+                return
+            with open(full, 'rb') as f:
+                body = f.read(_MAX_STATIC_BYTES + 1)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         # Map of /api/<name> section endpoints -> snapshot section key.
         # Every handler reads ONLY the cached snapshot via service.section();
         # a web request NEVER triggers router collection.
@@ -164,7 +237,21 @@ def _make_handler(service):
                 elif path == '/api/history':
                     self._send_json(service.query_history(raw_query))
                 elif path in ('/', '/index.html'):
+                    if os.path.isfile(_INDEX_FILE):
+                        self._send_file(_INDEX_FILE)
+                    else:
+                        self._send_html(_DEV_PAGE)
+                elif path == '/dev':
                     self._send_html(_DEV_PAGE)
+                elif path.startswith(_STATIC_PREFIX):
+                    full = resolve_static(path)
+                    if full is None:
+                        self._send_json({'error': 'not found'}, code=404)
+                    else:
+                        self._send_file(full)
+                elif path == '/api/info':
+                    # Header version label of the web app template script.
+                    self._send_json({'app_version': VERSION})
                 elif path in ('/api/status', '/api/health'):
                     self._send_json(service.status())
                 elif path == '/api/snapshot':
@@ -266,6 +353,19 @@ def _make_handler(service):
                     self._send_json({'error': 'internal error'}, code=500)
                 except Exception:
                     pass
+
+        def log_request(self, code='-', size='-'):
+            # Page and asset loads are routine; log only API calls and errors.
+            path = self.path.split('?', 1)[0]
+            routine = (path in ('/', '/index.html')
+                       or path.startswith(_STATIC_PREFIX))
+            try:
+                ok = int(code) < 400
+            except (TypeError, ValueError):
+                ok = False
+            if routine and ok:
+                return
+            BaseHTTPRequestHandler.log_request(self, code, size)
 
         def log_message(self, fmt, *args):
             # Route access logs through cp.log (no stdout on router).
