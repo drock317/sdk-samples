@@ -37,6 +37,16 @@ field semantics):
     control/sdwan_adv/wan_bonding/interface/{info.uid} -> local_ip/remote_ip
         -> WBOND overlay source/gateway (fallback: status/routing analysis)
 
+PHASE-1A VERIFIED on R1900 + R2400, NCOS 7.26.81 (v0.8.3 consumers):
+    status/wan/steering/rules[].xpolicy -> effective compiled definitions
+        (dst_ip_network == config/identities/ip[]._id_, intent ==
+        config/identities/intent[]._id_; see steering_defs.py)
+    status/wan/steering/stats.rules[].apps -> key == identities/ip[].name
+    config/identities/intent[].traffic_class == config/sdwan_adv/traffic_class._id_
+    config/sdwan_adv/wan_bonding -> {_id_, name, dynamic_weight (bool),
+        members[] = criteria {_id_, trigger_string, weight}} (bond_config.py)
+    config/sdwan_adv/qoe.pkt_loss_cnt.enabled
+
 These paths are validated in STA code but are NOT yet in this repo's
 docs/ncos-api and have not been re-verified on a router by THIS app -- they
 require device validation before we depend on them in production (see
@@ -453,6 +463,10 @@ _PATHS = {
     'identities_ip': 'config/identities/ip',
     'identities_intent': 'config/identities/intent',
     'traffic_class_config': 'config/sdwan_adv/traffic_class',
+    # v0.8.3: configured WAN bonding (criteria + static/dynamic mode).
+    'wan_bonding_cfg': 'config/sdwan_adv/wan_bonding',
+    # v0.8.3: QoE config (pkt_loss_cnt.enabled) -- interpretation context.
+    'qoe_cfg': 'config/sdwan_adv/qoe',
 }
 _STEERING_KEYS = ('steering_rules', 'steering_events', 'steering_stats',
                   'steering_intents')
@@ -462,7 +476,13 @@ _STEERING_KEYS = ('steering_rules', 'steering_events', 'steering_stats',
 # and targeted manual refresh -- never on every observation and never during
 # high-rate Recording by default.
 STATIC_CONFIG_KEYS = ('wan_rules2', 'identities_ip', 'identities_intent',
-                      'traffic_class_config')
+                      'traffic_class_config', 'wan_bonding_cfg', 'qoe_cfg')
+# Small config trees the steering definitions resolve against (identity
+# uuid, intent uuid, traffic class uuid). Read in the SAME pass as a changed
+# steering definition set so resolution is consistent; never re-read on every
+# observation.
+STEERING_DEP_KEYS = ('identities_ip', 'identities_intent',
+                     'traffic_class_config')
 EXPENSIVE_RUNTIME_KEYS = ('loadbalancers',)
 CLASS_RUNTIME = 'runtime'
 CLASS_EXPENSIVE_RUNTIME = 'expensive_runtime'
@@ -485,8 +505,8 @@ def key_class(key):
 # Targeted manual-refresh groups -> keys read.
 REFRESH_GROUPS = {
     'traffic_classes': ('identities_intent', 'traffic_class_config'),
-    'steering': _STEERING_KEYS + ('identities_ip',),
-    'bonding': ('wan_devices', 'wan_bonding'),
+    'steering': _STEERING_KEYS + STEERING_DEP_KEYS,
+    'bonding': ('wan_devices', 'wan_bonding', 'wan_bonding_cfg'),
     'wan_paths': ('wan_devices', 'primary_device', 'swans', 'qoe'),
     'overview': RUNTIME_KEYS,
     'loadbalancers': EXPENSIVE_RUNTIME_KEYS,

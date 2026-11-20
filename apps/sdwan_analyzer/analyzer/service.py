@@ -38,12 +38,17 @@ import cp
 
 from . import VERSION
 from . import analytics
+from . import bond_config
+from . import cellular
 from . import collectors
 from . import durable
+from . import foundation
 from . import inspector
 from . import normalize
 from . import query
 from . import recording
+from . import steering_defs
+from . import steering_state
 from . import storage
 from . import telemetry
 from . import topology
@@ -236,6 +241,13 @@ class AnalyzerService(object):
         # Fingerprints from the previous composed snapshot.
         self._prev_fingerprints = {}
 
+        # v0.8.3: steering definition versioning/change detection and the
+        # last-seen capture epochs (capture restart detection). In-memory,
+        # bounded; durable data is the config version store + observations.
+        self._defs_tracker = steering_state.SteeringDefsTracker()
+        self._prev_capture = {}
+        self._bond_cfg_state = {'state': None, 'checked_ts': None}
+
         # Cross-observation telemetry state (all bounded).
         self._prev_counters = {}
         # Latest normalized runtime telemetry for CURRENT STATE (merged
@@ -398,6 +410,7 @@ class AnalyzerService(object):
             t0 = time.time()
             keys = tuple(keys)
             results = collectors.collect_keys(keys)
+            results = self._with_steering_deps(results)
             errors = [{'collector': k, 'error': r.error,
                        'error_type': getattr(r, 'error_type', None)}
                       for k, r in sorted(results.items())
@@ -441,6 +454,36 @@ class AnalyzerService(object):
             else:
                 self._store.append(obs)
             return obs
+
+    def _with_steering_deps(self, results):
+        """Read identity/intent/Traffic Class config in the same pass as a
+        CHANGED set of steering definitions, so uuid resolution is
+        consistent. Never triggered by an unchanged definition set (so not
+        by high-rate Recording) or by the first-ever baseline."""
+        try:
+            res = results.get('steering_rules')
+            if res is None or not getattr(res, 'ok', False):
+                return results
+            missing = tuple(k for k in collectors.STEERING_DEP_KEYS
+                            if k not in results)
+            if not missing:
+                return results
+            cur = self._config_store.current(steering_state.NAME)
+            if cur is None:
+                return results
+            state, payload, _ = steering_defs.extract(res.value)
+            if state != steering_defs.ST_COMPLETE:
+                return results
+            if steering_defs.payload_fingerprint(payload) == cur[
+                    'fingerprint']:
+                return results
+            extra = collectors.collect_keys(missing)
+            merged = dict(results)
+            merged.update(extra)
+            return merged
+        except Exception as e:
+            cp.log('service: steering dependency read skipped: {}'.format(e))
+            return results
 
     def recompose(self):
         """Recompose the CURRENT STATE from cached raw (the UI cache).
@@ -519,11 +562,25 @@ class AnalyzerService(object):
                 devices, data.get('primary_device'), now,
                 primary_known=primary_known)
             obs['interfaces'], obs['cellular'] = tel
+        # Versions first: runtime sections below cite the definition
+        # revision (steering_rule_defs) in force for this pass.
+        obs['config_versions'] = self._update_config_versions(
+            snap, now, ok)
+        defs_cur = self._config_store.current(steering_state.NAME)
+        defs_version = defs_cur['version'] if defs_cur else None
         if 'swans' in ok:
             obs['swans_samples'] = telemetry.swans_new_samples(
                 data.get('swans'), self._swans_seen, now)
         if 'qoe' in ok:
             obs['qoe'] = telemetry.qoe_records(data.get('qoe'), now)
+            qcfg = normalize.qoe_config(data.get('qoe_cfg'))
+            if qcfg['state'] == 'ok':
+                # Config context as last read (its own timestamp), not a
+                # measurement of this pass.
+                obs['qoe_meta'] = {
+                    'pkt_loss_cnt_enabled': qcfg['pkt_loss_cnt_enabled'],
+                    'config_read_ts': self._config_raw.health().get(
+                        'qoe_cfg', {}).get('last_success_ts')}
         if 'wan_bonding' in ok:
             obs['wbond'] = telemetry.wbond_runtime(snap.get('bonding'), now)
         ts = snap.get('traffic_steering', {})
@@ -536,11 +593,39 @@ class AnalyzerService(object):
         if 'steering_events' in ok:
             obs['steering_events'] = telemetry.steering_new_events(
                 ts.get('events'), self._event_seen, now)
-        obs['config_versions'] = self._update_config_versions(snap, now)
+            meta = telemetry.steering_events_meta(
+                data.get('steering_events'),
+                self._prev_capture.get('events'))
+            obs['steering_events_meta'] = meta
+            if meta.get('began_capture') is not None:
+                self._prev_capture['events'] = meta['began_capture']
+        if 'steering_stats' in ok:
+            rec = telemetry.steering_apps_record(
+                data.get('steering_stats'), defs_version,
+                self._prev_capture.get('stats'))
+            obs['steering_apps'] = rec
+            if rec.get('began_capture') is not None:
+                self._prev_capture['stats'] = rec['began_capture']
         return obs
 
-    def _update_config_versions(self, snap, now):
-        """Version static/config objects; a new version only on fp change."""
+    def _kind_of(self):
+        """Callable resolving a destination criterion's kind from runtime
+        labels (exact UUID join); used to annotate change events."""
+        raw = self._raw()
+        res = steering_defs.resolver(
+            raw.get('identities_ip'), raw.get('identities_intent'),
+            raw.get('traffic_class_config'), raw.get('steering_stats'))
+        return lambda value, kind: steering_defs.resolve_destination(
+            res, value, kind)
+
+    def _update_config_versions(self, snap, now, ok_keys=None):
+        """Version static/config objects; a new version only on fp change.
+
+        `ok_keys` (collector keys read successfully in THIS pass) gates the
+        v0.8.3 objects, which are derived from raw reads of their own: a
+        definition or configuration is never (re)versioned from a stale
+        cached read or a failed one. None means every key counts as read.
+        """
         fps = snap.get('fingerprints', {})
         wan = snap.get('wan', {})
         bonds = snap.get('bonding', {}).get('bonds', [])
@@ -583,7 +668,38 @@ class AnalyzerService(object):
             if fp is None:
                 fp = normalize._stable_hash(payload)
             out[name] = self._config_store.update(name, fp, payload, now)
+        # --- v0.8.3 objects (distinct from the legacy ones above) ---------
+        try:
+            if ok_keys is None or 'steering_rules' in ok_keys:
+                res = self._defs_tracker.observe(
+                    self._config_store, self._raw().get('steering_rules'),
+                    now, history_recent=self._history_tail,
+                    kind_of=self._kind_of)
+                if res is not None:
+                    out[steering_state.NAME] = res
+        except Exception as e:
+            cp.log('service: steering definition versioning error: '
+                   '{}'.format(e))
+        try:
+            if ok_keys is None or 'wan_bonding_cfg' in ok_keys:
+                st, cfg_bonds = bond_config.normalize_config(
+                    self._raw().get('wan_bonding_cfg'))
+                self._bond_cfg_state = {'state': st, 'checked_ts': now}
+                if st == 'ok':
+                    payload = bond_config.config_payload(cfg_bonds)
+                    out['wan_bonding_config'] = self._config_store.update(
+                        'wan_bonding_config',
+                        bond_config.config_fingerprint(payload), payload,
+                        now)
+        except Exception as e:
+            cp.log('service: bonding config versioning error: {}'.format(e))
         return out
+
+    def _history_tail(self):
+        try:
+            return self._store.recent(limit=None)
+        except Exception:
+            return []
 
     def _raw(self):
         """Merged last-known-good raw view (config + runtime)."""
@@ -628,6 +744,8 @@ class AnalyzerService(object):
         # SWANS + QoE (kept separate concepts).
         swans = normalize.swans_paths(base.get('swans'))
         qoe = normalize.qoe_paths(heavy.get('qoe'))
+        # v0.8.3 additive: QoE config context (pkt_loss_cnt.enabled).
+        qoe['config'] = normalize.qoe_config(heavy.get('qoe_cfg'))
 
         # Traffic Classes (config-authoritative; merges both config trees).
         traffic_classes = normalize.traffic_classes(
@@ -676,6 +794,8 @@ class AnalyzerService(object):
                 'modems': [dict(r, carriers=[dict(c) for c in
                                              r.get('carriers', [])])
                            for r in self._cur_cellular],
+                # v0.8.3 additive: component RF semantics.
+                'rf_notes': list(cellular.RF_NOTES),
             },
             'swans': swans,
             'traffic_classes': traffic_classes,
@@ -804,8 +924,13 @@ class AnalyzerService(object):
             rule_fps[name] = lr.get('semantic_fingerprint')
         return {
             'topology': normalize.topology_fingerprint(wan_paths),
+            # LEGACY digest (historical wbond_config versions); see the v2
+            # definition for mode + tunnel identity.
             'bonding_membership': normalize.bonding_membership_fingerprint(
                 bonding.get('bonds', [])),
+            'bonding_membership_v2':
+                normalize.bonding_membership_fingerprint_v2(
+                    bonding.get('bonds', [])),
             'logical_rules': normalize._stable_hash(rule_fps),
             'logical_rule_map': rule_fps,
             'traffic_classes': normalize._stable_hash(
@@ -851,7 +976,13 @@ class AnalyzerService(object):
                 config.append('logical_rule_removed:{}'.format(key))
 
         return {'topology': topology, 'config': config,
-                'first_snapshot': False}
+                'first_snapshot': False,
+                # v0.8.3 additive: v2 bond fingerprint (bonding_mode +
+                # tunnel identity), independent of the legacy entry above.
+                'bonding_structure_changed': (
+                    None if prev.get('bonding_membership_v2') is None
+                    else prev.get('bonding_membership_v2') != fingerprints.get(
+                        'bonding_membership_v2'))}
 
     def _collector_health(self):
         """Per-collector health (last-known-good ts, error, error ts).
@@ -1009,6 +1140,44 @@ class AnalyzerService(object):
         if snap is None:
             return None
         return wbond.build(snap, devices, health)
+
+    # --- v0.8.3 telemetry-foundation views (read-only, cached) ----------
+
+    def _view_inputs(self):
+        with self._lock:
+            snap = self._snapshot
+            raw = self._raw()
+            health = dict(self._config_raw.health())
+            health.update(self._runtime_raw.health())
+        return snap, raw, health
+
+    def query_steering(self):
+        snap, raw, health = self._view_inputs()
+        if snap is None:
+            return None
+        return foundation.steering_view(
+            self._config_store, self._defs_tracker, raw, health,
+            snap.get('timestamp'))
+
+    def query_steering_changes(self, raw_query=''):
+        _, raw, _ = self._view_inputs()
+        return foundation.steering_changes_view(
+            self._config_store, self._defs_tracker, raw, raw_query)
+
+    def query_wbond_config(self):
+        snap, raw, health = self._view_inputs()
+        if snap is None:
+            return None
+        wb = wbond.build(snap, raw.get('wan_devices'), health)
+        return foundation.wbond_config_view(
+            self._config_store, raw, wb, snap.get('bonding'), health)
+
+    def query_validity(self):
+        snap, raw, health = self._view_inputs()
+        return foundation.validity_view(
+            health, self._freshness, self._defs_tracker, self._config_store,
+            snap, self._bond_cfg_state,
+            normalize.qoe_config(raw.get('qoe_cfg')))
 
     def query_recording_samples(self, job_id, raw_query=''):
         """One bounded page of a Recording's samples, oldest first."""

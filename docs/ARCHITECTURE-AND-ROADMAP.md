@@ -1,8 +1,9 @@
 # SD-WAN Analyzer: architecture and roadmap
 
-Status of this document: draft for review, on branch
-`feature/sdwan-v0.5.0-analytics-foundation` (baseline commit `56d5b21`, v0.4.4,
-plus the uncommitted v0.5.0 work described below). Source of truth for what
+Status of this document: draft for review. Written for v0.5.0 (baseline
+`56d5b21`); the phase plan, deferred list and open items are maintained through
+v0.8.3 (branch `feature/sdwan-v0.8.3-telemetry-foundation`, baseline
+`f7220cc`). Source of truth for what
 exists is `apps/sdwan_analyzer/readme.md` and the code. This document adds
 structure and states what is **not** built.
 
@@ -35,7 +36,8 @@ collectors.py   normalize.py     storage.py      (new) counters.py      service.
 | Layer | Modules | Responsibility | State |
 |---|---|---|---|
 | Acquisition | `collectors.py` | Read-only NCOS `status/` and `config/` reads with a 15 s wall-clock guard. No business logic | Implemented |
-| Normalization | `normalize.py`, `telemetry.py`, `cellular.py` | Convert raw NCOS shapes to stable records; timestamp envelope; counter and SWANS/QoE/WBOND records | Implemented |
+| Normalization | `normalize.py`, `telemetry.py`, `cellular.py`, (v0.8.3) `steering_defs.py`, `bond_config.py` | Convert raw NCOS shapes to stable records; timestamp envelope; counter and SWANS/QoE/WBOND records; steering definitions and configured bonding | Implemented |
+| Version analysis (v0.8.3) | `steering_changes.py`, `steering_state.py`, `foundation.py` | Definition-difference detection over the config version store; read-only views. No I/O | Implemented |
 | Persistence | `storage.py`, `persistence.py`, `durable.py`, `recording.py` | Bounded in-memory stores, durable segmented JSONL under `tmp/telemetry`, Recording jobs | Implemented |
 | Mathematical analysis | `counters.py` | Pure functions over normalized records. Imports only `math`. No I/O, no `cp`, no storage access, no UI imports. Used by the interface rate API (`/api/analytics/interfaces`, v0.6.0) | Implemented (v0.5.0, wired in v0.6.0) |
 | API | `service.py`, `query.py`, `web.py` | `service` is the only layer the web tier may call. Read-only paginated `/api/history` and Recording samples | Implemented |
@@ -116,6 +118,13 @@ Not built, and not to be implied by any current document or UI:
 - Anomaly scoring and alerting.
 - Drop and error interpretation (counter meaning is documented but not interpreted as loss).
 - QoE packet-loss and WBOND bandwidth-field interpretation (units unproven).
+  v0.8.3 flags QoE sentinel candidates and keeps bandwidth fields raw; it does
+  not interpret either.
+- A persistent application catalog (the approved v0.8.3 design is
+  rule-centric; application/category references are kept only as they appear
+  in definitions and runtime stats).
+- Cross-source correlation analytics and a redesigned recorder.
+- Advanced cellular RF statistics and transition analytics (v0.8.4).
 - Production UI, dashboards, Recording UI, and Recording analysis.
 - SD-WAN overlay source-IP resolution wiring.
 - Device validation catalog for friendly model names.
@@ -146,6 +155,13 @@ Still open:
 | U10 | Counter behaviour on modem reconnect, reboot, or tunnel re-creation | Defines how often `counter_decrease` occurs and what it means | Not observed. Needs a controlled event, outside read-only research |
 | U11 | On-router read latency of `status/wan/devices` | Bounds how far `collected_at` is from the true sampling instant | Not measured. No deployment authorised |
 | U15 | `config_versions` on observations is derived from cached config | A startup with failed config reads versions the partial state (documented v0.4.x behaviour) | Not changed |
+| U16 | Stable logical steering rule identity | Rename vs remove+add cannot be told apart | NCOS 7.26.81 exposes none; rules keyed by name (`logical_name_only`), renames reported as `possible_rename` (never confirmed) |
+| U17 | Configured bond `_id_` to runtime bond interface | Multi-bond sites | No universal mapping verified; single-bond candidate association only |
+| U18 | Criterion weight to runtime `config_weight`/`ds_weight`/`us_weight` | Weight interpretation | Unknown formula (R2400: 100 -> 33/33/33). Values kept separate, raw |
+| U19 | Component SINR between -50 and 50, component RSRP/RSRQ scaling, carrier dedupe of identical SCELL identities | RF accuracy | `sinr_raw` + `ambiguous`; RSRP/RSRQ as reported; collapsed groups flagged `ambiguous` |
+| U20 | Location and meaning of QoE `4294967295` | Loss/latency validity | Not reproduced. Field-aware sentinel-candidate flags only |
+| U21 | Units of WBOND member bandwidth fields | Bandwidth interpretation | Unknown; reported raw as `bandwidth_raw_units_unverified` |
+| U15b | v0.8.3 config objects use only same-pass successful reads | Partially resolves U15 for `steering_rule_defs` and `wan_bonding_config` | Legacy objects unchanged |
 
 ## 6. Phase plan
 
@@ -163,6 +179,8 @@ Still open:
 | v0.8.0 | Current-state topology and relationships, `GET /api/analytics/topology` | Done, see `docs/analytics/topology.md` |
 | v0.8.1 | Read-only WBOND runtime analysis, `GET /api/analytics/wbond` | Done, see `docs/analytics/wbond.md` |
 | v0.8.2 | Stored WBOND observations keep `tunnel_iface` and flow-total provenance (`reported`/`summed`/`unknown`) | Done, see `docs/analytics/wbond.md`. Pre-0.8.2 history is not back-filled. Normal collection intervals are 5, 15, 30 and 60 min; sub-5-min is for short recordings; the 1-minute schedule is temporary testing |
+| v0.8.3 | Telemetry foundation: `steering_rule_defs` (definition-only versioning) and change detection, runtime application matching (`steering_apps`), `wan_bonding_config` with criteria-to-member resolution, component-carrier RF and dedupe evidence, QoE validity flags, `/api/analytics/{steering,steering/changes,wbond_config,validity}`. Fixes: bonding fingerprint v2 (legacy pinned), flow-total `summed` provenance | Implemented, pending live validation on R1900/R2400. See `docs/analytics/telemetry-foundation.md` |
+| v0.8.4 | Advanced RF statistics, cellular transition/event analytics | Approved direction, not built |
 
 ## 7. Failed-read invariant and runtime audit
 

@@ -145,6 +145,10 @@ _DEV_PAGE = """<!DOCTYPE html>
 <li><a href="/api/storage">/api/storage</a> (Storage Inspector: memory counts, app file metadata; generated on demand)</li>
 <li><a href="/api/history">/api/history</a> (durable, paginated: limit, start, end, sample_source, cursor)</li>
 <li><a href="/api/analytics/wbond">/api/analytics/wbond</a> (WBOND runtime analysis, read-only)</li>
+<li><a href="/api/analytics/wbond_config">/api/analytics/wbond_config</a> (configured bonding vs runtime members, read-only)</li>
+<li><a href="/api/analytics/steering">/api/analytics/steering</a> (steering definitions + runtime application matching, read-only)</li>
+<li>/api/analytics/steering/changes (definition versions + differences; limit, before_version)</li>
+<li><a href="/api/analytics/validity">/api/analytics/validity</a> (source validity and freshness)</li>
 <li><a href="/api/analytics/topology">/api/analytics/topology</a> (current WAN / overlay / WBOND relationships, read-only)</li>
 <li>/api/analytics/interfaces?uid=&lt;interface uid&gt; (calculated RX/TX rates, read-only; limit, start, end, max_gap_s, cursor)</li>
 <li><a href="/api/recordings">/api/recordings</a>, <a href="/api/recordings/active">/active</a>, /api/recordings/&lt;id&gt;, /api/recordings/&lt;id&gt;/samples (paginated); POST /api/recordings/start, /api/recordings/&lt;id&gt;/stop (backend-owned, max 30 min)</li>
@@ -248,6 +252,21 @@ def _make_handler(service):
                             {'error': 'snapshot not ready'}, code=503)
                     else:
                         self._send_json(wb)
+                elif path in ('/api/analytics/steering',
+                              '/api/analytics/wbond_config'):
+                    view = (service.query_steering()
+                            if path.endswith('/steering')
+                            else service.query_wbond_config())
+                    if view is None:
+                        self._send_json(
+                            {'error': 'snapshot not ready'}, code=503)
+                    else:
+                        self._send_json(view)
+                elif path == '/api/analytics/steering/changes':
+                    self._send_json(
+                        service.query_steering_changes(raw_query))
+                elif path == '/api/analytics/validity':
+                    self._send_json(service.query_validity())
                 elif path == '/api/analytics/interfaces':
                     self._send_json(service.query_interface_rates(raw_query))
                 elif path == '/api/history':

@@ -376,7 +376,9 @@ def test_dur_config_versions_restart():
             lines = _read_lines(os.path.join(_root(base),
                                              'config_versions.jsonl'))
             names = sorted(r['name'] for r in lines)
-            check(len(lines) == 7 and all(
+            # v0.8.3 adds steering_rule_defs (fixtures carry no configured
+            # bonding, so wan_bonding_config is absent here): 8 objects.
+            check(len(lines) == 8 and 'steering_rule_defs' in names and all(
                 set(r) == {'name', 'version', 'fingerprint', 'ts', 'payload'}
                 for r in lines) and all(r['version'] == 1 for r in lines),
                 'one record per object on first sight: {}'.format(names))
@@ -386,7 +388,7 @@ def test_dur_config_versions_restart():
                   'restart restores versions + fingerprints')
             s2.collect_startup()
             check(len(_read_lines(os.path.join(
-                _root(base), 'config_versions.jsonl'))) == 7 and
+                _root(base), 'config_versions.jsonl'))) == 8 and
                 s2._config_store.summary() == before,
                 'matching post-restart collection reuses the version')
             fc.overrides['identities_intent'] = copy.deepcopy(

@@ -23,6 +23,14 @@ these change over time.
 > nothing in the service, storage or API calls it yet). See `docs/ARCHITECTURE-AND-ROADMAP.md`
 > and `docs/analytics/`.
 
+> **v0.8.3 telemetry foundation.** Versions the effective steering
+> definitions (`steering_rule_defs`) and the configured WAN bonding
+> (`wan_bonding_config`), detects definition differences between observations,
+> records per-rule application matching, keeps component-carrier RF, and flags
+> QoE sentinel candidates. New read-only endpoints are listed below; details in
+> `docs/analytics/telemetry-foundation.md`. Existing endpoints are unchanged
+> (additive fields only).
+
 > **v0.7.0 adds the first web page: Throughput trends.** Open `http://router_ip:<port>`
 > (the port is in the app log and in `sdwan_analyzer_web_port`). The earlier endpoint list is now at `/dev`.
 
@@ -124,10 +132,16 @@ not ready"}` until the first snapshot has been composed.
 - `GET /api/analytics/interfaces` (0.6.0) — calculated interface RX/TX rates; see *Query APIs*.
 - `GET /api/analytics/topology` (0.8.0) — current physical WAN / SD-WAN overlay / WBOND relationships with known state; unverified links are returned as `unresolved`. See `docs/analytics/topology.md`.
 - `GET /api/analytics/wbond` (0.8.1) — read-only WBOND runtime analysis: per-bond state, per-member overlay/physical WAN, configured vs router-reported runtime values, and data freshness. From 0.8.2 it also reports whether each bond flow total was `reported` by NCOS or `summed` from member flows, and stored WBOND history records `tunnel_iface` per member. See `docs/analytics/wbond.md`.
+- `GET /api/analytics/steering` (0.8.3) — current effective steering definitions (compiled children, exact-UUID destination and Traffic Class resolution) with per-rule runtime flow gauges and application matching.
+- `GET /api/analytics/steering/changes` (0.8.3) — `steering_rule_defs` versions and the observed differences between them; `limit` (1-50), `before_version`.
+- `GET /api/analytics/wbond_config` (0.8.3) — configured bonds (static/dynamic mode, selection criteria) resolved against runtime members; configured and runtime weights kept separate.
+- `GET /api/analytics/validity` (0.8.3) — collector health, section freshness and data-validity indicators.
 - `GET /api/recordings/<job_id>/samples` (0.4.4) — paginated Recording
   samples; see *Query APIs*.
 - `POST /api/refresh/<group>` — manual refresh of one group
-  (`traffic_classes`, `steering`, `bonding`, `wan_paths`, `overview`);
+  (`traffic_classes`, `steering`, `bonding`, `wan_paths`, `overview`;
+  from 0.8.3 `steering` also reads the identity/intent/Traffic Class config
+  and `bonding` also reads `config/sdwan_adv/wan_bonding`);
   ~5 s cooldown per group (`429` while cooling down)
 
 > LAN clients reach this port only if a firewall zone-forward rule exists from
@@ -745,7 +759,11 @@ Local, standard-library-only harness (not shipped — excluded via
 `acquisition_tests.py` (acquisition timing, WAN failed-read/recovery, persisted
 records, legacy compatibility), `failed_read_tests.py` (failed-read invariant
 for every runtime section, including persisted history and Recording) and
-`counters_tests.py` (hand-calculated counter math). The suite has been run on CPython 3.8.20 (the cppython
+`counters_tests.py` (hand-calculated counter math), and (v0.8.3)
+`stage_a_tests.py` (bonding fingerprint and flow-total regressions) and
+`foundation_tests.py` (steering definitions/changes, application matching,
+configured bonding, component RF, QoE validity, persistence, new APIs; fixtures
+in `foundation_fixtures.py`, synthetic and sanitized). The suite has been run on CPython 3.8.20 (the cppython
 version) as well as the workstation interpreter.
 
 `tests/fixtures.py` models the validated R1900 scenario (physical Ethernet +
@@ -785,6 +803,11 @@ real hardware (incl. R1900).
 | `status/wan/sdwan` | SD-WAN hub/spoke: `connected_hub`, `links` | Docs; not used for membership; `links` device-dependent |
 | `control/sdwan_adv/user_mode_driver/interface/{info.uid}` → `local_ip`/`remote_ip` | SD-WAN overlay source/gateway (read-only GET) | STA-validated; not in repo docs; needs device validation |
 | `control/sdwan_adv/wan_bonding/interface/{info.uid}` → `local_ip`/`remote_ip` | WBOND overlay source/gateway (read-only GET) | STA-validated; not in repo docs; needs device validation |
+| `status/wan/steering/rules[].xpolicy` | Effective steering definitions (`steering_rule_defs`) | Verified on R1900 + R2400, NCOS 7.26.81 |
+| `status/wan/steering/stats.rules[].apps` | Runtime application matching; key == `config/identities/ip[].name` | Verified, NCOS 7.26.81 |
+| `config/identities/ip`, `config/identities/intent`, `config/sdwan_adv/traffic_class` | Exact-UUID destination and Traffic Class resolution | Verified, NCOS 7.26.81 |
+| `config/sdwan_adv/wan_bonding` | Configured bonds: `dynamic_weight`, selection criteria (`wan_bonding_config`) | Verified, NCOS 7.26.81 |
+| `config/sdwan_adv/qoe` → `pkt_loss_cnt.enabled` | QoE config context | Verified, NCOS 7.26.81 |
 
 Identity note (from STA): `info.uid` is the control-plane/routing identity
 for overlays; the WAN object key (e.g. `wbond-wbond0_hub0`) is the
@@ -849,7 +872,13 @@ mocks. They still require on-device confirmation (see below).
 ## Fields intentionally left raw (semantics not yet proven)
 
 - **SD-WAN QoE** loss/units and any non-latency fields — carried under
-  `qoe.paths[].raw`; only clear latency samples are normalized.
+  `qoe.paths[].pkt_loss_stats_raw`; only clear latency samples are normalized.
+  From 0.8.3 latency sentinel candidates (4294967295) are withheld and flagged,
+  never interpreted.
+- **WBOND bandwidth fields** and the criterion-weight to runtime-weight
+  relationship — reported raw; units and formula unverified.
+- **Component SINR between -50 and 50** — kept as `sinr_raw` with
+  `sinr_scale: ambiguous`.
 - **SWANS** extra fields beyond latency/jitter — carried under
   `swans.paths[].raw`.
 - **Loadbalancer** algorithm-specific fields — normalized where known

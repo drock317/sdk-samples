@@ -1041,8 +1041,9 @@ def test_cellular_ca_parsing():
     check((rec['rsrp'], rec['rsrq'], rec['sinr']) == (-90, -11, 10) and
           (rec['rsrp_5g'], rec['rsrq_5g'], rec['sinr_5g']) == (-95, -12, 8),
           'LTE and 5G signal fields')
+    # v0.8.3: the legacy fields are unchanged; `rf` is additive.
     check(set(rec['carriers'][0]) == {'role', 'rat', 'band', 'bandwidth_mhz',
-                                      'channel', 'pci', 'active'},
+                                      'channel', 'pci', 'active', 'rf'},
           'carrier entry fields')
     check(rec['timestamp_source'] == 'collector' and rec['metric_ts'] == 50
           and rec['collected_ts'] == 60, 'timestamp envelope')
@@ -1274,12 +1275,15 @@ def test_manual_refresh_targeted():
         check(svc.refresh('steering')['ok'], 'cooldown is per group')
         check(set(fc.calls[-1]) == {'steering_rules', 'steering_events',
                                     'steering_stats', 'steering_intents',
-                                    'identities_ip'}, 'steering group keys')
+                                    'identities_ip', 'identities_intent',
+                                    'traffic_class_config'},
+              'steering group keys (v0.8.3: + identity/intent/TC deps)')
         clock.t += 6
         check(svc.refresh('traffic_classes')['ok'], 'allowed after cooldown')
         svc.refresh('bonding')
-        check(set(fc.calls[-1]) == {'wan_devices', 'wan_bonding'},
-              'bonding group keys')
+        check(set(fc.calls[-1]) == {'wan_devices', 'wan_bonding',
+                                    'wan_bonding_cfg'},
+              'bonding group keys (v0.8.3: + configured bonding)')
         svc.refresh('wan_paths')
         check({'wan_devices', 'primary_device', 'swans', 'qoe'} ==
               set(fc.calls[-1]), 'wan_paths group keys')
@@ -2252,7 +2256,7 @@ def test_cellular_current_state_api():
               m['sinr_5g'] == 32.0, 'RF values numeric in current state')
         check(m['carriers'] and all(
             set(c) == {'role', 'rat', 'band', 'bandwidth_mhz', 'channel',
-                       'pci', 'active'} for c in m['carriers']),
+                       'pci', 'active', 'rf'} for c in m['carriers']),
             'carrier entries carry the expected fields only')
         check(m['cell_key_hash'] and len(m['cell_key_hash']) == 16,
               'hashed cell key present')
@@ -2943,6 +2947,12 @@ def main():
     import primary_config_tests
     primary_config_tests.bind(check)
     tests = tests + primary_config_tests.TESTS
+    import stage_a_tests
+    stage_a_tests.bind(check)
+    tests = tests + stage_a_tests.TESTS
+    import foundation_tests
+    foundation_tests.bind(check, _free_port)
+    tests = tests + foundation_tests.TESTS
     for t in tests:
         t()
     print('')

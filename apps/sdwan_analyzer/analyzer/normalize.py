@@ -571,15 +571,75 @@ def qoe_paths(raw_qoe):
         if lat_last is None:
             lat_last = _num(_first_present(
                 obj, ('latency_last', 'last_latency')))
+        avg_v, avg_state = qoe_latency_validity(lat_avg)
+        last_v, last_state = qoe_latency_validity(lat_last)
+        loss_raw = obj.get('pkt-loss-stats')
         paths.append({
             'uid': str(key),
-            'latency_avg_ms': lat_avg,
-            'latency_last_ms': lat_last,
+            # v0.8.3: a sentinel CANDIDATE is withheld (null) from the ms
+            # fields; the reported value stays in *_raw.
+            'latency_avg_ms': avg_v,
+            'latency_last_ms': last_v,
             # pkt-loss-stats semantics/units unproven -> keep raw only.
-            'pkt_loss_stats_raw': obj.get('pkt-loss-stats'),
+            'pkt_loss_stats_raw': loss_raw,
+            'latency_avg_raw': lat_avg,
+            'latency_last_raw': lat_last,
+            'validity': {'latency_avg': avg_state,
+                         'latency_last': last_state},
+            'pkt_loss_sentinel_candidates': _count_sentinels(loss_raw),
         })
 
     return {'paths': paths}
+
+
+# Values that look like an unset unsigned counter. The NCOS meaning of
+# 4294967295 in QoE is NOT verified (Phase 1A could not reproduce it), so
+# these are only "sentinel candidates": withheld from derived fields, kept
+# raw, counted. Never used to compute anything.
+QOE_SENTINEL_CANDIDATES = (4294967295, 18446744073709551615)
+# A latency in ms above this is not a plausible measurement.
+_QOE_LATENCY_MAX_MS = 600000
+
+
+def qoe_latency_validity(value):
+    """(usable value or None, state) for one QoE latency field.
+
+    state: valid | missing | sentinel_candidate | implausible.
+    """
+    if value is None:
+        return None, 'missing'
+    if value in QOE_SENTINEL_CANDIDATES:
+        return None, 'sentinel_candidate'
+    if value < 0 or value > _QOE_LATENCY_MAX_MS:
+        return None, 'implausible'
+    return value, 'valid'
+
+
+def _count_sentinels(obj, depth=0):
+    """Count sentinel-candidate integers in a small nested raw object."""
+    if depth > 3 or isinstance(obj, bool):
+        return 0
+    if isinstance(obj, (int, float)):
+        return 1 if obj in QOE_SENTINEL_CANDIDATES else 0
+    if isinstance(obj, dict):
+        return sum(_count_sentinels(v, depth + 1) for v in obj.values())
+    if isinstance(obj, list):
+        return sum(_count_sentinels(v, depth + 1) for v in obj[:64])
+    return 0
+
+
+def qoe_config(raw_qoe_cfg):
+    """config/sdwan_adv/qoe -> {'state', 'pkt_loss_cnt_enabled'}.
+
+    Only pkt_loss_cnt.enabled is verified (Phase 1A, NCOS 7.26.81).
+    """
+    raw = raw_qoe_cfg if isinstance(raw_qoe_cfg, dict) else None
+    if raw is None:
+        return {'state': 'unavailable', 'pkt_loss_cnt_enabled': None}
+    plc = raw.get('pkt_loss_cnt')
+    en = plc.get('enabled') if isinstance(plc, dict) else None
+    return {'state': 'ok',
+            'pkt_loss_cnt_enabled': en if isinstance(en, bool) else None}
 
 
 # =========================================================================
@@ -960,15 +1020,21 @@ def wan_bonding_detail(raw_wan_bonding):
             obj, ('DL total flows', 'total_download_flows')))
         reported_ul = _num(_first_present(
             obj, ('UL total flows', 'total_upload_flows')))
-        # Provenance of each bond total, decided by the same fallback below.
+        # A total is `summed` only when at least one member reported a
+        # numeric flow value; members that exist but reported nothing give
+        # `unknown`. Each direction is decided independently.
+        has_dl = any(isinstance(m.get('download_flows'), (int, float))
+                     for m in members)
+        has_ul = any(isinstance(m.get('upload_flows'), (int, float))
+                     for m in members)
         if reported_dl is not None:
             dl_source = 'reported'
         else:
-            dl_source = 'summed' if members else 'unknown'
+            dl_source = 'summed' if has_dl else 'unknown'
         if reported_ul is not None:
             ul_source = 'reported'
         else:
-            ul_source = 'summed' if members else 'unknown'
+            ul_source = 'summed' if has_ul else 'unknown'
         bonds.append({
             'present': True,
             'iface': str(key),
@@ -980,13 +1046,13 @@ def wan_bonding_detail(raw_wan_bonding):
             'member_count': _num(_first_present(
                 obj, ('Total interfaces',))) or len(members),
             'total_download_flows': (reported_dl if reported_dl is not None
-                                     else (summed_dl if members else None)),
+                                     else (summed_dl if has_dl else None)),
             'total_upload_flows': (reported_ul if reported_ul is not None
-                                   else (summed_ul if members else None)),
+                                   else (summed_ul if has_ul else None)),
             'total_download_flows_source': dl_source,
             'total_upload_flows_source': ul_source,
-            'computed_download_flows': summed_dl if members else None,
-            'computed_upload_flows': summed_ul if members else None,
+            'computed_download_flows': summed_dl if has_dl else None,
+            'computed_upload_flows': summed_ul if has_ul else None,
             'negotiated_capabilities': _cap_list(
                 obj.get('negotiated_capabilities')),
             'supported_capabilities': supported,
@@ -1924,19 +1990,29 @@ def topology_fingerprint(wan_path_records):
 
 
 def bonding_membership_fingerprint(bonds):
-    """Stable fingerprint of bond membership + configured weights.
+    """LEGACY (v0.2+) fingerprint of bond membership + configured weights.
+
+    Kept byte-for-byte compatible for historical `wbond_config` versions.
+    Known limitations, deliberately preserved: it reads the key `mode`, which
+    normalized bonds never carry (the field is `bonding_mode`), so the mode
+    is always empty here; and it ignores tunnel identity. Use
+    bonding_membership_fingerprint_v2 for change analysis. The only change
+    since v0.2 is that a TypeError from sorting mixed None/number weights
+    falls back to a deterministic order instead of raising.
 
     Configured weight is part of the CONFIG fingerprint; runtime directional
-    weights and flow counts are intentionally EXCLUDED (those are runtime
-    changes, tracked separately).
+    weights and flow counts are intentionally EXCLUDED.
     """
     items = []
     for b in (bonds or []):
         if not isinstance(b, dict):
             continue
-        members = sorted(
-            (_s(m.get('member_uid')), m.get('configured_weight'))
-            for m in b.get('members', []) if isinstance(m, dict))
+        raw = [(_s(m.get('member_uid')), m.get('configured_weight'))
+               for m in b.get('members', []) if isinstance(m, dict)]
+        try:
+            members = sorted(raw)
+        except TypeError:
+            members = sorted(raw, key=lambda t: (t[0], repr(t[1])))
         items.append({
             'iface': _s(b.get('iface')),
             'name': _s(b.get('name')),
@@ -1945,3 +2021,49 @@ def bonding_membership_fingerprint(bonds):
         })
     items.sort(key=lambda x: x['iface'])
     return _stable_hash(items)
+
+
+BOND_FP_VERSION = 2
+
+
+def _weight_key(w):
+    """Total order over None / bool / numbers / other: never raises."""
+    if w is None:
+        return (2, 0, '')
+    if isinstance(w, bool):
+        return (1, int(w), 'bool')
+    if isinstance(w, (int, float)):
+        return (0, w, '')
+    return (3, 0, repr(w))
+
+
+def bonding_membership_fingerprint_v2(bonds):
+    """Versioned (v2) fingerprint of the observed bond structure.
+
+    Differences from the legacy function: it reads `bonding_mode`, includes
+    each member's tunnel interface (so a member moving to a different tunnel
+    is a change), and sorts deterministically with missing/mixed weights.
+    A missing weight (None) is distinct from a zero weight. Runtime weights
+    and flow gauges are excluded. The payload carries its own version tag, so
+    its digests can never collide with legacy digests by construction.
+    """
+    items = []
+    for b in (bonds or []):
+        if not isinstance(b, dict):
+            continue
+        members = []
+        for m in b.get('members', []):
+            if not isinstance(m, dict):
+                continue
+            members.append((_s(m.get('tunnel_iface')),
+                            _s(m.get('member_uid')),
+                            _weight_key(m.get('configured_weight'))))
+        members.sort()
+        items.append({
+            'iface': _s(b.get('iface')),
+            'name': _s(b.get('name')),
+            'bonding_mode': _s(b.get('bonding_mode')),
+            'members': [list(t[:2]) + [list(t[2])] for t in members],
+        })
+    items.sort(key=lambda x: (x['iface'], x['name']))
+    return _stable_hash({'fp_version': BOND_FP_VERSION, 'bonds': items})

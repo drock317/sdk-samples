@@ -68,9 +68,13 @@ case as unresolved instead.
 
 ## Known limitations
 
-- **Configured WBOND membership is not collected.** Membership is the runtime
-  `members_list`. `config.membership.state` is `not_collected`. No configuration
-  path for it has been verified.
+- **Configured WBOND membership is not part of this view.** Membership is the
+  runtime `members_list`. `config.membership.state` stays `not_collected` for
+  compatibility. From v0.8.3 the configured bonding *selection criteria*
+  (`config/sdwan_adv/wan_bonding`, verified on NCOS 7.26.81) are reported by
+  `/api/analytics/wbond_config`. They are criteria, not a member list, and no
+  universal configured-bond to runtime-bond mapping is verified (see
+  `telemetry-foundation.md`).
 - Member and overlay state (`UP`, `connected`, `ATTACHED`) is observed state. It
   does not show that traffic is carried, or that the path is healthy.
 - A WBOND member's physical WAN comes from NCOS-reported `intf name`. If the

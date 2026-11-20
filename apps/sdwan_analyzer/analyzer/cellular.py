@@ -296,6 +296,16 @@ def _dedupe_active_carriers(carriers):
 
 
 def _parse_active_carriers(diagnostics):
+    """Deduplicated active carriers (unchanged behavior).
+
+    v0.8.3 split: the collection half is _collect_carriers() so the
+    pre-dedupe source entries can be reported as evidence. The combination
+    is identical to the copied original.
+    """
+    return _dedupe_active_carriers(_collect_carriers(diagnostics))
+
+
+def _collect_carriers(diagnostics):
     """Parse all active serving carriers from modem diagnostics.
 
     Discovers carriers from all known field families without
@@ -484,9 +494,9 @@ def _parse_active_carriers(diagnostics):
             pci=None
         ))
 
-    # --- Deduplication ---
+    # --- Deduplication (applied by _parse_active_carriers) ---
     # Multiple NCOS schemas may expose the same physical serving carrier.
-    return _dedupe_active_carriers(carriers)
+    return carriers
 
 
 def _determine_service_mode(diagnostics):
@@ -669,15 +679,214 @@ def ca_signature(carriers):
     return '|'.join(sorted(items))
 
 
+# --- v0.8.3: component-carrier RF, dedupe evidence, modem/SIM context ------
+#
+# Component-carrier RF comes ONLY from the indexed component families
+# (<METRIC>_5G_PCELL, <METRIC>_5G_SCELL<n>). The `_5G_` in those names is a
+# schema family, not proof of NR: RAT is taken from the band text. Serving-
+# level RSRP/RSRQ/SINR (RSRP, SINR, RSRP_5G, ...) stay on the modem record
+# and are never copied into a component carrier.
+
+SINR_TENTHS_ABOVE = 50       # |raw| above this cannot be a dB value
+SCALE_TENTHS = 'tenths_db_plausibility'
+SCALE_AMBIGUOUS = 'ambiguous'
+MAX_COLLAPSED_GROUPS = 8
+
+RF_NOTES = (
+    'Component RF is read from indexed PCELL/SCELL fields only; serving-'
+    'level RSRP/RSRQ/SINR stay on the modem record.',
+    'Component SINR above 50 in magnitude is treated as tenths of a dB '
+    '(plausibility, consistent with Speedtest Analyzer and Phase 1A '
+    'observations). Smaller values are ambiguous: sinr is null and sinr_raw '
+    'is kept.',
+    'Component RSRP/RSRQ are stored as reported; their scaling is not '
+    'verified.',
+    'Zero RF values on inactive or 0 MHz component entries are treated as '
+    'placeholders (null).',
+)
+
+
+def _comp_val(diagnostics, key):
+    v = diagnostics.get(key)
+    if isinstance(v, str) and v.strip().lower() in _EMPTY:
+        return None
+    return rf_number(v)
+
+
+def _component_entries(diagnostics):
+    """Indexed component entries with raw RF: [{role, identity, rf}]."""
+    out = []
+    roles = []
+    if _present(diagnostics.get('BAND_5G_PCELL')):
+        roles.append(('pcell', '_5G_PCELL'))
+    idx = set()
+    for k in diagnostics:
+        m = re.match(r'^BAND_5G_SCELL(\d+)$', str(k).upper())
+        if m:
+            idx.add(int(m.group(1)))
+    for i in sorted(idx):
+        roles.append(('scell{}'.format(i), '_5G_SCELL{}'.format(i)))
+    for role, suf in roles:
+        band = diagnostics.get('BAND' + suf)
+        rat, _ = _parse_band_name(band)
+        if not rat:
+            continue
+        bw = _parse_bandwidth_value(diagnostics.get('BANDWIDTH' + suf))
+        act = diagnostics.get('ACTIVE' + suf)
+        active = (True if act is None else
+                  str(act).strip().lower() in ('active', '1', 'true', 'yes'))
+        ch = diagnostics.get('CHANNEL' + suf)
+        ch = str(ch).strip() if _present(ch) else None
+        out.append({
+            'role': role,
+            'identity': _carrier_identity({'rat': rat, 'band': band,
+                                           'channel': ch,
+                                           'bandwidth_mhz': bw}),
+            'active': active,
+            'bandwidth_mhz': bw,
+            'raw': {'rsrp': _comp_val(diagnostics, 'RSRP' + suf),
+                    'rsrq': _comp_val(diagnostics, 'RSRQ' + suf),
+                    'sinr': _comp_val(diagnostics, 'SINR' + suf)},
+        })
+    return out
+
+
+def component_rf(entry):
+    """Validated RF block for one component entry, or None if none present.
+
+    validity per metric: valid | missing | placeholder_zero.
+    """
+    raw = entry['raw']
+    if all(v is None for v in raw.values()):
+        return None
+    placeholder_ctx = (not entry['active']) or entry['bandwidth_mhz'] == 0
+    out, validity = {}, {}
+    for f in ('rsrp', 'rsrq', 'sinr'):
+        v = raw[f]
+        if v is None:
+            validity[f] = 'missing'
+            out[f] = None
+        elif v == 0 and placeholder_ctx:
+            validity[f] = 'placeholder_zero'
+            out[f] = None
+        else:
+            validity[f] = 'valid'
+            out[f] = v
+    sinr_raw = raw['sinr']
+    scale = None
+    if out['sinr'] is not None:
+        if abs(sinr_raw) > SINR_TENTHS_ABOVE:
+            out['sinr'] = round(sinr_raw / 10.0, 1)
+            scale = SCALE_TENTHS
+        else:
+            out['sinr'] = None
+            scale = SCALE_AMBIGUOUS
+            validity['sinr'] = 'ambiguous_scale'
+    out['sinr_raw'] = sinr_raw
+    out['sinr_scale'] = scale
+    out['validity'] = validity
+    return out
+
+
+def _attach_component_rf(carriers, entries):
+    """rf for each deduped carrier from the component entry with the same
+    role AND identity; None (not copied from serving level) otherwise."""
+    by = {}
+    for e in entries:
+        by.setdefault((e['role'], e['identity']), e)
+    out = []
+    for c in carriers:
+        e = by.get((c.get('role'), _carrier_identity(c)))
+        out.append(component_rf(e) if e is not None else None)
+    return out
+
+
+def carrier_evidence(source_carriers, deduped):
+    """How the reported source entries collapsed into deduped carriers."""
+    active = [c for c in source_carriers if c.get('active')]
+    groups = {}
+    for c in active:
+        ident = _carrier_identity(c)
+        if ident[2] is None:
+            continue
+        groups.setdefault(ident, []).append(str(c.get('role') or ''))
+    collapsed = []
+    for ident, roles in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        if len(roles) < 2:
+            continue
+        indexed = sorted({r for r in roles
+                          if r == 'pcell' or r.startswith('scell')
+                          or r.startswith('lte_scell')})
+        collapsed.append({
+            'identity': '{}:{}:{}:{}'.format(
+                ident[0], ident[1], ident[2],
+                '' if ident[3] is None else ident[3]),
+            'roles': sorted(roles),
+            # Two different indexed component entries with an identical
+            # identity are not explained by schema duplication.
+            'ambiguous': len([r for r in indexed if r != 'pcell']) >= 2,
+        })
+    return {
+        'source_entry_count': len(source_carriers),
+        'active_source_entry_count': len(active),
+        'deduplicated_count': len(deduped),
+        'collapsed_duplicate_count': max(0, len(active) - len(deduped)),
+        'channelless_count': sum(1 for c in deduped
+                                 if _carrier_identity(c)[2] is None),
+        'ambiguous_identity_count': sum(1 for g in collapsed
+                                        if g['ambiguous']),
+        'collapsed_groups': collapsed[:MAX_COLLAPSED_GROUPS],
+        'collapsed_groups_truncated': len(collapsed) > MAX_COLLAPSED_GROUPS,
+    }
+
+
+def modem_context(diagnostics, info=None, status=None):
+    """Non-sensitive modem/SIM context. Never IMEI/IMSI/ICCID/MDN/serials.
+
+    sim_present is derived from NOSIM only (documented: 'TRUE' for an empty
+    slot); the ICCID value is never read. roaming_state is 'home' only for
+    the documented ROAM == '1', otherwise 'unverified' with the raw code.
+    """
+    info = info if isinstance(info, dict) else {}
+    status = status if isinstance(status, dict) else {}
+    nosim = diagnostics.get('NOSIM')
+    roam = diagnostics.get('ROAM')
+    roam_s = str(roam).strip() if _present(roam) else None
+    sim = str(info.get('sim') or '').strip().lower()
+    return {
+        'connection_state': (str(status.get('connection_state')).strip()
+                             if _present(status.get('connection_state'))
+                             else None),
+        'sim_slot': sim if sim in ('sim1', 'sim2') else None,
+        'sim_present': (False if str(nosim).strip().upper() == 'TRUE'
+                        else None),
+        'module_port': (str(info.get('port')).strip()
+                        if _present(info.get('port')) else None),
+        'wan_profile_id': (str(info.get('config_id')).strip()
+                           if _present(info.get('config_id')) else None),
+        'carrier_label': (_diag(diagnostics, 'carrier')
+                          or (diagnostics.get('HOMECARRID')
+                              if _present(diagnostics.get('HOMECARRID'))
+                              else None)),
+        'roaming_code': roam_s,
+        'roaming_state': (None if roam_s is None else
+                          ('home' if roam_s == '1' else 'unverified')),
+    }
+
+
 def normalize_cellular(uid, diagnostics, metric_ts, collected_ts,
-                       timestamp_source='collector'):
+                       timestamp_source='collector', info=None, status=None):
     """Normalize one cellular WAN's diagnostics into a telemetry record.
 
-    Returns None for a missing/non-dict diagnostics object.
+    Returns None for a missing/non-dict diagnostics object. `info` and
+    `status` (status/wan/devices/<uid>/info, /status) add the v0.8.3 safe
+    context block when given.
     """
     if not isinstance(diagnostics, dict) or not diagnostics:
         return None
-    carriers = _parse_active_carriers(diagnostics)
+    source = _collect_carriers(diagnostics)
+    carriers = _dedupe_active_carriers(source)
+    rf = _attach_component_rf(carriers, _component_entries(diagnostics))
     service_mode = _determine_service_mode(diagnostics)
     summary = _build_carrier_summary(carriers)
     sa = service_mode == '5G SA'
@@ -727,7 +936,11 @@ def normalize_cellular(uid, diagnostics, metric_ts, collected_ts,
             'channel': c.get('channel'),
             'pci': c.get('pci'),
             'active': c.get('active'),
-        } for c in carriers],
+            # v0.8.3 additive: component RF (None = no component RF).
+            'rf': rf[i],
+        } for i, c in enumerate(carriers)],
+        'carrier_evidence': carrier_evidence(source, carriers),
+        'context': modem_context(diagnostics, info, status),
         'ca_signature': ca_signature(carriers),
         'cell_key_hash': cell_key_hash(carrier, service_mode, cell_id, pci,
                                        band),

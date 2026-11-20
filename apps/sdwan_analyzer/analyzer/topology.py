@@ -40,9 +40,10 @@ NOTES = (
     'Physical, sdwan and wbond counters and rates are different layers of '
     'the same traffic and are not additive; no cross-class totals are '
     'computed.',
-    'WBOND membership is the runtime members_list reported by '
-    'status/sdwan_adv/wan_bonding. A configured bond membership source is '
-    'not collected, so configured membership is not_collected.',
+    'WBOND membership here is the runtime members_list reported by '
+    'status/sdwan_adv/wan_bonding. Configured bonding selection criteria '
+    '(config/sdwan_adv/wan_bonding, v0.8.3) are reported separately by '
+    '/api/analytics/wbond_config; they are criteria, not members.',
     'A member or tunnel reported UP/connected is not evidence that it is '
     'carrying traffic or that the path is healthy.',
     'No bandwidth utilization or bonding efficiency is calculated.',

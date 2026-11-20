@@ -172,7 +172,7 @@ def cellular_records(raw_devices, collected_ts):
             continue
         rec = cellular.normalize_cellular(
             uid, dev.get('diagnostics'), collected_ts, collected_ts,
-            SRC_COLLECTOR)
+            SRC_COLLECTOR, info=dev.get('info'), status=dev.get('status'))
         if rec is not None:
             out.append(rec)
     return out
@@ -224,6 +224,16 @@ def qoe_records(raw_qoe, collected_ts):
                'latency_avg_ms': p.get('latency_avg_ms'),
                'latency_last_ms': p.get('latency_last_ms'),
                'pkt_loss_stats_raw': p.get('pkt_loss_stats_raw')}
+        # v0.8.3 additive validity: only present when something is not a
+        # plain valid value, so ordinary records do not grow.
+        val = p.get('validity') or {}
+        if any(v != 'valid' for v in val.values()) or p.get(
+                'pkt_loss_sentinel_candidates'):
+            rec['validity'] = val
+            rec['latency_avg_raw'] = p.get('latency_avg_raw')
+            rec['latency_last_raw'] = p.get('latency_last_raw')
+            rec['pkt_loss_sentinel_candidates'] = p.get(
+                'pkt_loss_sentinel_candidates')
         rec.update(envelope(collected_ts))
         out.append(rec)
     return out
@@ -290,6 +300,37 @@ def steering_runtime(logical_rules, collected_ts):
     return out
 
 
+MAX_DEST_PER_EVENT = 10
+MAX_DEST_KEYS = 8
+_MAX_STR = 64
+
+
+def _compact_destinations(dests):
+    """Bounded scalar-only copy of an event's destinations[].
+
+    The inner key names of destinations[] (application/category labels and
+    moved-flow counts) are carried as NCOS reports them: only scalar values
+    are kept, strings are truncated, and the list and each entry are capped.
+    No key names are assumed.
+    """
+    out = []
+    if not isinstance(dests, list):
+        return out
+    for d in dests[:MAX_DEST_PER_EVENT]:
+        if isinstance(d, dict):
+            c = {}
+            for k in list(d)[:MAX_DEST_KEYS]:
+                v = d[k]
+                if isinstance(v, str):
+                    c[str(k)] = v[:_MAX_STR]
+                elif v is None or isinstance(v, (bool, int, float)):
+                    c[str(k)] = v
+            out.append(c)
+        elif isinstance(d, str):
+            out.append(d[:_MAX_STR])
+    return out
+
+
 def steering_new_events(events, seen, collected_ts):
     """Unseen steering events; dedupe key includes the exact event epoch."""
     out = []
@@ -303,6 +344,129 @@ def steering_new_events(events, seen, collected_ts):
         rec = {k: ev.get(k) for k in (
             'steering_rule', 'reason', 'wan_from_uid', 'wan_to_uid',
             'wan_from', 'wan_to', 'total_flows_moved')}
+        # v0.8.3 (additive): which destinations the moved flows belonged to.
+        dests = _compact_destinations(ev.get('destinations'))
+        if dests:
+            rec['destinations'] = dests
+        if isinstance(ev.get('destinations'), list) and len(
+                ev['destinations']) > MAX_DEST_PER_EVENT:
+            rec['destinations_truncated'] = True
         rec.update(envelope(collected_ts, metric_ts=ev.get('epoch')))
         out.append(rec)
     return out
+
+
+def steering_events_meta(raw_events, prev_began=None):
+    """Capture metadata of status/wan/steering/events (additive v0.8.3).
+
+    `capture_restarted` is True/False only when a previous began_capture is
+    known to compare against, else None. A restart is a new measurement
+    epoch, never a rule deletion.
+    """
+    raw = raw_events if isinstance(raw_events, dict) else None
+    if raw is None:
+        return {'source_state': 'unavailable'}
+    began = normalize._num(raw.get('began_capture'))
+    return {
+        'source_state': 'ok',
+        'began_capture': began,
+        'total_perf_events': normalize._num(raw.get('total_perf_events')),
+        'event_overflow': raw.get('event_overflow'),
+        'capture_restarted': (None if prev_began is None or began is None
+                              else began != prev_began),
+    }
+
+
+# --- Steering runtime: per-rule application matching (v0.8.3) --------------
+
+# Bounds keep one record far below the 256 KiB history line limit even at
+# the Recording steering cadence (10 s). Worst case ~40 KB; typical < 2 KB.
+MAX_STATS_RULES = 50
+MAX_APPS_PER_RULE = 16
+MAX_APPS_TOTAL = 200
+
+
+def _flow_state(v):
+    return 'missing' if v is None else 'value'
+
+
+def steering_apps_record(raw_stats, defs_version=None, prev_began=None):
+    """Compact application-level matching from status/wan/steering/stats.
+
+    preferred/nonpreferred flows are GAUGES (current flow populations), never
+    cumulative counters. A null flow value means NCOS did not report it; a
+    zero is a valid reported zero. Applications with no match and no flows
+    are counted in `apps_omitted` rather than listed, so records stay
+    bounded; the full per-rule app total is `apps_total`.
+
+    source_state: ok | empty (read succeeded, zero rules) | unavailable
+    (read succeeded but no stats object). A failed read never reaches here
+    (the section is omitted and the failure is in collector_errors).
+    `defs_version` is the steering_rule_defs revision in force.
+    """
+    raw = raw_stats if isinstance(raw_stats, dict) else None
+    if raw is None or not isinstance(raw.get('rules'), list):
+        return {'source_state': 'unavailable', 'defs_version': defs_version,
+                'rules': []}
+    began = normalize._num(raw.get('began_capture'))
+    rules = []
+    listed_total = 0
+    for r in raw['rules'][:MAX_STATS_RULES]:
+        if not isinstance(r, dict):
+            continue
+        name = normalize._s(r.get('steering_rule')) or None
+        apps, total, omitted = [], 0, 0
+        for key, a in normalize._as_entries(r.get('apps')):
+            if not isinstance(a, dict):
+                continue
+            total += 1
+            pf = normalize._num(a.get('preferred_flows'))
+            nf = normalize._num(a.get('nonpreferred_flows'))
+            matched = a.get('was_flow_matched')
+            active = (matched is True or (pf or 0) > 0 or (nf or 0) > 0
+                      or pf is None or nf is None)
+            if not active:
+                omitted += 1
+                continue
+            if (len(apps) >= MAX_APPS_PER_RULE
+                    or listed_total >= MAX_APPS_TOTAL):
+                omitted += 1
+                continue
+            listed_total += 1
+            apps.append({
+                'id': str(key),
+                'appname': normalize._s(a.get('appname')) or None,
+                'catname': normalize._s(a.get('catname')) or None,
+                'preferred_flows': pf,
+                'nonpreferred_flows': nf,
+                'matched': matched if isinstance(matched, bool) else None,
+            })
+        pf = normalize._num(r.get('preferred_flows'))
+        nf = normalize._num(r.get('nonpreferred_flows'))
+        rules.append({
+            'rule': name,
+            'rule_key': (normalize.logical_rule_name(name).lower()
+                         if name else None),
+            'preferred_flows': pf,
+            'nonpreferred_flows': nf,
+            'preferred_flows_state': _flow_state(pf),
+            'nonpreferred_flows_state': _flow_state(nf),
+            'was_flow_matched': (r.get('was_flow_matched') if isinstance(
+                r.get('was_flow_matched'), bool) else None),
+            'total_perf_events': normalize._num(r.get('total_perf_events')),
+            'apps_total': total,
+            'apps_omitted': omitted,
+            'apps': apps,
+        })
+    return {
+        'source_state': 'ok' if rules else 'empty',
+        'defs_version': defs_version,
+        'began_capture': began,
+        'capture_restarted': (None if prev_began is None or began is None
+                              else began != prev_began),
+        'flows_truncated': (raw.get('flows_truncated') if isinstance(
+            raw.get('flows_truncated'), bool) else None),
+        'rules_truncated': len(raw['rules']) > MAX_STATS_RULES,
+        'flow_values': 'gauge',
+        'rules': rules,
+    }

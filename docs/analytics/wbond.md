@@ -22,7 +22,9 @@ Each member: `tunnel_iface`, `overlay`, `physical` (each `resolved` with a
 `basis`, or `unresolved` with a `reason`), `physical_display_name`,
 `underlay_consistency`, and two separate blocks:
 
-- `config.configured_weight`
+- `config.configured_weight` (legacy name: the value is the runtime
+  `members_list[].config_weight`, not configuration; from v0.8.3 the same
+  value is also `observed.runtime_config_weight`)
 - `observed`: `link_state`, `link_attach_state`, `current_download_weight`,
   `current_upload_weight`, `download_flows`, `upload_flows`, `loss_indicator`
 
@@ -42,8 +44,9 @@ as last successfully read.
 - `loss_indicator` is the raw `has_loss` value, not a packet-loss percentage.
 - A measurement the router did not report is `null`, never `0`.
 - Counters and flow counts of different layers are not additive.
-- Configured WBOND membership is not collected; membership is the runtime list.
-- Configured WBOND membership is not collected; membership is the runtime list.
+- Membership here is the runtime list. Configured bonding selection criteria
+  (v0.8.3) are criteria, not members; they are reported by
+  `/api/analytics/wbond_config` (see `telemetry-foundation.md`).
 
 ## History integrity fields (v0.8.2)
 Two fields are added to each newly stored WBOND observation (`telemetry.wbond_runtime`).
@@ -67,8 +70,8 @@ one value per direction, decided by the existing normalization fallback
 | Value | Meaning |
 |---|---|
 | `reported` | NCOS supplied the total (`DL total flows` / `UL total flows`). A reported `0` is still `reported`. |
-| `summed` | NCOS did not supply it, so it is the sum of member flow counts. |
-| `unknown` | Provenance cannot be established: no reported total and no members to sum (the total is `null`), or the input had no provenance. |
+| `summed` | NCOS did not supply it, so it is the sum of member flow counts. From v0.8.3 this requires at least one numeric member flow in that direction. |
+| `unknown` | Provenance cannot be established: no reported total and no numeric member flow to sum (the total is `null`), or the input had no provenance. Before v0.8.3, members that existed but reported no flow values were labelled `summed` with a total of 0; that history is not rewritten. |
 The two directions are independent; one can be `reported` and the other `summed`.
 The same two fields appear in `observed` of `/api/analytics/wbond`, for the live
 snapshot.

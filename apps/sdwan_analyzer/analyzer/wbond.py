@@ -33,6 +33,10 @@ NOTES = (
     'not a packet-loss percentage.',
     'No bandwidth utilization or bonding efficiency is calculated.',
     'A null value means the router did not report it; it is not zero.',
+    'config.configured_weight is a legacy name: its source is the runtime '
+    'members_list config_weight. observed.runtime_config_weight is the same '
+    'value, correctly labelled. Configured criterion weights are in '
+    '/api/analytics/wbond_config.',
 )
 
 
@@ -94,9 +98,14 @@ def build(snapshot, raw_devices, health):
                 'physical': tm['physical'],
                 'physical_display_name': phys_names.get(puid),
                 'underlay_consistency': tm['underlay_consistency'],
+                # LEGACY name (kept for compatibility): its source is the
+                # RUNTIME status members_list[].config_weight, not
+                # config/sdwan_adv/wan_bonding. See observed.
+                # runtime_config_weight and /api/analytics/wbond_config.
                 'config': {
                     'configured_weight': rm.get('configured_weight')},
                 'observed': {
+                    'runtime_config_weight': rm.get('configured_weight'),
                     'link_state': rm.get('link_state'),
                     'link_attach_state': rm.get('link_attach_state'),
                     'current_download_weight': rm.get(

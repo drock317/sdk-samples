@@ -189,7 +189,8 @@ def test_targeted_refresh_omits_primary_identity():
             env.clock.t += 30
             env.svc.refresh('bonding')
             b = env.svc.history(1)[-1]
-            check(env.calls[-1] == ('wan_devices', 'wan_bonding'),
+            check(env.calls[-1] == ('wan_devices', 'wan_bonding',
+                                    'wan_bonding_cfg'),
                   'bonding refresh does not request primary_device')
             check(_no_identity(b),
                   'bonding refresh: identity omitted, cached value not '
