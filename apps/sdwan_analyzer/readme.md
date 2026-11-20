@@ -39,6 +39,14 @@ these change over time.
 > with configurable limits, periodic cleanup, low-disk write protection and
 > coverage reporting. See *Historical analytics (v0.8.4)* and
 > *Durable telemetry storage* below.
+> **v0.8.5 steering reliability fix.** When the router intermittently returns
+> no data for its steering status, that poll is now recorded as a failed read
+> (`empty_source` in `collector_errors` and `/api/health`) instead of an empty
+> steering configuration. Previously this could report false steering
+> configuration changes (`steering_definitions` flipping between versions).
+> Polls with missing, partial or not-yet-confirmed empty steering rules keep
+> the last known definition version. `/api/analytics/validity` adds
+> `steering_source`, the classification of the latest steering read.
 > **v0.7.0 adds the first web page: Throughput trends.** Open `http://router_ip:<port>`
 > (the port is in the app log and in `sdwan_analyzer_web_port`). The earlier endpoint list is now at `/dev`.
 
@@ -298,7 +306,8 @@ later reads fail fast (`collector busy`) instead of piling up; no second
 worker thread is ever started while one is pending. Limitation: the abandoned
 call may still complete in the background. Collector health in `/api/status`
 (`collectors.{runtime,config}.collectors`) reports per endpoint
-`error_type` (`timeout` | `busy` | `api_error`), `last_success_ts`,
+`error_type` (`timeout` | `busy` | `api_error`, and from v0.8.5 for the
+steering keys `empty_source` | `incomplete_source`), `last_success_ts`,
 `last_error_ts`, `last_error_type` and `last_error`; the current `error`
 clears on the next success while the `last_error_*` history is kept.
 

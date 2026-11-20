@@ -13,6 +13,7 @@ derived resolutions are kept in separate, labelled blocks.
 Python 3.8 compatible.
 """
 from . import bond_config
+from . import collectors
 from . import cellular
 from . import normalize
 from . import query
@@ -309,6 +310,10 @@ def validity_view(health, freshness, tracker, store, snapshot, bond_state,
         'section_freshness': dict(freshness or {}),
         'steering_definitions': tracker.status(store),
         'steering_capture': ts.get('events_meta'),
+        # v0.8.5: classification of the latest status/wan/steering read
+        # (ok | ok_empty_rules | empty_source | incomplete_source |
+        # transport_failure) and how many consecutive reads it has held.
+        'steering_source': collectors.steering_source_state(),
         'wan_bonding_config': dict(bond_state or {}),
         'qoe': {'validity_counts': qoe_flags,
                 'sentinel_candidates': sum(

@@ -2964,6 +2964,10 @@ def main():
     import analytics_v084_tests
     analytics_v084_tests.bind(check)
     tests = tests + analytics_v084_tests.TESTS
+    # v0.8.5: steering source reliability (R2400 empty-source finding).
+    import steering_reliability_tests
+    steering_reliability_tests.bind(check, _Clock)
+    tests = tests + steering_reliability_tests.TESTS
     for t in tests:
         t()
     print('')

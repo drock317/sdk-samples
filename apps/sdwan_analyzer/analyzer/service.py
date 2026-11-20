@@ -163,7 +163,8 @@ class _RawCache(object):
                 'updated_ts': self._updated.get(k),
                 'error': self._errors.get(k),
                 'error_ts': self._error_ts.get(k),
-                # error_type: timeout | busy | api_error (current error).
+                # error_type: timeout | busy | api_error | empty_source |
+                # incomplete_source (current error).
                 'error_type': self._error_type.get(k),
                 'last_success_ts': self._updated.get(k),
                 'last_error_ts': le[0],
@@ -729,11 +730,10 @@ class AnalyzerService(object):
             ('capabilities', None, caps),
         )
         out = {}
-        for name, fp, payload in items:
-            if fp is None:
-                fp = normalize._stable_hash(payload)
-            out[name] = self._config_store.update(name, fp, payload, now)
-        # --- v0.8.3 objects (distinct from the legacy ones above) ---------
+        # v0.8.3 definition tracker runs FIRST (v0.8.5): it judges whether a
+        # successful rules read is complete. Its fingerprint semantics are
+        # unchanged; only the ordering moved.
+        legacy_steering_withheld = None
         try:
             if ok_keys is None or 'steering_rules' in ok_keys:
                 res = self._defs_tracker.observe(
@@ -742,9 +742,21 @@ class AnalyzerService(object):
                     kind_of=self._kind_of)
                 if res is not None:
                     out[steering_state.NAME] = res
+                legacy_steering_withheld = self._defs_tracker.withheld
+                self._note_defs_withheld(legacy_steering_withheld)
         except Exception as e:
             cp.log('service: steering definition versioning error: '
                    '{}'.format(e))
+        for name, fp, payload in items:
+            if name == 'steering_definitions' and legacy_steering_withheld:
+                # v0.8.5: a read the tracker withheld (unavailable, partial
+                # or an unconfirmed empty) must not version the legacy
+                # object either; _attribute_versions references the last
+                # known good version as latest_known, changed=False.
+                continue
+            if fp is None:
+                fp = normalize._stable_hash(payload)
+            out[name] = self._config_store.update(name, fp, payload, now)
         try:
             if ok_keys is None or 'wan_bonding_cfg' in ok_keys:
                 st, cfg_bonds = bond_config.normalize_config(
@@ -759,6 +771,21 @@ class AnalyzerService(object):
         except Exception as e:
             cp.log('service: bonding config versioning error: {}'.format(e))
         return self._attribute_versions(out, ok_keys)
+
+    def _note_defs_withheld(self, reason):
+        """Log (on change only) that steering definitions were withheld from
+        versioning, and when they are accepted again. Reason names only."""
+        prev = getattr(self, '_defs_withheld_logged', None)
+        if reason == prev:
+            return
+        self._defs_withheld_logged = reason
+        if reason:
+            cp.log('service: steering definitions withheld ({}); last known '
+                   'version kept for steering_rule_defs and '
+                   'steering_definitions'.format(reason))
+        elif prev:
+            cp.log('service: steering definitions accepted again '
+                   '(previously withheld: {})'.format(prev))
 
     def _history_tail(self):
         try:

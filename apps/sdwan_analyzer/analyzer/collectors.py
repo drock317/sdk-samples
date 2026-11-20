@@ -71,6 +71,11 @@ import cp
 ERR_TIMEOUT = 'timeout'   # read exceeded READ_TIMEOUT_S
 ERR_BUSY = 'busy'         # skipped: an earlier timed-out read is still pending
 ERR_API = 'api_error'     # cp.get raised
+# v0.8.5: a read that "succeeded" but carried no usable steering object.
+# On-router cp.get() returns None (no exception) on a config-store socket
+# timeout or error, so these are failed reads, not empty configurations.
+ERR_EMPTY_SOURCE = 'empty_source'           # parent None / not a dict / {}
+ERR_INCOMPLETE_SOURCE = 'incomplete_source'  # parent lacks a usable `rules`
 
 
 class CollectResult(object):
@@ -410,6 +415,44 @@ def traffic_class_config():
     return _get('config/sdwan_adv/traffic_class')
 
 
+# Last classification of the status/wan/steering read and how many
+# consecutive reads it has held. Logged on change only (no per-pass spam).
+_steering_source = {'state': None, 'repeat': 0}
+
+STEERING_SOURCE_MESSAGES = {
+    'transport_failure': 'read failed ({})',
+    ERR_EMPTY_SOURCE: 'returned no usable object ({}); treated as a failed '
+                      'read, last known steering data kept',
+    ERR_INCOMPLETE_SOURCE: 'incomplete ({}); rules treated as a failed '
+                           'read, last known definitions kept',
+    'ok_empty_rules': 'read ok with an explicit empty rules list ({} rules)',
+    'ok': 'read ok ({} rules)',
+}
+
+
+def _note_steering_source(state, detail):
+    """Sanitized source-health log: counts and type names only, never raw
+    payload. Logs when the classification changes, including the recovery
+    to ok after a problem, with how many reads the previous state held."""
+    prev = _steering_source['state']
+    if state == prev:
+        _steering_source['repeat'] += 1
+        return
+    held = _steering_source['repeat']
+    _steering_source['state'] = state
+    _steering_source['repeat'] = 1
+    if state == 'ok' and prev in (None, 'ok'):
+        return  # steady healthy state: nothing to report
+    msg = STEERING_SOURCE_MESSAGES.get(state, '{}').format(detail)
+    suffix = '' if prev is None else ' (previous: {} x{})'.format(prev, held)
+    cp.log('collectors: status/wan/steering {}{}'.format(msg, suffix))
+
+
+def steering_source_state():
+    """Current classification of the steering read (for health views)."""
+    return dict(_steering_source)
+
+
 def _steering_split_results():
     """Read status/wan/steering ONCE and split into per-key CollectResults.
 
@@ -426,14 +469,43 @@ def _steering_split_results():
     """
     res = _get_result('status/wan/steering')
     if not res.ok:
+        _note_steering_source('transport_failure', res.error_type)
         return {k: CollectResult(False, error=res.error,
                                  error_type=res.error_type)
                 for k in _STEERING_KEYS}
-    parent = res.value if isinstance(res.value, dict) else {}
-    # A successful parent read that lacks a child key is a legitimate empty
-    # for that child (ok=True, value None) -- it must replace stale data.
+    parent = res.value
+    if not isinstance(parent, dict) or not parent:
+        # v0.8.5: NCOS always returns the parent as a non-empty object
+        # ({events, stats, perf, rules, intents}); on-router cp.get() yields
+        # None for a socket timeout/error. Never treat that as "no steering":
+        # fail every key so the LKG cache, freshness and version stores keep
+        # the last good state and the gap is visible in collector_errors.
+        detail = 'no data' if parent is None else type(parent).__name__
+        _note_steering_source(ERR_EMPTY_SOURCE, detail)
+        err = 'status/wan/steering returned no usable object ({})'.format(
+            detail)
+        return {k: CollectResult(False, error=err,
+                                 error_type=ERR_EMPTY_SOURCE)
+                for k in _STEERING_KEYS}
+    rules = parent.get('rules')
+    if isinstance(rules, (list, dict)):
+        rules_res = CollectResult(True, value=rules)
+        _note_steering_source('ok' if rules else 'ok_empty_rules',
+                              len(rules))
+    else:
+        # The parent object arrived but without a usable rules child:
+        # incomplete, not an empty configuration (that is an explicit []).
+        # Only the rules key fails; the other children are still current.
+        detail = 'rules {}'.format(type(rules).__name__)
+        _note_steering_source(ERR_INCOMPLETE_SOURCE, detail)
+        rules_res = CollectResult(
+            False, error='status/wan/steering incomplete ({})'.format(detail),
+            error_type=ERR_INCOMPLETE_SOURCE)
+    # A successful parent read that lacks a NON-rules child key is a
+    # legitimate empty for that child (ok=True, value None) -- it must
+    # replace stale data.
     return {
-        'steering_rules': CollectResult(True, value=parent.get('rules')),
+        'steering_rules': rules_res,
         'steering_events': CollectResult(True, value=parent.get('events')),
         'steering_stats': CollectResult(True, value=parent.get('stats')),
         'steering_intents': CollectResult(True, value=parent.get('intents')),
