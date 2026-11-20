@@ -759,6 +759,17 @@ source was read in that pass), `latest_known` (the latest known version is
 referenced; no fresh read and `changed: false`) or `unspecified` (record from
 before v0.8.4).
 
+### Known issue (v0.8.5): legacy `steering_definitions` startup baseline
+Found in live R2400 verification. If the first steering read after app start
+fails (`empty_source`), the legacy `steering_definitions` object records a
+baseline (v1) from the missing data. The first successful read then bumps it
+to v2 (`changed: true`). No event reaches `/api/changes` and the new
+`steering_rule_defs` object is not affected: it stayed at v1 and referenced
+`latest_known` during the failure. Treat a legacy `steering_definitions`
+v1 to v2 step at startup as an artifact, and use `steering_rule_defs` for
+configuration versioning. Planned fix for a future release: do not baseline
+the legacy object until a read completes successfully.
+
 ## Normalized snapshot schema
 
 ```
