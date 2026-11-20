@@ -1,14 +1,12 @@
-/* SD-WAN Analyzer: page bootstrap. Mounts the Throughput trends view. Header,
- * sidebar, theme, layout and the version label come from the web app template
- * (static/js/script.js). */
+/* Mount the Overview and preserve the existing Throughput trends page. */
 (function (root) {
     'use strict';
-
     function start() {
-        var mount = document.getElementById('throughput-trends-root');
-        if (mount) { new root.SdwanThroughputTrends(mount); }
+        var overview = document.getElementById('overview-root');
+        if (overview && root.SdwanOverview) { new root.SdwanOverview(overview); }
+        var trends = document.getElementById('throughput-trends-root');
+        if (trends) { new root.SdwanThroughputTrends(trends); }
     }
-
     if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', start); }
     else { start(); }
 }(window));
