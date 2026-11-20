@@ -148,6 +148,9 @@ _DEV_PAGE = """<!DOCTYPE html>
 <li><a href="/api/analytics/wbond_config">/api/analytics/wbond_config</a> (configured bonding vs runtime members, read-only)</li>
 <li><a href="/api/analytics/steering">/api/analytics/steering</a> (steering definitions + runtime application matching, read-only)</li>
 <li>/api/analytics/steering/changes (definition versions + differences; limit, before_version)</li>
+<li><a href="/api/analytics/cellular">/api/analytics/cellular</a> (serving cells, LTE vs NR, RF stats with validity exclusions, carrier changes; uid, start, end, max_events)</li>
+<li><a href="/api/analytics/sdwan_history">/api/analytics/sdwan_history</a> (steering, bond members and weights, per-layer throughput, QoE; start, end, max_events)</li>
+<li><a href="/api/analytics/correlation">/api/analytics/correlation</a> (time-aligned cellular and SD-WAN events, evidence only; uid, start, end, window_s)</li>
 <li><a href="/api/analytics/validity">/api/analytics/validity</a> (source validity and freshness)</li>
 <li><a href="/api/analytics/topology">/api/analytics/topology</a> (current WAN / overlay / WBOND relationships, read-only)</li>
 <li>/api/analytics/interfaces?uid=&lt;interface uid&gt; (calculated RX/TX rates, read-only; limit, start, end, max_gap_s, cursor)</li>
@@ -265,6 +268,13 @@ def _make_handler(service):
                 elif path == '/api/analytics/steering/changes':
                     self._send_json(
                         service.query_steering_changes(raw_query))
+                elif path == '/api/analytics/cellular':
+                    self._send_json(service.query_cellular_analysis(
+                        raw_query))
+                elif path == '/api/analytics/sdwan_history':
+                    self._send_json(service.query_sdwan_history(raw_query))
+                elif path == '/api/analytics/correlation':
+                    self._send_json(service.query_correlation(raw_query))
                 elif path == '/api/analytics/validity':
                     self._send_json(service.query_validity())
                 elif path == '/api/analytics/interfaces':

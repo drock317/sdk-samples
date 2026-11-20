@@ -59,6 +59,20 @@ def _configured_schedule_minutes():
         return None
 
 
+def _configured_history_policy():
+    """Optional read-only App Data history limits (never written):
+    sdwan_analyzer_history_max_mb (32-1024) and
+    sdwan_analyzer_history_max_days (1-30). Missing/invalid -> defaults; the
+    effective values and any clamping are reported by /api/storage."""
+    out = {}
+    for key, field in (('max_mb', 'sdwan_analyzer_history_max_mb'),
+                       ('max_days', 'sdwan_analyzer_history_max_days')):
+        try:
+            raw = cp.get_appdata(field)
+            out[key] = raw if raw not in (None, '') else None
+        except Exception:
+            out[key] = None
+    return out
 def main():
     cp.log('sdwan_analyzer: starting backend build v{}'.format(VERSION))
 
@@ -76,7 +90,8 @@ def main():
     # application update/reinstall (accepted). If it cannot be initialised the
     # service falls back to in-memory stores and keeps running.
     service = AnalyzerService(schedule_minutes=_configured_schedule_minutes(),
-                              telemetry_root=TELEMETRY_ROOT)
+                              telemetry_root=TELEMETRY_ROOT,
+                              history_policy=_configured_history_policy())
     global _service
     _service = service
     server = DevWebServer(service)

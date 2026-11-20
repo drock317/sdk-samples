@@ -218,6 +218,11 @@ def build_report(memory, app_root, now=None, persistent=None):
         'retention': info.get('retention'),
         'recovery': info.get('recovery'),
         'free_space': info.get('free_space'),
+        # v0.8.4: effective retention policy, write protection, coverage.
+        'history_policy': info.get('history_policy'),
+        'space_guard': info.get('space_guard'),
+        'history_coverage': info.get('history_coverage'),
+        'retention_events': info.get('retention_events'),
     }
     return {'generated_ts': now, 'memory': memory,
             'persistent': out, 'application_files': app}

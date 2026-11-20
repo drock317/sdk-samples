@@ -629,10 +629,11 @@ def test_dur_history_retention_default_profile():
     print('test_dur_history_retention_default_profile')
     check(durable.DEFAULT_RETENTION == {
         'history_max_age_s': 7 * 86400,
-        'history_max_bytes': 32 * 1024 * 1024,
+        'history_max_bytes': 256 * 1024 * 1024,
         'recordings_max_jobs': 10,
         'recordings_max_bytes': 32 * 1024 * 1024},
-        'locked default retention: 7 d / 32 MB history, 10 jobs / 32 MB '
+        'locked default retention: 7 d / 256 MiB history (v0.8.4), 10 jobs / '
+        '32 MB '
         'Recordings')
     with _Tmp() as base:
         svc = _mk(base, _Clock())
@@ -1123,7 +1124,7 @@ def test_dur_storage_inspector_persistent():
         check(not any(n.startswith('tmp/') for n in
                       _rel_names(rep['application_files']['files'])),
               'tmp/ is not double counted in application_files')
-        check(p['retention']['history_max_bytes'] == 32 * 1024 * 1024 and
+        check(p['retention']['history_max_bytes'] == 256 * 1024 * 1024 and
               p['retention']['last']['reason'] == 'recording_complete',
               'retention limits (and the last sweep) shown')
         check(p['last_fsync_ts'] is not None and p['write_errors'] == 0 and

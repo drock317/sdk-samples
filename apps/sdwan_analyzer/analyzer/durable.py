@@ -44,6 +44,7 @@ from . import VERSION
 from . import persistence as P
 from . import query as Q
 from . import recording
+from . import retention as RT
 from . import storage
 
 ROOT_REL = 'tmp/telemetry'
@@ -55,8 +56,11 @@ SANE_MIN_TS = 1704067200            # 2024-01-01T00:00:00Z
 
 MIB = 1024 * 1024
 DEFAULT_RETENTION = {
-    'history_max_age_s': 7 * 86400,
-    'history_max_bytes': 32 * MIB,
+    # v0.8.4: history 256 MiB / 7 days (was 32 MiB). Recordings unchanged
+    # and independent. Operators change the two history limits through
+    # read-only App Data (retention.normalize_history_policy).
+    'history_max_age_s': RT.DEFAULT_HISTORY_MAX_DAYS * 86400,
+    'history_max_bytes': RT.DEFAULT_HISTORY_MAX_BYTES,
     'recordings_max_jobs': 10,
     'recordings_max_bytes': 32 * MIB,
 }
@@ -65,6 +69,9 @@ HISTORY_RING = 20
 CONFIG_COMPACT_BYTES = 512 * 1024
 CONFIG_KEEP_VERSIONS = 20
 EVENTS_ROTATE_BYTES = 256 * 1024
+INDEX_APPEND_BYTES = 2 * MIB     # incremental index read after an append
+INDEX_FIRST_WARM_BYTES = 64 * MIB   # first maintenance pass after start
+INDEX_WARM_BYTES = 8 * MIB      # seek-index upkeep per maintenance pass
 RECORDING_FSYNC_S = 30
 RECORDING_CHECKPOINT_S = 60
 DEDUPE_TAIL_BYTES = 65536
@@ -132,7 +139,8 @@ class TelemetryStorage(object):
     """Owns the storage root, health, events, state, retention, recovery."""
 
     def __init__(self, root, display_root=ROOT_REL, clock=time.time,
-                 ring=HISTORY_RING, retention=None):
+                 ring=HISTORY_RING, retention=None, free_space_fn=None,
+                 policy_report=None):
         self.root = root
         self.display_root = display_root
         self._clock = clock
@@ -142,6 +150,25 @@ class TelemetryStorage(object):
         self.limits = dict(DEFAULT_RETENTION)
         if retention:
             self.limits.update(retention)
+        # v0.8.4 policy/space state (see retention.py).
+        self.policy_report = policy_report
+        self._free_space_fn = free_space_fn
+        self.expected_interval_s = 300
+        self.retention_log = deque(maxlen=20)
+        self.gaps = deque(maxlen=50)
+        self.space = {
+            'state': 'ok', 'reason': None, 'since_ts': None,
+            'last_check_ts': None, 'pauses': 0, 'resumes': 0,
+            'paused_observations': 0, 'last_event_ts': None,
+            'emergency_deleted_files': 0, 'reserve_bytes': None,
+            'resume_bytes': None, 'free_bytes': None, 'total_bytes': None,
+            'paused_day': None,
+        }
+        self.effective_cap = {'configured': self.limits['history_max_bytes'],
+                              'effective': self.limits['history_max_bytes'],
+                              'limited_by_disk': False}
+        self.last_periodic_sweep_ts = None
+        self._index_warmed = False
         self.state_path = os.path.join(root, 'state.json')
         self.config_path = os.path.join(root, 'config_versions.jsonl')
         self.events_path = os.path.join(root, 'events.jsonl')
@@ -495,17 +522,171 @@ class TelemetryStorage(object):
         try:
             with self.lock:
                 now = self._clock()
+                self.check_space(now, force=True)
+                before = self.history_store.total_bytes()
                 h = self.history_store.sweep(now)
                 r = self.recording_store.sweep(now)
                 self.last_retention = {
                     'ts': int(now), 'reason': reason,
-                    'history_deleted': len(h), 'recordings_deleted': len(r)}
+                    'history_deleted': len(h), 'recordings_deleted': len(r),
+                    'history_bytes_freed': max(
+                        0, before - self.history_store.total_bytes())}
         except Exception as e:
             self.record_error('retention', e)
+
+    # --- v0.8.4: space safety, maintenance ----------------------------------
+    def set_expected_interval(self, seconds):
+        if isinstance(seconds, (int, float)) and not isinstance(
+                seconds, bool) and seconds > 0:
+            self.expected_interval_s = int(seconds)
+
+    def _space_event(self, now, event, **detail):
+        """Pause/resume events are rate limited so a flapping disk cannot
+        generate unbounded writes (the events file is also size-rotated)."""
+        sp = self.space
+        last = sp['last_event_ts']
+        if last is not None and now - last < RT.EVENT_MIN_INTERVAL_S:
+            return
+        sp['last_event_ts'] = int(now)
+        self.log_event(event, **detail)
+
+    def _pause(self, now, reason, day=None):
+        sp = self.space
+        if sp['state'] == 'paused':
+            return
+        sp.update(state='paused', reason=reason, since_ts=int(now),
+                  paused_day=day)
+        sp['pauses'] += 1
+        cp.log('sdwan_analyzer storage: history writes PAUSED ({}); '
+               'telemetry continues in memory'.format(reason))
+        self._space_event(now, 'history_paused', reason=reason,
+                          free_bytes=sp['free_bytes'],
+                          reserve_bytes=sp['reserve_bytes'])
+
+    def _resume(self, now):
+        sp = self.space
+        if sp['state'] != 'paused':
+            return
+        was = sp['reason']
+        sp.update(state='ok', reason=None, since_ts=None, paused_day=None)
+        sp['resumes'] += 1
+        cp.log('sdwan_analyzer storage: history writes RESUMED')
+        self._space_event(now, 'history_resumed', previous_reason=was,
+                          free_bytes=sp['free_bytes'])
+
+    def check_space(self, now, force=False):
+        """Refresh free-space state (throttled). Never raises.
+
+        Below the reserve the oldest unprotected history days are removed
+        until the resume threshold is reached; if the disk is still short,
+        history writes pause (RAM telemetry continues). Writes resume only
+        above the higher resume threshold. Deleting and pausing both REDUCE
+        writes, so the guard cannot itself cause unbounded writing.
+        """
+        sp = self.space
+        last = sp['last_check_ts']
+        if (not force and last is not None
+                and now - last < RT.SPACE_CHECK_INTERVAL_S):
+            return sp['state']
+        try:
+            sp['last_check_ts'] = int(now)
+            fs = self.free_space()
+            if not fs.get('available'):
+                return sp['state']
+            free, total = int(fs['free_bytes']), int(fs['total_bytes'])
+            reserve = RT.space_reserve(
+                total, self.limits.get('space_reserve_bytes'))
+            resume = RT.resume_threshold(reserve)
+            sp.update(free_bytes=free, total_bytes=total,
+                      reserve_bytes=reserve, resume_bytes=resume)
+            hist = self.history_store.total_bytes()
+            cap, limited = RT.effective_cap(
+                self.limits['history_max_bytes'], hist, free, reserve)
+            self.effective_cap = {
+                'configured': self.limits['history_max_bytes'],
+                'effective': cap, 'limited_by_disk': limited}
+            if sp['state'] == 'ok' and free < reserve:
+                freed = self.history_store.emergency_sweep(
+                    now, lambda: self.free_space().get('free_bytes', 0)
+                    >= resume)
+                sp['emergency_deleted_files'] += freed
+                fs2 = self.free_space()
+                free = int(fs2.get('free_bytes', free))
+                sp['free_bytes'] = free
+                if free < reserve:
+                    self._pause(now, RT.REASON_LOW_SPACE)
+            elif (sp['state'] == 'paused'
+                  and sp['reason'] == RT.REASON_LOW_SPACE
+                  and free >= resume):
+                self._resume(now)
+        except Exception as e:
+            self.record_error('space_check', e)
+        return sp['state']
+
+    def history_write_gate(self, day):
+        """True when a history observation may be written to disk now."""
+        sp = self.space
+        now = self._clock()
+        self.check_space(now)
+        if (sp['state'] == 'paused' and sp['reason'] == RT.REASON_DAY_OVERFLOW
+                and sp['paused_day'] != day):
+            self._resume(now)           # a new UTC day is a new file
+        if sp['state'] == 'ok':
+            size = P.file_size(self.history_store.day_path(day))
+            if size >= max(self.effective_cap['effective'],
+                           RT.MIN_EFFECTIVE_CAP):
+                # The protected current day alone fills the cap: it cannot be
+                # trimmed, so stop growing it until the next UTC day.
+                self._pause(now, RT.REASON_DAY_OVERFLOW, day)
+        if sp['state'] == 'paused':
+            sp['paused_observations'] += 1
+            return False
+        return True
+
+    def maintenance(self, now):
+        """Cheap periodic upkeep, called after each stored observation:
+        throttled space check, hourly retention sweep, bounded index warm-up.
+        Never raises."""
+        try:
+            if self._write_forbidden():
+                return
+            self.check_space(now)
+            last = self.last_periodic_sweep_ts
+            if last is None or now - last >= RT.SWEEP_INTERVAL_S:
+                self.last_periodic_sweep_ts = now
+                self.retention_sweep('periodic')
+            # First pass after start indexes more so an existing 256 MiB
+            # history becomes seekable quickly; later passes only top up.
+            budget = (INDEX_FIRST_WARM_BYTES if not self._index_warmed
+                      else INDEX_WARM_BYTES)
+            self._index_warmed = True
+            self.history_store.warm_index(budget)
+        except Exception as e:
+            self.record_error('maintenance', e)
+
+    def recent_events(self, kinds, limit=20):
+        """Newest persisted events of the given kinds (bounded read)."""
+        out = []
+        for path in (os.path.join(self.root, 'events.1.jsonl'),
+                     self.events_path):
+            try:
+                out.extend(r for r in P.read_tail_records(
+                    path, EVENTS_ROTATE_BYTES) if r.get('event') in kinds)
+            except Exception:
+                continue
+        out.sort(key=lambda r: r.get('ts') or 0)
+        return out[-limit:]
 
     # --- inspector ----------------------------------------------------------
 
     def free_space(self):
+        if self._free_space_fn is not None:
+            try:
+                fs = self._free_space_fn()
+                if isinstance(fs, dict):
+                    return dict(fs)
+            except Exception as e:
+                return {'available': False, 'error': str(e)[:80]}
         try:
             if not hasattr(os, 'statvfs'):
                 return {'available': False, 'error': 'statvfs unsupported'}
@@ -540,6 +721,34 @@ class TelemetryStorage(object):
             'retention': dict(self.limits, last=self.last_retention),
             'recovery': dict(self.recovery),
             'free_space': self.free_space(),
+            'history_policy': self.policy_info(),
+            'space_guard': dict(self.space),
+            'history_coverage': self.history_store.coverage(self._clock()),
+            'retention_events': self.recent_events(
+                ('retention_delete', 'history_paused', 'history_resumed',
+                 'history_gap'), 20),
+        }
+
+    def policy_info(self):
+        eff = self.effective_cap
+        return {
+            'history_max_bytes': self.limits['history_max_bytes'],
+            'history_max_age_s': self.limits['history_max_age_s'],
+            'history_max_days': round(
+                self.limits['history_max_age_s'] / 86400.0, 2),
+            'effective_history_cap_bytes': eff['effective'],
+            'limited_by_disk': eff['limited_by_disk'],
+            'recordings_max_jobs': self.limits['recordings_max_jobs'],
+            'recordings_max_bytes': self.limits['recordings_max_bytes'],
+            'recordings_independent': True,
+            'sweep_interval_s': RT.SWEEP_INTERVAL_S,
+            'last_periodic_sweep_ts': self.last_periodic_sweep_ts,
+            'config': self.policy_report,
+            'bounds': {
+                'history_max_mb': [RT.MIN_HISTORY_MAX_BYTES // RT.MIB,
+                                   RT.MAX_HISTORY_MAX_BYTES // RT.MIB],
+                'history_max_days': [RT.MIN_HISTORY_MAX_DAYS,
+                                     RT.MAX_HISTORY_MAX_DAYS]},
         }
 
 
@@ -679,6 +888,13 @@ class DurableHistoryStore(storage.HistoryStore):
         self._ring = deque(maxlen=ring)
         self._app = None
         self._day = None
+        # v0.8.4: verified seek indexes, gap tracking, coverage cache.
+        self._idx = {}
+        self._idx_lock = threading.Lock()
+        self._last_ts = None            # newest PERSISTED observation ts
+        self._first_since_start = True
+        self._gap_paused = False
+        self._bounds_cache = {}
 
     # interface ---------------------------------------------------------------
 
@@ -702,16 +918,43 @@ class DurableHistoryStore(storage.HistoryStore):
         if self._t._write_forbidden():
             return
         try:
-            rec = P.encode_observation(sample)
             day = utc_day(ts)
+            if not self._t.history_write_gate(day):
+                self._gap_paused = True     # RAM ring only; see space guard
+                return
+            rec = P.encode_observation(sample)
             with self._t.lock:
                 if day != self._day:
                     self._switch_day(day)
                 self._app.append(rec)
             h.persisted_observations += 1
             h.consecutive_errors = 0
+            self._note_persisted(ts, day)
         except Exception as e:
             self._t.record_error('history', e)
+
+    def _note_persisted(self, ts, day):
+        """Gap detection and incremental seek-index upkeep. Never raises."""
+        try:
+            last = self._last_ts
+            if last is not None and ts > last:
+                thr = max(150, int(2.5 * self._t.expected_interval_s))
+                if ts - last > thr:
+                    reason = ('history_paused' if self._gap_paused else
+                              ('process_start' if self._first_since_start
+                               else 'missed_collection'))
+                    gap = {'start_ts': int(last), 'end_ts': int(ts),
+                           'seconds': int(ts - last), 'reason': reason}
+                    self._t.gaps.append(gap)
+                    self._t.log_event('history_gap', **gap)
+            if last is None or ts > last:
+                self._last_ts = ts
+            self._gap_paused = False
+            self._first_since_start = False
+            idx = self._index(day)
+            idx.extend(self.day_path(day), INDEX_APPEND_BYTES)
+        except Exception:
+            pass
 
     def recent(self, limit=100):
         items = list(self._ring)
@@ -777,6 +1020,13 @@ class DurableHistoryStore(storage.HistoryStore):
             self._ring.append(P.decode_observation(
                 rec, fingerprint_lookup=lookup))
         self._t.recovery['history_restored'] = len(self._ring)
+        try:
+            tss = [r.get('collected_ts') for r in self._ring
+                   if isinstance(r.get('collected_ts'), (int, float))]
+            if tss:
+                self._last_ts = max(tss)
+        except Exception:
+            pass
 
     # paged durable reads (GET /api/history) ----------------------------------------
 
@@ -858,6 +1108,7 @@ class DurableHistoryStore(storage.HistoryStore):
         floor = max_bytes < P.QUERY_MAX_LINE + 1
         lookup = self._t.config_store.fingerprint_for
         out, skipped, scanned, accepted = [], 0, 0, 0
+        seek_skipped = 0
         next_cursor = None
 
         def mint(day, off, rs):
@@ -866,7 +1117,13 @@ class DurableHistoryStore(storage.HistoryStore):
 
         for day in selected:
             path = self.day_path(day)
-            off = c_off if day == c_day else 0
+            if day == c_day:
+                off = c_off
+            else:
+                # Verified seek only (DayIndex prefix maxima): never skips a
+                # record that could match, whatever the file order.
+                off = self._seek(day, eff_start)
+                seek_skipped += off
             rs = resync if day == c_day else False
             if (scanned >= max_bytes or len(out) >= limit
                     or accepted >= max_accept_bytes):
@@ -893,13 +1150,185 @@ class DurableHistoryStore(storage.HistoryStore):
                 break
         return {'samples': out, 'count': len(out),
                 'next_cursor': next_cursor, 'skipped_lines': skipped,
-                'scanned_bytes': scanned}
+                'scanned_bytes': scanned,
+                'seek_skipped_bytes': seek_skipped}
+
+    # seek index ---------------------------------------------------------------
+
+    def _index(self, day):
+        with self._idx_lock:
+            idx = self._idx.get(day)
+            if idx is None:
+                idx = self._idx[day] = P.DayIndex()
+            return idx
+
+    def _seek(self, day, start_ts):
+        """Verified skip offset for `day` (0 when no proof is available)."""
+        if start_ts is None:
+            return 0
+        try:
+            with self._idx_lock:
+                idx = self._idx.get(day)
+                if idx is None:
+                    return 0
+                off = idx.seek_offset(start_ts)
+            if off <= 0:
+                return 0
+            path = self.day_path(day)
+            if P.offset_state(path, off) != 'ok':
+                with self._idx_lock:
+                    self._idx.pop(day, None)
+                return 0
+            return off
+        except Exception:
+            return 0
+
+    def warm_index(self, budget_bytes):
+        """Index existing day files in bounded steps (newest first). Reads
+        at most `budget_bytes` per call; queries never build the index."""
+        left = int(budget_bytes)
+        names = self.day_files()
+        live = {n[:-6] for n in names}
+        with self._idx_lock:
+            for d in [d for d in self._idx if d not in live]:
+                self._idx.pop(d, None)      # deleted by retention
+        for name in reversed(names):
+            if left <= 0:
+                break
+            day = name[:-6]
+            idx = self._index(day)
+            path = os.path.join(self._t.history_dir, name)
+            if idx.size >= P.file_size(path):
+                continue
+            left -= max(1, idx.extend(path, left))
+
+    def total_bytes(self):
+        total = 0
+        for name in self.day_files():
+            path = os.path.join(self._t.history_dir, name)
+            total += P.file_size(path) + P.file_size(path + '.corrupt')
+        return total
+
+    def emergency_sweep(self, now, done):
+        """Low-disk relief: delete the oldest UNPROTECTED day files until
+        `done()` is true or none remain. Returns the number deleted."""
+        protected = {utc_day(now), self._day}
+        removed = 0
+        for name in self.day_files():
+            if done():
+                break
+            if name[:-6] in protected:
+                continue
+            path = os.path.join(self._t.history_dir, name)
+            size = P.file_size(path) + P.file_size(path + '.corrupt')
+            P.remove_quiet(path)
+            P.remove_quiet(path + '.corrupt')
+            with self._idx_lock:
+                self._idx.pop(name[:-6], None)
+            self._bounds_cache.pop(name, None)
+            removed += 1
+            self._t.retention_log.append({
+                'ts': int(now), 'file': name, 'reason': 'low_space',
+                'bytes': size})
+            self._t.log_event('retention_delete', kind='history', file=name,
+                              reason='low_space', bytes=size)
+        if removed:
+            P.fsync_directory(self._t.history_dir)
+        return removed
+
+    # coverage ------------------------------------------------------------------
+
+    def _file_bounds(self, name):
+        path = os.path.join(self._t.history_dir, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None, None, 0
+        key = (st.st_size, int(st.st_mtime))
+        hit = self._bounds_cache.get(name)
+        if hit is not None and hit[0] == key:
+            return hit[1], hit[2], st.st_size
+        first = last = None
+        try:
+            with open(path, 'rb') as f:
+                first = P.peek_ts(f.readline(512))
+            for rec in reversed(P.read_tail_records(path, 65536)):
+                t = rec.get('collected_ts')
+                if isinstance(t, (int, float)) and not isinstance(t, bool):
+                    last = float(t)
+                    break
+        except Exception:
+            pass
+        self._bounds_cache[name] = (key, first, last)
+        return first, last, st.st_size
+
+    def coverage(self, now):
+        """What history is actually retained. Cheap: one first-line read and
+        one bounded tail read per day file (cached by size/mtime)."""
+        t = self._t
+        names = self.day_files()
+        days, oldest, newest, total = [], None, None, 0
+        for name in names:
+            first, last, size = self._file_bounds(name)
+            total += size
+            days.append({'day': name[:-6], 'bytes': size,
+                         'first_ts': first, 'last_ts': last})
+            if first is not None and (oldest is None or first < oldest):
+                oldest = first
+            if last is not None and (newest is None or last > newest):
+                newest = last
+        missing = []
+        if len(names) >= 2:
+            have = {n[:-6] for n in names}
+            d = day_start_ts(names[0][:-6])
+            end = day_start_ts(names[-1][:-6])
+            while d < end and len(missing) < 31:
+                dd = utc_day(d)
+                if dd not in have:
+                    missing.append(dd)
+                d += 86400
+        lim = t.limits
+        eff = t.effective_cap
+        full = [x for x in days[:-1] if x['bytes'] > 0]
+        daily = max((x['bytes'] for x in full[-7:]), default=None)
+        max_days = lim['history_max_age_s'] / 86400.0
+        factor = RT.limiting_factor(len(days), max_days, total,
+                                    eff['effective'], eff['limited_by_disk'])
+        gaps = list(t.gaps)[-20:]
+        with self._idx_lock:
+            idx = {d: i.info() for d, i in self._idx.items()}
+        indexed = sum(v['indexed_bytes'] for v in idx.values())
+        return {
+            'oldest_ts': oldest, 'newest_ts': newest,
+            'span_s': (None if oldest is None or newest is None
+                       else int(newest - oldest)),
+            'days_present': len(days), 'total_bytes': total,
+            'days': days[-31:], 'missing_days': missing,
+            'gaps': gaps, 'gaps_note': 'detected while this app ran '
+            '(restarts, missed collections, paused writes); older gaps '
+            'appear in retention_events',
+            'limiting_factor': factor,
+            'max_days': max_days,
+            'observed_max_daily_bytes': daily,
+            'projected_days_at_cap': (
+                round(eff['effective'] / float(daily), 1) if daily else None),
+            'protected_day_overflow': (
+                t.space['state'] == 'paused'
+                and t.space['reason'] == RT.REASON_DAY_OVERFLOW),
+            'coverage_shortfall': bool(
+                oldest is not None and factor in ('size', 'disk_space')
+                and now - oldest < max_days * 86400 - 86400),
+            'seek_index': {'indexed_bytes': indexed, 'total_bytes': total,
+                           'files': len(idx)},
+        }
 
     # retention -----------------------------------------------------------------
 
     def sweep(self, now):
         """Delete whole day files past the age / size limits (oldest first).
-        Today's UTC file and the file being appended are never deleted."""
+        Today's UTC file and the file being appended are never deleted.
+        The size limit is the configured cap lowered, when needed, to what
+        the disk can hold above its reserve (RetentionPolicy)."""
         lim = self._t.limits
         protected = {utc_day(now), self._day}
         entries = []
@@ -908,16 +1337,17 @@ class DurableHistoryStore(storage.HistoryStore):
             size = P.file_size(path) + P.file_size(path + '.corrupt')
             entries.append([name, name[:-6], size])
         deleted = []
-
         def drop(entry, reason):
             path = os.path.join(self._t.history_dir, entry[0])
             P.remove_quiet(path)
             P.remove_quiet(path + '.corrupt')
             entries.remove(entry)
             deleted.append(entry[0])
+            self._t.retention_log.append({
+                'ts': int(now), 'file': entry[0], 'reason': reason,
+                'bytes': entry[2]})
             self._t.log_event('retention_delete', kind='history',
                               file=entry[0], reason=reason, bytes=entry[2])
-
         cutoff = now - lim['history_max_age_s']
         for entry in list(entries):
             if entry[1] in protected:
@@ -925,8 +1355,10 @@ class DurableHistoryStore(storage.HistoryStore):
             if day_start_ts(entry[1]) + 86400 <= cutoff:
                 drop(entry, 'age')
         total = sum(e[2] for e in entries)
+        cap = min(lim['history_max_bytes'],
+                  self._t.effective_cap['effective'])
         for entry in list(entries):
-            if total <= lim['history_max_bytes']:
+            if total <= cap:
                 break
             if entry[1] in protected:
                 continue
@@ -934,9 +1366,11 @@ class DurableHistoryStore(storage.HistoryStore):
             drop(entry, 'size')
         if deleted:
             P.fsync_directory(self._t.history_dir)
+            for name in deleted:
+                with self._idx_lock:
+                    self._idx.pop(name[:-6], None)
+                self._bounds_cache.pop(name, None)
         return deleted
-
-
 # --- recordings --------------------------------------------------------------
 
 def _valid_job(job, name):

@@ -821,6 +821,12 @@ def encode_observation(obs, recording=False):
                          if isinstance(e, dict) and e.get('changed'))
         if changed:
             out['cvc'] = changed
+        # v0.8.4: names referenced as the LATEST KNOWN version (their source
+        # was not read in this pass). Presence of `cvl` marks an
+        # attribution-aware record; older records have none.
+        out['cvl'] = sorted(n for n, e in cv.items()
+                            if isinstance(e, dict)
+                            and e.get('attribution') == 'latest_known')
     return out
 
 
@@ -846,7 +852,7 @@ def decode_observation(rec, job_id=None, recording=False,
     for key, val in rec.items():
         if key in ('collected_ts', 'sample_source', 'job_id',
                    'refresh_group', 'timestamp', 'recording_group', 'cv',
-                   'cvc', 'collector_errors'):
+                   'cvc', 'cvl', 'collector_errors'):
             continue
         if key == 'wan' and isinstance(val, dict):
             wan = dict(val)
@@ -861,6 +867,8 @@ def decode_observation(rec, job_id=None, recording=False,
     obs['duration_ms'] = None
     if 'cv' in rec and isinstance(rec['cv'], dict):
         changed = set(rec.get('cvc') or ())
+        aware = 'cvl' in rec
+        latest = set(rec.get('cvl') or ())
         cfg = {}
         for n, v in rec['cv'].items():
             fp = None
@@ -870,6 +878,138 @@ def decode_observation(rec, job_id=None, recording=False,
                 except Exception:
                     fp = None
             cfg[n] = {'version': v, 'fingerprint': fp,
-                      'changed': n in changed}
+                      'changed': n in changed,
+                      'attribution': (('latest_known' if n in latest
+                                       else 'read') if aware
+                                      else 'unspecified')}
         obs['config_versions'] = cfg
     return obs
+
+
+# --- verified seek index (v0.8.4) --------------------------------------------
+# Large daily history files are scanned forward from byte 0 by scan_range().
+# A timestamp BINARY SEARCH would assume the file is time-ordered, which is not
+# guaranteed (clock steps, repaired tails, manual edits). DayIndex avoids that
+# assumption: while it reads a file once (incrementally, never during a
+# query) it records, every INDEX_STRIDE bytes, the MAXIMUM timestamp of every
+# valid record BEFORE that point. A seek to a point whose prefix maximum is
+# below the requested start skips only records that are all provably older
+# than the start, whatever the order. Prefix maxima are non-decreasing by
+# construction, so the lookup is a plain bisect over verified data.
+#
+# The index is derived, in memory, optional and rebuildable: a file that
+# shrank, a boundary that is not a line start, or any error makes the caller
+# fall back to scanning from the requested offset. Nothing is written to disk.
+INDEX_STRIDE = 262144              # bytes between index points
+INDEX_MAX_POINTS = 4096            # per file (covers > 1 GiB at the stride)
+
+
+class DayIndex(object):
+    """Prefix-maximum seek index for ONE history day file."""
+
+    def __init__(self, stride=INDEX_STRIDE):
+        self._stride = max(4096, int(stride))
+        self.size = 0              # bytes covered (always at a line start)
+        self.max_ts = None         # max valid ts in [0, size)
+        self.points = []           # [(offset, prefix_max_ts or None)]
+        self.malformed = 0
+        self.out_of_order = 0      # lines whose ts < the running maximum
+        self._last_point = 0
+        self.complete_ts = None
+
+    def reset(self):
+        self.size = 0
+        self.max_ts = None
+        self.points = []
+        self.malformed = 0
+        self.out_of_order = 0
+        self._last_point = 0
+
+    def extend(self, path, budget_bytes):
+        """Index up to `budget_bytes` more of the file. Returns bytes read.
+
+        Only complete (newline-terminated) lines are consumed. Never raises.
+        """
+        try:
+            f = open(path, 'rb')
+        except OSError:
+            self.reset()
+            return 0
+        read = 0
+        try:
+            with f:
+                fsize = os.fstat(f.fileno()).st_size
+                if fsize < self.size:
+                    self.reset()            # truncated/replaced
+                if self.size > 0:
+                    f.seek(self.size - 1)
+                    if f.read(1) != b'\n':
+                        self.reset()        # boundary no longer a line start
+                f.seek(self.size)
+                pos = self.size
+                while read < budget_bytes and pos < fsize:
+                    line = f.readline(QUERY_MAX_LINE + 1)
+                    if not line:
+                        break
+                    if not line.endswith(b'\n'):
+                        if len(line) > QUERY_MAX_LINE:
+                            # Oversized line: never served; skip its rest.
+                            while True:
+                                chunk = f.readline(QUERY_SKIP_CHUNK)
+                                read += len(chunk)
+                                if not chunk or chunk.endswith(b'\n'):
+                                    break
+                            if not chunk or not chunk.endswith(b'\n'):
+                                break       # EOF inside it: not consumed
+                            pos = f.tell()
+                            read += len(line)
+                            self.malformed += 1
+                            self._advance(pos)
+                            continue
+                        break               # incomplete tail: not consumed
+                    read += len(line)
+                    pos += len(line)
+                    if line.strip():
+                        ts = peek_ts(line)
+                        if ts is None:
+                            rec = _parse_line(line)
+                            t = rec.get('collected_ts') if rec else None
+                            ts = (float(t) if isinstance(t, (int, float))
+                                  and not isinstance(t, bool) else None)
+                        if ts is None:
+                            self.malformed += 1
+                        else:
+                            if self.max_ts is not None and ts < self.max_ts:
+                                self.out_of_order += 1
+                            if self.max_ts is None or ts > self.max_ts:
+                                self.max_ts = ts
+                    self._advance(pos)
+        except Exception:
+            self.reset()
+            return read
+        return read
+
+    def _advance(self, pos):
+        self.size = pos
+        if (pos - self._last_point >= self._stride
+                and len(self.points) < INDEX_MAX_POINTS):
+            self.points.append((pos, self.max_ts))
+            self._last_point = pos
+
+    def seek_offset(self, start_ts):
+        """Largest verified offset such that every record before it has
+        ts < start_ts (so skipping them cannot lose a match). 0 if none."""
+        if start_ts is None or not self.points:
+            return 0
+        best = 0
+        for off, pmax in self.points:
+            if pmax is None or pmax < start_ts:
+                best = off
+            else:
+                break       # prefix maxima never decrease
+        return best
+
+    def info(self):
+        return {'indexed_bytes': self.size, 'points': len(self.points),
+                'out_of_order_records': self.out_of_order,
+                'malformed_lines': self.malformed}

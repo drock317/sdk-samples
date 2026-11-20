@@ -16,6 +16,7 @@ NR_CELL_ID are never stored; they are folded into a one-way local hash
 
 import hashlib
 import re
+from . import rf_validity as RV
 
 # Diagnostics keys per normalized field, in priority order (subset of the
 # Speedtest Analyzer _DIAG_FIELD_CANDIDATES that this module consumes).
@@ -654,14 +655,34 @@ def rf_number(value):
 def cell_key_hash(carrier, service_mode, cell_id, pci, band):
     """Deterministic shortened SHA-256 of the serving-cell identity.
 
-    The exact composition lives in this one function so it can change later.
-    Never uses Python's hash() (salted per process). Returns None when there
-    is no cell id to derive from.
+    v0.8.4: the cell id is canonicalized BEFORE hashing (leading decimal of
+    forms such as "6643981 (0x65610d)", or a 0x hex form) so formatting
+    differences of the same cell hash alike. Plain decimal ids hash exactly
+    as in v0.8.3. An id that cannot be canonicalized yields None (an identity
+    is never manufactured from PCI/TAC/band).
+    Never uses Python's hash() (salted per process).
     """
-    if not _present(cell_id):
+    canon = RV.canonical_cell_id(cell_id)
+    if not canon:
         return None
-    parts = [carrier, service_mode, cell_id, pci, band]
+    parts = [carrier, service_mode, canon, pci, band]
     text = '|'.join('' if p is None else str(p).strip() for p in parts)
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()[:CELL_KEY_HASH_LEN]
+
+
+def serving_cell_hash(carrier, sa, cell_id):
+    """Mode-independent serving-cell identity (v0.8.4).
+
+    `cell_key_hash` (v0.8.3) also hashes the radio mode, band and PCI, so the
+    same cell reads as a different one after an LTE -> 5G NSA change. This
+    hash covers only what identifies the cell: carrier label, the id type
+    (LTE ECI, or NR NCI for 5G SA) and the canonical id. Never invented
+    from PCI/TAC/band; None without a usable id.
+    """
+    canon = RV.canonical_cell_id(cell_id)
+    if not canon:
+        return None
+    text = '|'.join([str(carrier or '').strip(), 'NR' if sa else 'LTE', canon])
     return hashlib.sha256(text.encode('utf-8')).hexdigest()[:CELL_KEY_HASH_LEN]
 
 
@@ -687,34 +708,44 @@ def ca_signature(carriers):
 # level RSRP/RSRQ/SINR (RSRP, SINR, RSRP_5G, ...) stay on the modem record
 # and are never copied into a component carrier.
 
-SINR_TENTHS_ABOVE = 50       # |raw| above this cannot be a dB value
-SCALE_TENTHS = 'tenths_db_plausibility'
-SCALE_AMBIGUOUS = 'ambiguous'
 MAX_COLLAPSED_GROUPS = 8
+RF_VERSION = 2          # v0.8.4 field-aware validity (absent => legacy)
 
 RF_NOTES = (
     'Component RF is read from indexed PCELL/SCELL fields only; serving-'
     'level RSRP/RSRQ/SINR stay on the modem record.',
-    'Component SINR above 50 in magnitude is treated as tenths of a dB '
-    '(plausibility, consistent with Speedtest Analyzer and Phase 1A '
-    'observations). Smaller values are ambiguous: sinr is null and sinr_raw '
-    'is kept.',
-    'Component RSRP/RSRQ are stored as reported; their scaling is not '
-    'verified.',
-    'Zero RF values on inactive or 0 MHz component entries are treated as '
-    'placeholders (null).',
+    'Every RF metric has a validity (valid, missing, placeholder_zero, '
+    'placeholder_context, implausible_range, unknown_scale). The raw reading '
+    'is preserved in `raw` / `sinr_raw` when it is not valid.',
+    'Component SINR scale comes from the source field family, not from '
+    'magnitude: an integer token is tenths of a dB, a decimal token is dB. '
+    'sinr_scale states the basis: tenths_corroborated (the component is the '
+    'serving carrier and agrees within 10 dB), tenths_family_corroborated, '
+    'tenths_family_inferred (no corroboration; INFERRED), db_decimal_token or '
+    'unknown (withheld).',
+    'Plausibility bounds are 3GPP reporting ranges; in range does not mean '
+    'accurate. A raw 0 on a measured carrier is implausible_range; a 0 or '
+    'any value on an unmeasured entry (inactive, 0 MHz, or RSSI 0 with RSRP '
+    '0/absent) is a placeholder. RSRQ -3 is not invalid by itself.',
+    'Component RSRP/RSRQ scaling is taken as reported (unverified).',
+    'role_aliases lists every NCOS role under which one physical carrier '
+    'was reported; two indexed SCells with an identical identity remain '
+    'flagged ambiguous in carrier_evidence.',
 )
 
 
 def _comp_val(diagnostics, key):
+    """Raw component token (string/number) or None for empty sentinels."""
     v = diagnostics.get(key)
-    if isinstance(v, str) and v.strip().lower() in _EMPTY:
+    if v is None or isinstance(v, bool):
         return None
-    return rf_number(v)
+    if isinstance(v, str) and v.strip().lower() in RV._EMPTY:
+        return None
+    return v
 
 
 def _component_entries(diagnostics):
-    """Indexed component entries with raw RF: [{role, identity, rf}]."""
+    """Indexed component entries with RAW tokens: [{role, identity, ...}]."""
     out = []
     roles = []
     if _present(diagnostics.get('BAND_5G_PCELL')):
@@ -739,66 +770,149 @@ def _component_entries(diagnostics):
         ch = str(ch).strip() if _present(ch) else None
         out.append({
             'role': role,
+            'suffix': suf,
+            'rat': rat,
             'identity': _carrier_identity({'rat': rat, 'band': band,
                                            'channel': ch,
                                            'bandwidth_mhz': bw}),
+            'channel': ch,
             'active': active,
             'bandwidth_mhz': bw,
-            'raw': {'rsrp': _comp_val(diagnostics, 'RSRP' + suf),
-                    'rsrq': _comp_val(diagnostics, 'RSRQ' + suf),
-                    'sinr': _comp_val(diagnostics, 'SINR' + suf)},
+            'tokens': {'rsrp': _comp_val(diagnostics, 'RSRP' + suf),
+                       'rsrq': _comp_val(diagnostics, 'RSRQ' + suf),
+                       'sinr': _comp_val(diagnostics, 'SINR' + suf),
+                       'rssi': _comp_val(diagnostics, 'RSSI' + suf)},
         })
     return out
 
 
-def component_rf(entry):
-    """Validated RF block for one component entry, or None if none present.
-
-    validity per metric: valid | missing | placeholder_zero.
-    """
-    raw = entry['raw']
-    if all(v is None for v in raw.values()):
-        return None
-    placeholder_ctx = (not entry['active']) or entry['bandwidth_mhz'] == 0
-    out, validity = {}, {}
-    for f in ('rsrp', 'rsrq', 'sinr'):
-        v = raw[f]
-        if v is None:
-            validity[f] = 'missing'
-            out[f] = None
-        elif v == 0 and placeholder_ctx:
-            validity[f] = 'placeholder_zero'
-            out[f] = None
-        else:
-            validity[f] = 'valid'
-            out[f] = v
-    sinr_raw = raw['sinr']
-    scale = None
-    if out['sinr'] is not None:
-        if abs(sinr_raw) > SINR_TENTHS_ABOVE:
-            out['sinr'] = round(sinr_raw / 10.0, 1)
-            scale = SCALE_TENTHS
-        else:
-            out['sinr'] = None
-            scale = SCALE_AMBIGUOUS
-            validity['sinr'] = 'ambiguous_scale'
-    out['sinr_raw'] = sinr_raw
-    out['sinr_scale'] = scale
-    out['validity'] = validity
+def _serving_refs(diagnostics):
+    """[(rat, channel, sinr_db)] of the serving carriers whose SINR is
+    reported at serving level (decimal dB, range-checked). Used ONLY to
+    corroborate the component SINR scale for the matching carrier."""
+    refs = []
+    rfband = diagnostics.get('RFBAND')
+    if _present(rfband):
+        rat, _ = _parse_band_name(rfband)
+        ch = diagnostics.get('RFCHANNEL')
+        src = 'SINR_5G' if rat == 'NR' else 'SINR'
+        if rat and _present(ch):
+            refs.append((rat, str(ch).strip(), diagnostics.get(src)))
+    rfband5 = diagnostics.get('RFBAND_5G')
+    if _present(rfband5):
+        rat, _ = _parse_band_name(rfband5)
+        ch = diagnostics.get('RFCHANNEL_5G')
+        if rat and _present(ch):
+            refs.append((rat, str(ch).strip(), diagnostics.get('SINR_5G')))
+    out = []
+    for rat, ch, raw in refs:
+        num, _ = RV.parse_token(raw)
+        if num is not None and RV.in_range('sinr', num, rat):
+            out.append((rat, ch, num))
     return out
 
 
-def _attach_component_rf(carriers, entries):
+def component_rf(entry, serving_refs=None):
+    """Validated RF block for one component entry, or None if none present.
+
+    v0.8.4 field-aware validity (rf_validity): every metric reports a
+    validity in RV.VALIDITY_VALUES; the interpreted value is None unless
+    valid; non-valid, non-missing readings keep the number in `raw`.
+    SINR carries `sinr_scale` provenance. `empty_reason` is set when the
+    entry itself carries no usable measurement (inactive / 0 MHz / RSSI 0).
+    """
+    tok = entry['tokens']
+    if all(v is None for v in tok.values()):
+        return None
+    rat = entry.get('rat')
+    nums = {k: RV.parse_token(v)[0] for k, v in tok.items()}
+    reason = RV.entry_unmeasured(entry['active'], entry['bandwidth_mhz'],
+                                 nums['rssi'], nums['rsrp'])
+    out, validity, raw = {}, {}, {}
+    for f in ('rsrp', 'rsrq'):
+        val, vd = RV.validate_metric(f, nums[f], rat, reason)
+        out[f] = val
+        validity[f] = vd
+        if vd not in (RV.VALID, RV.MISSING):
+            raw[f] = nums[f]
+    ref = None
+    for r_rat, r_ch, r_sinr in (serving_refs or ()):
+        if r_rat == rat and entry.get('channel') and r_ch == entry['channel']:
+            ref = r_sinr
+            break
+    sres = RV.component_sinr(tok['sinr'], rat, reason, ref)
+    out['sinr'] = sres['value']
+    validity['sinr'] = sres['validity']
+    out['sinr_raw'] = sres['raw']
+    out['sinr_scale'] = sres['scale']
+    if sres['ref_diff_db'] is not None:
+        out['sinr_ref_diff_db'] = sres['ref_diff_db']
+    rssi_val, rssi_vd = RV.validate_metric('rssi', nums['rssi'], rat, reason)
+    if nums['rssi'] is not None:
+        out['rssi'] = rssi_val
+        validity['rssi'] = rssi_vd
+        if rssi_vd not in (RV.VALID, RV.MISSING):
+            raw['rssi'] = nums['rssi']
+    out['validity'] = validity
+    if raw:
+        out['raw'] = raw
+    if reason:
+        out['empty_reason'] = reason
+    out['source'] = entry['suffix']
+    return out
+
+
+def _attach_component_rf(carriers, entries, serving_refs=None):
     """rf for each deduped carrier from the component entry with the same
     role AND identity; None (not copied from serving level) otherwise."""
     by = {}
     for e in entries:
         by.setdefault((e['role'], e['identity']), e)
     out = []
+    blocks = []
     for c in carriers:
         e = by.get((c.get('role'), _carrier_identity(c)))
-        out.append(component_rf(e) if e is not None else None)
+        blk = component_rf(e, serving_refs) if e is not None else None
+        out.append(blk)
+        if blk is not None:
+            blocks.append({'scale': blk.get('sinr_scale')})
+    # Family-level upgrade: one corroborated component supports the others.
+    RV.upgrade_family_scale(blocks)
+    it = iter(blocks)
+    for blk in out:
+        if blk is not None:
+            blk['sinr_scale'] = next(it)['scale']
     return out
+
+
+def role_aliases(source_carriers, carrier):
+    """Every NCOS role under which the same physical carrier was reported.
+
+    Mirrors the dedupe rules: active source entries with the same
+    RAT/band/channel/bandwidth, plus channel-less entries of the same
+    RAT/band/bandwidth when exactly ONE explicit channel exists in that
+    group (the case in which dedupe merges them). A carrier without a
+    channel keeps only its own role.
+    """
+    ident = _carrier_identity(carrier)
+    own = str(carrier.get('role') or '')
+    if ident[2] is None:
+        return [own] if own else []
+    rat, band, channel, bw = ident
+    active = [c for c in source_carriers if c.get('active')]
+    group = [c for c in active
+             if _carrier_identity(c)[0] == rat
+             and _carrier_identity(c)[1] == band
+             and _carrier_identity(c)[3] == bw]
+    channels = {_carrier_identity(c)[2] for c in group
+                if _carrier_identity(c)[2] is not None}
+    roles = set()
+    for c in group:
+        cid = _carrier_identity(c)[2]
+        if cid == channel or (cid is None and len(channels) == 1):
+            roles.add(str(c.get('role') or ''))
+    roles.discard('')
+    return sorted(roles) if roles else ([own] if own else [])
 
 
 def carrier_evidence(source_carriers, deduped):
@@ -886,7 +1000,8 @@ def normalize_cellular(uid, diagnostics, metric_ts, collected_ts,
         return None
     source = _collect_carriers(diagnostics)
     carriers = _dedupe_active_carriers(source)
-    rf = _attach_component_rf(carriers, _component_entries(diagnostics))
+    rf = _attach_component_rf(carriers, _component_entries(diagnostics),
+                              _serving_refs(diagnostics))
     service_mode = _determine_service_mode(diagnostics)
     summary = _build_carrier_summary(carriers)
     sa = service_mode == '5G SA'
@@ -912,16 +1027,36 @@ def normalize_cellular(uid, diagnostics, metric_ts, collected_ts,
         pci = _diag(diagnostics, 'phy_cell_id')
         band = _diag(diagnostics, 'rf_band')
 
-    return {
+    # Serving-level readings: validated per field; the raw number is kept
+    # in rf_raw when the reading is not valid.
+    plain_rat = 'NR' if sa else 'LTE'
+    srv = {}
+    for name, field, metric, rat in (
+            ('rsrp', 'rsrp', 'rsrp', plain_rat),
+            ('rsrq', 'rsrq', 'rsrq', plain_rat),
+            ('sinr', 'sinr', 'sinr', plain_rat),
+            ('rsrp_5g', 'rsrp_5g', 'rsrp', 'NR'),
+            ('rsrq_5g', 'rsrq_5g', 'rsrq', 'NR'),
+            ('sinr_5g', 'sinr_5g', 'sinr', 'NR')):
+        srv[name] = RV.serving_metric(_diag(diagnostics, field), metric, rat)
+    rf_validity = {k: v['validity'] for k, v in srv.items()}
+    rf_raw = {k: v['raw'] for k, v in srv.items()
+              if v['validity'] not in (RV.VALID, RV.MISSING)}
+
+    cell_id_raw = cell_id
+    canon = RV.canonical_cell_id(cell_id_raw)
+    rec = {
         'uid': uid,
         'carrier': carrier,
         'service_mode': service_mode,
-        'rsrp': rf_number(_diag(diagnostics, 'rsrp')),
-        'rsrq': rf_number(_diag(diagnostics, 'rsrq')),
-        'sinr': rf_number(_diag(diagnostics, 'sinr')),
-        'rsrp_5g': rf_number(_diag(diagnostics, 'rsrp_5g')),
-        'rsrq_5g': rf_number(_diag(diagnostics, 'rsrq_5g')),
-        'sinr_5g': rf_number(_diag(diagnostics, 'sinr_5g')),
+        'rf_version': RF_VERSION,
+        'rsrp': srv['rsrp']['value'],
+        'rsrq': srv['rsrq']['value'],
+        'sinr': srv['sinr']['value'],
+        'rsrp_5g': srv['rsrp_5g']['value'],
+        'rsrq_5g': srv['rsrq_5g']['value'],
+        'sinr_5g': srv['sinr_5g']['value'],
+        'rf_validity': rf_validity,
         'serving_band': serving.get('band') if serving else None,
         'serving_bandwidth_mhz': (serving.get('bandwidth_mhz')
                                   if serving else None),
@@ -930,6 +1065,7 @@ def normalize_cellular(uid, diagnostics, metric_ts, collected_ts,
         'zero_mhz_count': summary['zero_mhz_count'],
         'carriers': [{
             'role': c.get('role'),
+            'role_aliases': role_aliases(source, c),
             'rat': c.get('rat'),
             'band': c.get('band'),
             'bandwidth_mhz': c.get('bandwidth_mhz'),
@@ -944,7 +1080,16 @@ def normalize_cellular(uid, diagnostics, metric_ts, collected_ts,
         'ca_signature': ca_signature(carriers),
         'cell_key_hash': cell_key_hash(carrier, service_mode, cell_id, pci,
                                        band),
+        'serving_cell_hash': serving_cell_hash(carrier, sa, cell_id),
+        'cell_key_state': ('ok' if canon else
+                          ('unusable' if _present(cell_id_raw) else 'absent')),
         'metric_ts': metric_ts,
         'collected_ts': collected_ts,
         'timestamp_source': timestamp_source,
     }
+    if rf_raw:
+        rec['rf_raw'] = rf_raw
+    health = RV.modem_health(status)
+    if health is not None:
+        rec['health'] = health
+    return rec

@@ -402,10 +402,13 @@ def test_changes_failed_read_service():
         c.fail = {'steering_rules', 'steering_events', 'steering_stats',
                   'steering_intents'}
         obs = svc.collect('manual', _STEER, group='steering')
-        check(steering_state.NAME not in obs['config_versions'] and
+        ref = obs['config_versions'].get(steering_state.NAME)
+        check(ref is not None and ref['attribution'] == 'latest_known' and
+              ref['changed'] is False and ref['version'] == v1 and
               'steering_apps' not in obs and
               svc._config_store.current(steering_state.NAME)['version']
-              == v1, 'failed steering read: no version, no runtime record')
+              == v1, 'failed steering read: latest-known reference only, no new version, '
+              'no runtime record')
 
 
 def test_changes_capture_reset_not_removal():
@@ -779,8 +782,11 @@ def test_bond_versions_and_legacy():
         c.fail = {'wan_bonding_cfg'}
         clock.t += 60
         o4 = svc.collect('manual', ('wan_bonding_cfg',), group='bonding')
-        check('wan_bonding_config' not in o4['config_versions'],
-              'failed config read does not re-version from cache')
+        ref = o4['config_versions'].get('wan_bonding_config')
+        check(ref is not None and ref['attribution'] == 'latest_known' and
+              ref['changed'] is False and ref['version'] == v1 + 1,
+              'failed config read: referenced as latest known, never '
+              're-versioned or claimed as a fresh read')
     shuffled = F.bond_cfg()
     shuffled[0]['members'] = list(reversed(shuffled[0]['members']))
     for m in shuffled[0]['members']:
@@ -826,7 +832,9 @@ def test_cell_nsa_components():
           '_5G_PCELL key with an LTE band value is LTE (RAT from band)')
     check(by['pcell']['rf']['sinr'] == 18.1 and
           by['pcell']['rf']['sinr_raw'] == 181 and
-          by['pcell']['rf']['sinr_scale'] == 'tenths_db_plausibility',
+          by['pcell']['rf']['sinr_scale'] in (
+              'tenths_corroborated', 'tenths_family_inferred',
+              'tenths_family_corroborated'),
           'raw SINR 181 -> 18.1 dB with scaling provenance')
     check(by['pcell']['rf']['rsrp'] is None and
           by['pcell']['rf']['validity']['rsrp'] == 'missing',
@@ -842,10 +850,12 @@ def test_cell_nsa_components():
                                    'sinr': 'placeholder_zero'} and
           s1['rf']['rsrp'] is None, '0 MHz component zeros are placeholders')
     s2 = by['scell2']
-    check(s2['rf']['sinr'] is None and s2['rf']['sinr_raw'] == 25 and
-          s2['rf']['sinr_scale'] == 'ambiguous' and
-          s2['rf']['validity']['sinr'] == 'ambiguous_scale',
-          'ambiguous SINR keeps raw, no unit claimed')
+    # v0.8.4: scale follows the source FIELD FAMILY (integer token = tenths),
+    # not magnitude, so a small integer token is 2.5 dB and says so.
+    check(s2['rf']['sinr'] == 2.5 and s2['rf']['sinr_raw'] == 25 and
+          s2['rf']['sinr_scale'].startswith('tenths_family') and
+          s2['rf']['validity']['sinr'] == 'valid',
+          'small integer component SINR follows the family scale (inferred)')
     check(r['context']['roaming_state'] == 'unverified' and
           r['context']['roaming_code'] == '3',
           'undocumented ROAM code is not interpreted')

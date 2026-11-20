@@ -31,6 +31,14 @@ these change over time.
 > `docs/analytics/telemetry-foundation.md`. Existing endpoints are unchanged
 > (additive fields only).
 
+> **v0.8.4 engineering analytics.** Adds validity-checked cellular RF
+> (every reading says whether it is valid, a placeholder, impossible or of
+> unknown scale, and the raw value is kept), NCOS cellular health, stable
+> serving-cell identity, **three new history analytics endpoints** (cellular,
+> SD-WAN, and time-aligned correlation), and a **256 MiB / 7-day history**
+> with configurable limits, periodic cleanup, low-disk write protection and
+> coverage reporting. See *Historical analytics (v0.8.4)* and
+> *Durable telemetry storage* below.
 > **v0.7.0 adds the first web page: Throughput trends.** Open `http://router_ip:<port>`
 > (the port is in the app log and in `sdwan_analyzer_web_port`). The earlier endpoint list is now at `/dev`.
 
@@ -136,6 +144,9 @@ not ready"}` until the first snapshot has been composed.
 - `GET /api/analytics/steering/changes` (0.8.3) — `steering_rule_defs` versions and the observed differences between them; `limit` (1-50), `before_version`.
 - `GET /api/analytics/wbond_config` (0.8.3) — configured bonds (static/dynamic mode, selection criteria) resolved against runtime members; configured and runtime weights kept separate.
 - `GET /api/analytics/validity` (0.8.3) — collector health, section freshness and data-validity indicators.
+- `GET /api/analytics/cellular` (0.8.4) — serving cells, LTE versus NR usage, RF statistics with validity exclusions, carrier-aggregation changes, NCOS cellular health history and time-bounded events per modem.
+- `GET /api/analytics/sdwan_history` (0.8.4) — steering rules and observed applications, bond member and weight history, per-layer throughput and QoE/SWANS quality over a time window.
+- `GET /api/analytics/correlation` (0.8.4) — cellular and SD-WAN events that were first seen in the same or adjacent polls. Timing evidence only; no cause is asserted.
 - `GET /api/recordings/<job_id>/samples` (0.4.4) — paginated Recording
   samples; see *Query APIs*.
 - `POST /api/refresh/<group>` — manual refresh of one group
@@ -453,8 +464,27 @@ tmp/telemetry/
 - fsync: history/config/events on every write; Recording samples flushed per
   sample and fsynced about every 30 s (and on stop/expiry/failure/shutdown).
 - Retention (whole files only; the active Recording and today's history file
-  are never deleted): history 7 days or 32 MB; Recordings 10 completed jobs
-  or 32 MB; swept at startup, UTC day rollover and Recording completion.
+  are never deleted): **history 7 days or 256 MiB** (v0.8.4; was 32 MiB), set
+  with `sdwan_analyzer_history_max_mb` (32-1024) and
+  `sdwan_analyzer_history_max_days` (1-30); Recordings 10 completed jobs or
+  32 MB (independent of the history limits). Swept at startup, UTC day
+  rollover, Recording completion and **every hour**. The effective policy,
+  where each value came from, retained coverage and recent deletions are in
+  `GET /api/storage` (`persistent.history_policy`, `history_coverage`,
+  `retention_events`).
+- **Low-disk protection (v0.8.4).** History writes pause when free space falls
+  below the larger of 512 MiB and 10% of the filesystem, and resume only after
+  a higher threshold. Before pausing, the oldest whole days are removed.
+  While paused the app keeps collecting in memory (the latest state and the
+  20 newest observations stay available) and writes only one pause event, not
+  one per observation. The size limit is also lowered when the disk could not
+  hold it above that reserve. A single day that alone reaches the limit pauses
+  writes until the next UTC day. `persistent.space_guard` shows the state.
+- **Queries on large history.** `/api/history` keeps its 1 MiB scan limit. A
+  verified in-memory index lets a query that starts late in a large day file
+  skip bytes that are provably older than the start; it never assumes the
+  records are time-ordered, and a file it cannot prove is read from the
+  beginning as before.
 - `state.json` carries a per-process `run_id` (+ `pid`). A process claims it
   at startup and, on shutdown, writes its clean-stop marker ONLY if the file
   still carries its own `run_id`; if a newer process already replaced it (NCOS
@@ -648,6 +678,78 @@ When durable storage is unavailable, both endpoints fall back to the bounded
 in-memory stores with the same contract (cursors there are sequence positions;
 an evicted position is `410`).
 
+## Historical analytics (v0.8.4)
+
+Read-only and bounded. Each request streams stored observations through the
+analysis (memory holds one page), scans at most **8 MiB** of history and
+**1,500** observations, and reports `window.truncated` with `next_start` when
+a limit stopped it; ask again from `next_start` to continue. The default
+window is the last 6 hours. Parameters: `start`, `end` (UTC epoch seconds),
+`uid` (cellular and correlation), `max_events` (1-500), `window_s`
+(correlation, 60-1800).
+
+What the results do **not** claim: events are detected **between two polls**
+(`detected_between`, `exact_time: false`; no handover time is claimed);
+bond weights are NCOS control values, not traffic shares; flow counts are
+gauges; physical, overlay and bond throughput are separate layers and are
+never added; packet-loss percentages are not computed; correlation is timing
+evidence, never a cause.
+
+### `GET /api/analytics/cellular`
+Per modem: `serving_cells[]` (privacy-safe `cell_key_hash`, samples, share,
+`observed_seconds`, RF statistics, per-component statistics, `confidence`),
+`technology_usage` (LTE versus NR carrier presence, by service mode),
+`health` (NCOS score, category and signal strength history), `excluded`
+(readings left out of the statistics and why), `events[]`
+(`serving_cell_change`, `radio_mode_change`, `ca_composition_change`,
+`ca_bandwidth_change`, `component_role_change`, `connection_state_change`,
+`health_category_change`, `modem_missing`, `observation_gap`) and
+`data_quality`. Example event:
+
+```json
+{"type": "ca_composition_change", "uid": "mdm-1c00798a",
+ "first_observed_ts": 1795196762, "detected_between": [1795196702, 1795196762],
+ "uncertainty_s": 60, "time_resolution": "between_polls", "exact_time": false,
+ "confidence": "normal",
+ "detail": {"added": ["NR:Band n77:630720"], "removed": []}}
+```
+
+### `GET /api/analytics/sdwan_history`
+`steering.rules[]` (flow gauge statistics, observed applications, preferred
+WAN history, definition revisions with their attribution),
+`bonds[]` (member count, per-member runtime `config_weight`,
+`download_weight` and `upload_weight` statistics, link and attach states,
+member `throughput` with the physical and overlay layers kept separate),
+`interfaces.by_interface[]` (per-interface rates with excluded intervals
+listed), `quality` (QoE latency and SWANS latency/jitter; invalid readings
+excluded and counted) and `events[]`.
+
+### `GET /api/analytics/correlation`
+`correlation.pairs[]` pairs a cellular event with an SD-WAN event first
+observed within `window_s`. `evidence` is `A_same_poll_same_path`,
+`B_same_poll`, `C_adjacent_polls_same_path` or `D_adjacent_polls`
+(`same_path` means the SD-WAN event names the same modem). Compare with
+`event_rates_per_hour`, which shows how often each event type occurs on its
+own. `cause_asserted` is always `false`.
+
+### Cellular RF validity (v0.8.4)
+Every RF reading carries a validity: `valid`, `missing`, `placeholder_zero`,
+`placeholder_context`, `implausible_range` or `unknown_scale`. The raw value
+stays in `raw` / `sinr_raw` / `rf_raw` when it is not valid. Component SINR
+carries `sinr_scale`: `tenths_corroborated`, `tenths_family_corroborated`,
+`tenths_family_inferred` (**inferred**, not verified), `db_decimal_token` or
+`unknown`. A raw 0 on a measured carrier is `implausible_range`; a value on an
+unmeasured entry (inactive, 0 MHz, or RSSI 0 with RSRP 0) is a placeholder;
+RSRQ -3 is never rejected by value alone. Each carrier lists every NCOS
+`role_aliases` under which it was reported. Records written before v0.8.4 are
+checked against the same plausibility ranges when analyzed.
+
+### Configuration version attribution (v0.8.4)
+Each observation's `config_versions` entry now has `attribution`: `read` (its
+source was read in that pass), `latest_known` (the latest known version is
+referenced; no fresh read and `changed: false`) or `unspecified` (record from
+before v0.8.4).
+
 ## Normalized snapshot schema
 
 ```
@@ -821,6 +923,8 @@ for overlays; the WAN object key (e.g. `wbond-wbond0_hub0`) is the
 |-------|------|----------|---------|
 | `sdwan_analyzer_web_port` | string (integer port) | No | Effective web listening port. Namespaced by app per convention `<app_name>_web_port` (device-level appdata is shared). |
 | `sdwan_analyzer_interval_minutes` | string (1, 5, 15, 30 or 60) | No | Scheduled collection interval. Default 15 (applied in code, never written). Invalid values fall back to 15. |
+| `sdwan_analyzer_history_max_mb` | string (integer, 32-1024) | No | Maximum disk used by normal history. Default 256. Values outside the range are clamped; invalid values fall back to 256. Applied in code, never written. |
+| `sdwan_analyzer_history_max_days` | string (integer, 1-30) | No | Maximum age of normal history. Default 7. Values outside the range are clamped; invalid values fall back to 7. Applied in code, never written. |
 
 Web-port behavior (see `analyzer/web_port.py`, the shared dynamic web port
 module, byte-identical to the copy in Speedtest Analyzer 1.1.7 and the kit's

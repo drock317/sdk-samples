@@ -1042,8 +1042,9 @@ def test_cellular_ca_parsing():
           (rec['rsrp_5g'], rec['rsrq_5g'], rec['sinr_5g']) == (-95, -12, 8),
           'LTE and 5G signal fields')
     # v0.8.3: the legacy fields are unchanged; `rf` is additive.
-    check(set(rec['carriers'][0]) == {'role', 'rat', 'band', 'bandwidth_mhz',
-                                      'channel', 'pci', 'active', 'rf'},
+    check(set(rec['carriers'][0]) == {'role', 'role_aliases', 'rat', 'band',
+                                      'bandwidth_mhz', 'channel', 'pci',
+                                      'active', 'rf'},
           'carrier entry fields')
     check(rec['timestamp_source'] == 'collector' and rec['metric_ts'] == 50
           and rec['collected_ts'] == 60, 'timestamp envelope')
@@ -2255,8 +2256,9 @@ def test_cellular_current_state_api():
         check(m['rsrp'] == -89.0 and m['sinr'] == 16.2 and
               m['sinr_5g'] == 32.0, 'RF values numeric in current state')
         check(m['carriers'] and all(
-            set(c) == {'role', 'rat', 'band', 'bandwidth_mhz', 'channel',
-                       'pci', 'active', 'rf'} for c in m['carriers']),
+            set(c) == {'role', 'role_aliases', 'rat', 'band',
+                       'bandwidth_mhz', 'channel', 'pci', 'active', 'rf'}
+            for c in m['carriers']),
             'carrier entries carry the expected fields only')
         check(m['cell_key_hash'] and len(m['cell_key_hash']) == 16,
               'hashed cell key present')
@@ -2953,6 +2955,15 @@ def main():
     import foundation_tests
     foundation_tests.bind(check, _free_port)
     tests = tests + foundation_tests.TESTS
+    import cellular_v084_tests
+    cellular_v084_tests.bind(check)
+    tests = tests + cellular_v084_tests.TESTS
+    import storage_v084_tests
+    storage_v084_tests.bind(check)
+    tests = tests + storage_v084_tests.TESTS
+    import analytics_v084_tests
+    analytics_v084_tests.bind(check)
+    tests = tests + analytics_v084_tests.TESTS
     for t in tests:
         t()
     print('')

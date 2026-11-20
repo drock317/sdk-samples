@@ -77,7 +77,9 @@ These are described in the app readme. Summarised here for orientation.
   or non-monotonic time, decreasing counters, and caller-defined gaps. See
   `docs/analytics/counter-derivation.md`.
 - **Durable storage**: survives app restart and reboot; may be wiped by an app update (accepted).
-  Retention is 7 days or 32 MB of history, and 10 completed Recordings or 32 MB.
+  Retention is 7 days or 256 MiB of history (v0.8.4; was 32 MiB; configurable 1-30 days and
+  32-1024 MiB), and 10 completed Recordings or 32 MB, independent of history. From v0.8.4: hourly
+  sweep, low-disk write protection, coverage and retention-event reporting in `/api/storage`.
 - **Query APIs**: `/api/history` and `/api/recordings/<id>/samples`, cursor paginated, bounded reads.
 - **Local test harness**: `tests/run_tests.py` plus `durable_tests.py`, `query_tests.py`,
   `acquisition_tests.py`, `counters_tests.py`; standard library only. Run on CPython 3.8.20.
@@ -123,8 +125,10 @@ Not built, and not to be implied by any current document or UI:
 - A persistent application catalog (the approved v0.8.3 design is
   rule-centric; application/category references are kept only as they appear
   in definitions and runtime stats).
-- Cross-source correlation analytics and a redesigned recorder.
-- Advanced cellular RF statistics and transition analytics (v0.8.4).
+- A redesigned recorder (v0.8.5). Cross-source correlation exists since v0.8.4 as
+  timing evidence only (`/api/analytics/correlation`); no root-cause inference.
+- Daily rollups of the new analytics and any persisted analytics results (analytics are computed
+  on read from history; nothing derived is stored).
 - Production UI, dashboards, Recording UI, and Recording analysis.
 - SD-WAN overlay source-IP resolution wiring.
 - Device validation catalog for friendly model names.
@@ -158,10 +162,15 @@ Still open:
 | U16 | Stable logical steering rule identity | Rename vs remove+add cannot be told apart | NCOS 7.26.81 exposes none; rules keyed by name (`logical_name_only`), renames reported as `possible_rename` (never confirmed) |
 | U17 | Configured bond `_id_` to runtime bond interface | Multi-bond sites | No universal mapping verified; single-bond candidate association only |
 | U18 | Criterion weight to runtime `config_weight`/`ds_weight`/`us_weight` | Weight interpretation | Unknown formula (R2400: 100 -> 33/33/33). Values kept separate, raw |
-| U19 | Component SINR between -50 and 50, component RSRP/RSRQ scaling, carrier dedupe of identical SCELL identities | RF accuracy | `sinr_raw` + `ambiguous`; RSRP/RSRQ as reported; collapsed groups flagged `ambiguous` |
+| U19 | Component SINR scale, component RSRP/RSRQ scaling, carrier dedupe of identical SCELL identities | RF accuracy | **v0.8.4:** SINR scale by field family with provenance (`tenths_family_inferred` is inferred, not verified; corroborated where the component is the serving carrier); RSRP/RSRQ as reported, range-checked; collapsed groups flagged `ambiguous`, aliases preserved |
 | U20 | Location and meaning of QoE `4294967295` | Loss/latency validity | Not reproduced. Field-aware sentinel-candidate flags only |
 | U21 | Units of WBOND member bandwidth fields | Bandwidth interpretation | Unknown; reported raw as `bandwidth_raw_units_unverified` |
 | U15b | v0.8.3 config objects use only same-pass successful reads | Partially resolves U15 for `steering_rule_defs` and `wan_bonding_config` | Legacy objects unchanged |
+| U22 | Observations did not reference a config version whose source was not read in that pass | History could not tell a fresh read from a stale one | **v0.8.4:** every version reference has `attribution`; `latest_known` never claims a read or a change |
+| U23 | Serving-cell identity changed with the radio mode (v0.8.3 `cell_key_hash` hashes the mode) | False cell changes on LTE to 5G NSA | **v0.8.4:** `serving_cell_hash` (carrier, id type, canonical id). Analytics fall back to the legacy hash with low confidence |
+| U24 | Component SINR scale (integer token = tenths) is corroborated only where a component is the serving carrier | Scale of components with no serving counterpart | Inferred and labelled; needs more live pairs and ideally a vendor statement |
+| U25 | RSRQ -3 on unloaded measured carriers vs. placeholders | Over/under-rejection | Context rule (unmeasured entry only). Needs a controlled capture with known idle and loaded carriers |
+| U26 | Packet-loss counter semantics | Loss percentages | Still not computed |
 
 ## 6. Phase plan
 
@@ -180,7 +189,8 @@ Still open:
 | v0.8.1 | Read-only WBOND runtime analysis, `GET /api/analytics/wbond` | Done, see `docs/analytics/wbond.md` |
 | v0.8.2 | Stored WBOND observations keep `tunnel_iface` and flow-total provenance (`reported`/`summed`/`unknown`) | Done, see `docs/analytics/wbond.md`. Pre-0.8.2 history is not back-filled. Normal collection intervals are 5, 15, 30 and 60 min; sub-5-min is for short recordings; the 1-minute schedule is temporary testing |
 | v0.8.3 | Telemetry foundation: `steering_rule_defs` (definition-only versioning) and change detection, runtime application matching (`steering_apps`), `wan_bonding_config` with criteria-to-member resolution, component-carrier RF and dedupe evidence, QoE validity flags, `/api/analytics/{steering,steering/changes,wbond_config,validity}`. Fixes: bonding fingerprint v2 (legacy pinned), flow-total `summed` provenance | Implemented, pending live validation on R1900/R2400. See `docs/analytics/telemetry-foundation.md` |
-| v0.8.4 | Advanced RF statistics, cellular transition/event analytics | Approved direction, not built |
+| v0.8.4 | Engineering analytics and correlation. **Cellular correctness:** `rf_validity.py` field-aware validity (valid / missing / placeholder_zero / placeholder_context / implausible_range / unknown_scale), raw values preserved, SINR scale by field family with provenance (not magnitude), canonical cell ids before hashing, mode-independent `serving_cell_hash`, `role_aliases`, NCOS cellular health. **Storage:** 256 MiB / 7 days default, App Data limits with bounds, hourly sweep, low-disk pause/resume with hysteresis, coverage and retention events, verified prefix-maximum seek index. **Analytics:** `/api/analytics/{cellular,sdwan_history,correlation}`. **Attribution:** `config_versions[].attribution` (`read` / `latest_known` / `unspecified`). | Implemented, pending live validation on R1900/R2400. See `docs/analytics/engineering-analytics.md` |
+| v0.8.5 | Advanced recording subsystem | Planned, not started |
 
 ## 7. Failed-read invariant and runtime audit
 

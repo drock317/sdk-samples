@@ -39,6 +39,7 @@ import cp
 from . import VERSION
 from . import analytics
 from . import bond_config
+from . import cell_analytics
 from . import cellular
 from . import collectors
 from . import durable
@@ -47,6 +48,8 @@ from . import inspector
 from . import normalize
 from . import query
 from . import recording
+from . import retention
+from . import sdwan_analytics
 from . import steering_defs
 from . import steering_state
 from . import storage
@@ -66,6 +69,12 @@ CONFIG_RECONCILE_S = 3600
 REFRESH_COOLDOWN_S = 5
 
 SAMPLE_SOURCES = ('startup', 'scheduled', 'manual', 'recording')
+# v0.8.4 historical analytics request bounds (disk bytes, observations).
+ANALYSIS_DEFAULT_WINDOW_S = 6 * 3600
+ANALYSIS_MAX_SCAN_BYTES = 8 * 1048576
+ANALYSIS_MAX_OBS = 1500
+DEFAULT_ANALYSIS_EVENTS = 200
+MAX_ANALYSIS_EVENTS = 500
 
 # Current-state section -> collector keys that must ALL be read successfully
 # in a pass for that section's freshness to advance.
@@ -167,7 +176,8 @@ class _RawCache(object):
 class AnalyzerService(object):
     def __init__(self, store=None, schedule_minutes=DEFAULT_SCHEDULE_MINUTES,
                  config_store=None, clock=None, app_root=None,
-                 telemetry_root=None, telemetry_retention=None):
+                 telemetry_root=None, telemetry_retention=None,
+                 history_policy=None):
         self._clock = clock if clock is not None else time.time
         # Root of the files the Storage Inspector may describe (the app's own
         # directory). Injectable for tests.
@@ -195,9 +205,15 @@ class AnalyzerService(object):
                 else:
                     root = os.path.join(self._app_root, telemetry_root)
                     shown = telemetry_root.replace(os.sep, '/')
+                # v0.8.4: operator policy (App Data strings, validated and
+                # clamped) first; an explicit internal override wins.
+                pol = history_policy or {}
+                limits, policy_report = retention.normalize_history_policy(
+                    pol.get('max_mb'), pol.get('max_days'))
+                limits.update(telemetry_retention or {})
                 tel = durable.TelemetryStorage(
                     root, display_root=shown, clock=self._clock,
-                    retention=telemetry_retention)
+                    retention=limits, policy_report=policy_report)
                 if tel.prepare():
                     self._durable = tel
                 else:
@@ -225,6 +241,7 @@ class AnalyzerService(object):
         if schedule_minutes not in SCHEDULE_CHOICES:
             schedule_minutes = DEFAULT_SCHEDULE_MINUTES
         self._schedule_minutes = schedule_minutes
+        self._sync_expected_interval()
         self._next_due = None            # epoch of next scheduled collection
 
         # Raw last-known-good caches: runtime keys vs static/config keys.
@@ -294,6 +311,12 @@ class AnalyzerService(object):
 
     # --- schedule ---------------------------------------------------------
 
+    def _sync_expected_interval(self):
+        """Tell the durable layer the cadence so gap detection is relative."""
+        d = getattr(self, '_durable', None)
+        if d is not None:
+            d.set_expected_interval(self._schedule_minutes * 60)
+
     def schedule_minutes(self):
         return self._schedule_minutes
 
@@ -302,6 +325,7 @@ class AnalyzerService(object):
         if minutes not in SCHEDULE_CHOICES:
             return False
         self._schedule_minutes = minutes
+        self._sync_expected_interval()
         self._plan_next_due(self._clock())
         return True
 
@@ -453,6 +477,8 @@ class AnalyzerService(object):
                     cp.log('service: recording sample dropped (cap)')
             else:
                 self._store.append(obs)
+                if self._durable is not None:
+                    self._durable.maintenance(now)
             return obs
 
     def _with_steering_deps(self, results):
@@ -582,7 +608,9 @@ class AnalyzerService(object):
                     'config_read_ts': self._config_raw.health().get(
                         'qoe_cfg', {}).get('last_success_ts')}
         if 'wan_bonding' in ok:
-            obs['wbond'] = telemetry.wbond_runtime(snap.get('bonding'), now)
+            obs['wbond'] = telemetry.wbond_runtime(
+                snap.get('bonding'), now,
+                telemetry.iface_uid_map(data.get('wan_devices')))
         ts = snap.get('traffic_steering', {})
         if {'steering_rules', 'steering_stats', 'steering_events'} <= ok:
             # Runtime per rule combines rules (steering_to), stats (flows,
@@ -617,6 +645,43 @@ class AnalyzerService(object):
             raw.get('traffic_class_config'), raw.get('steering_stats'))
         return lambda value, kind: steering_defs.resolve_destination(
             res, value, kind)
+
+    # Collector keys whose successful read in THIS pass makes a config
+    # version a fresh observation; otherwise the observation only references
+    # the latest known version (attribution = latest_known).
+    _VERSION_SOURCES = {
+        'traffic_classes': ('traffic_class_config',),
+        'destinations': ('identities_ip', 'identities_intent'),
+        'wan_rules': ('wan_rules2',),
+        'steering_definitions': ('steering_rules',),
+        'wbond_config': ('wan_bonding',),
+        'overlay_underlay': ('wan_devices',),
+        'capabilities': ('wan_bonding',),
+        steering_state.NAME: ('steering_rules',),
+        'wan_bonding_config': ('wan_bonding_cfg',),
+    }
+
+    def _attribute_versions(self, out, ok_keys):
+        """Mark every version reference as freshly read in this pass or as
+        the latest known one, and add references for objects whose source was
+        not read in this pass. A latest_known reference never claims a change
+        (changed=False) and never claims a fresh read."""
+        for name, srcs in self._VERSION_SOURCES.items():
+            fresh = ok_keys is None or any(k in ok_keys for k in srcs)
+            ent = out.get(name)
+            if ent is None:
+                cur = self._config_store.current(name)
+                if cur is None:
+                    continue
+                out[name] = {'version': cur['version'],
+                             'fingerprint': cur['fingerprint'],
+                             'changed': False,
+                             'attribution': 'latest_known'}
+            else:
+                ent['attribution'] = 'read' if fresh else 'latest_known'
+                if not fresh:
+                    ent['changed'] = False
+        return out
 
     def _update_config_versions(self, snap, now, ok_keys=None):
         """Version static/config objects; a new version only on fp change.
@@ -693,7 +758,7 @@ class AnalyzerService(object):
                         now)
         except Exception as e:
             cp.log('service: bonding config versioning error: {}'.format(e))
-        return out
+        return self._attribute_versions(out, ok_keys)
 
     def _history_tail(self):
         try:
@@ -1140,6 +1205,127 @@ class AnalyzerService(object):
         if snap is None:
             return None
         return wbond.build(snap, devices, health)
+
+    # --- v0.8.4 historical analytics (read-only, bounded) ----------------
+
+    def _analysis_params(self, raw_query, allowed):
+        q = query.split_query(raw_query, allowed)
+        uid = q.get('uid')
+        if uid is not None and not analytics._UID_RE.match(uid):
+            raise query.bad('uid is not a valid device uid')
+        out = {'uid': uid,
+               'start': query.parse_ts('start', q.get('start')),
+               'end': query.parse_ts('end', q.get('end')),
+               'max_events': DEFAULT_ANALYSIS_EVENTS,
+               'window_s': None}
+        if q.get('max_events') is not None:
+            t = q['max_events']
+            if not t.isdigit() or not 1 <= int(t) <= MAX_ANALYSIS_EVENTS:
+                raise query.bad('max_events must be an integer between 1 '
+                                'and {}'.format(MAX_ANALYSIS_EVENTS))
+            out['max_events'] = int(t)
+        if q.get('window_s') is not None:
+            t = q['window_s']
+            if not t.isdigit() or not 60 <= int(t) <= \
+                    sdwan_analytics.MAX_CORRELATION_WINDOW_S:
+                raise query.bad('window_s must be an integer between 60 '
+                                'and {}'.format(
+                                    sdwan_analytics.MAX_CORRELATION_WINDOW_S))
+            out['window_s'] = int(t)
+        if (out['start'] is not None and out['end'] is not None
+                and out['start'] > out['end']):
+            raise query.bad('start must not be after end')
+        return out
+
+    def _scan_history(self, start, end, sinks):
+        """Stream observations in [start, end] through `sinks` (objects with
+        add(obs)). Memory holds one page; total disk bytes examined and
+        observations are capped. Returns the window description (including
+        `truncated` and `next_start` when the cap stopped the scan)."""
+        now = self._clock()
+        end_eff = end if end is not None else now
+        start_eff = start if start is not None else (
+            end_eff - ANALYSIS_DEFAULT_WINDOW_S)
+        scanned = n = skipped = seek = 0
+        cursor, last_ts, truncated = None, None, False
+        while True:
+            room = max(1, min(50, ANALYSIS_MAX_OBS - n))
+            res = self._store.query(start=start_eff, end=end_eff,
+                                    limit=room, cursor=cursor)
+            scanned += res.get('scanned_bytes') or 0
+            seek += res.get('seek_skipped_bytes') or 0
+            skipped += res.get('skipped_lines') or 0
+            for obs in res['samples']:
+                for sink in sinks:
+                    sink.add(obs)
+                n += 1
+                last_ts = obs.get('collected_ts', last_ts)
+            cursor = res.get('next_cursor')
+            if cursor is None:
+                break
+            if scanned >= ANALYSIS_MAX_SCAN_BYTES or n >= ANALYSIS_MAX_OBS:
+                truncated = True
+                break
+        return {'requested_start': start_eff, 'requested_end': end_eff,
+                'observations_scanned': n, 'scanned_bytes': scanned,
+                'seek_skipped_bytes': seek, 'skipped_lines': skipped,
+                'truncated': truncated,
+                'next_start': (last_ts + 1 if truncated and last_ts
+                               is not None else None),
+                'limits': {'max_scan_bytes': ANALYSIS_MAX_SCAN_BYTES,
+                           'max_observations': ANALYSIS_MAX_OBS,
+                           'default_window_s': ANALYSIS_DEFAULT_WINDOW_S}}
+
+    def query_cellular_analysis(self, raw_query=''):
+        p = self._analysis_params(raw_query, ('uid', 'start', 'end',
+                                              'max_events'))
+        an = cell_analytics.CellularAnalyzer(
+            uid=p['uid'], interval_hint_s=self._schedule_minutes * 60,
+            max_events=p['max_events'])
+        win = self._scan_history(p['start'], p['end'], (an,))
+        return an.result(win)
+
+    def query_sdwan_history(self, raw_query=''):
+        p = self._analysis_params(raw_query, ('start', 'end', 'max_events'))
+        an = sdwan_analytics.SdwanAnalyzer(
+            interval_hint_s=self._schedule_minutes * 60,
+            max_events=p['max_events'])
+        win = self._scan_history(p['start'], p['end'], (an,))
+        out = an.result(win)
+        out.pop('_events_all', None)
+        return out
+
+    def query_correlation(self, raw_query=''):
+        p = self._analysis_params(raw_query, ('uid', 'start', 'end',
+                                              'window_s'))
+        iv = self._schedule_minutes * 60
+        cell = cell_analytics.CellularAnalyzer(uid=p['uid'],
+                                               interval_hint_s=iv)
+        sd = sdwan_analytics.SdwanAnalyzer(interval_hint_s=iv)
+        win = self._scan_history(p['start'], p['end'], (cell, sd))
+        cres = cell.result()
+        sres = sd.result()
+        cev, sev = cell.events(), sres.pop('_events_all')
+        span = None
+        if cres['window'].get('first_observation_ts') is not None:
+            span = (cres['window']['last_observation_ts']
+                    - cres['window']['first_observation_ts'])
+        corr = sdwan_analytics.correlate(
+            cev, sev, cres['observation_interval_s'], p['window_s'], span)
+        win.update(first_observation_ts=cres['window'].get(
+            'first_observation_ts'), last_observation_ts=cres['window'].get(
+            'last_observation_ts'))
+        return {
+            'schema_version': 1, 'window': win,
+            'observations': cres['observations'],
+            'observation_interval_s': cres['observation_interval_s'],
+            'gap_threshold_s': cres['gap_threshold_s'],
+            'correlation': corr,
+            'cellular_event_counts': {m['uid']: m['event_counts']
+                                      for m in cres['modems']},
+            'sdwan_event_counts': sres['event_counts'],
+            'cause_asserted': False,
+        }
 
     # --- v0.8.3 telemetry-foundation views (read-only, cached) ----------
 

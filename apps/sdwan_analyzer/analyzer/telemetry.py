@@ -241,8 +241,28 @@ def qoe_records(raw_qoe, collected_ts):
 
 # --- WBOND runtime (raw BW fields intentionally NOT carried) --------------
 
-def wbond_runtime(bonding, collected_ts):
-    """Compact WBOND runtime from normalize.wan_bonding_detail output."""
+def iface_uid_map(raw_devices):
+    """{iface name: device uid} from wan_devices (info.iface), used to name
+    the overlay device of a bond member by its tunnel interface. Ambiguous
+    interface names (two devices, one iface) are left out."""
+    out, dup = {}, set()
+    if isinstance(raw_devices, dict):
+        for uid, dev in raw_devices.items():
+            info = dev.get('info') if isinstance(dev, dict) else None
+            iface = info.get('iface') if isinstance(info, dict) else None
+            if isinstance(iface, str) and iface:
+                if iface in out:
+                    dup.add(iface)
+                out[iface] = uid
+    for d in dup:
+        out.pop(d, None)
+    return out
+
+
+def wbond_runtime(bonding, collected_ts, iface_to_uid=None):
+    """Compact WBOND runtime from normalize.wan_bonding_detail output.
+    `iface_to_uid` (v0.8.4) adds `overlay_uid` to a member whose tunnel
+    interface names exactly one device; otherwise the key is omitted."""
     out = []
     for b in (bonding or {}).get('bonds', []):
         if not isinstance(b, dict):
@@ -273,6 +293,11 @@ def wbond_runtime(bonding, collected_ts):
                 'attach_state': m.get('link_attach_state'),
             } for m in b.get('members', []) if isinstance(m, dict)],
         }
+        if iface_to_uid:
+            for m in rec['members']:
+                ou = iface_to_uid.get(m.get('tunnel_iface'))
+                if ou:
+                    m['overlay_uid'] = ou
         rec.update(envelope(collected_ts))
         out.append(rec)
     return out
