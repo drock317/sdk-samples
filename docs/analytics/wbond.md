@@ -1,4 +1,4 @@
-# WBOND runtime analysis (v0.8.1)
+# WBOND runtime analysis (v0.8.1, history integrity v0.8.2)
 
 `GET /api/analytics/wbond` reports each WAN bond and its members from data the
 analyzer already holds. It makes no router calls and writes nothing. It reuses
@@ -15,7 +15,8 @@ Each bond: `iface`, `wbond_device`, `display_name`, and `observed`:
 `connection_state`, `link_state`, `bonding_mode`, `negotiated_capabilities`,
 `reported_member_count` (router's `Total interfaces`), `listed_member_count`,
 `resolved_member_count` (members whose overlay and physical WAN both resolved),
-`member_count_matches`, `total_download_flows`, `total_upload_flows`.
+`member_count_matches`, `total_download_flows`, `total_upload_flows`,
+`total_download_flows_source`, `total_upload_flows_source` (v0.8.2, see below).
 
 Each member: `tunnel_iface`, `overlay`, `physical` (each `resolved` with a
 `basis`, or `unresolved` with a `reason`), `physical_display_name`,
@@ -42,10 +43,50 @@ as last successfully read.
 - A measurement the router did not report is `null`, never `0`.
 - Counters and flow counts of different layers are not additive.
 - Configured WBOND membership is not collected; membership is the runtime list.
-- Bond-level `total_download_flows` / `total_upload_flows` are either the
-  router-reported totals or, when absent, a normalization fallback that sums
-  member flow counts. The response does not yet say which; future analysis
-  should record that provenance.
+- Configured WBOND membership is not collected; membership is the runtime list.
+
+## History integrity fields (v0.8.2)
+Two fields are added to each newly stored WBOND observation (`telemetry.wbond_runtime`).
+Nothing else about collection, scheduling, retention or storage changes.
+
+### `members[].tunnel_iface`
+The SD-WAN tunnel interface (the `members_list` key, e.g. `gres-hub0_164d3`) the
+member was reported under, taken from the same normalization pass that produced
+`member_uid`. It records the association as it was at collection time, so later
+analysis does not need to guess it from current topology.
+- `null` when the normalized member carries no tunnel interface. It is never
+  filled in from current topology or from another observation.
+- If NCOS ever returns `members_list` as a list rather than a keyed object, the
+  existing normalization uses the list index as the key; that is stored as is
+  and is not a real tunnel interface. NCOS returns a keyed object today.
+
+### `total_download_flows_source`, `total_upload_flows_source`
+Provenance of the bond-level `total_download_flows` / `total_upload_flows`,
+one value per direction, decided by the existing normalization fallback
+(`normalize.wan_bonding_detail`), not recalculated:
+| Value | Meaning |
+|---|---|
+| `reported` | NCOS supplied the total (`DL total flows` / `UL total flows`). A reported `0` is still `reported`. |
+| `summed` | NCOS did not supply it, so it is the sum of member flow counts. |
+| `unknown` | Provenance cannot be established: no reported total and no members to sum (the total is `null`), or the input had no provenance. |
+The two directions are independent; one can be `reported` and the other `summed`.
+The same two fields appear in `observed` of `/api/analytics/wbond`, for the live
+snapshot.
+
+### Historical limitations
+- Observations stored before v0.8.2 have no `tunnel_iface` and no `*_source`
+  fields. They are not back-filled: readers must treat the missing keys as
+  unknown, not as `reported` and not as a current-topology lookup.
+- `unknown` written by v0.8.2 means the source could not be established at
+  collection; an absent key means the observation predates the field.
+- `/api/analytics/wbond` reads the live snapshot and is not affected by older
+  history.
+
+## Collection interval
+Normal scheduled collection intervals are 5, 15, 30 and 60 minutes. Sub-5-minute
+collection is for short recording sessions. The current one-minute scheduled
+interval is temporary development testing. Flow counts are point-in-time
+populations, so how often they are sampled determines what history can show.
 
 ## Live validation (v0.8.1)
 

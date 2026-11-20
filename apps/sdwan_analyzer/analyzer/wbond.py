@@ -1,4 +1,4 @@
-"""Read-only WBOND runtime analysis (v0.8.1).
+"""Read-only WBOND runtime analysis (v0.8.1, provenance fields v0.8.2).
 
 GET /api/analytics/wbond: a pure function over data the service already
 holds. It reuses the validated topology relationships (topology.build) and
@@ -125,6 +125,11 @@ def build(snapshot, raw_devices, health):
                 'member_count_matches': obs['member_count_matches'],
                 'total_download_flows': rb.get('total_download_flows'),
                 'total_upload_flows': rb.get('total_upload_flows'),
+                # reported (NCOS) | summed (member flows) | unknown
+                'total_download_flows_source': rb.get(
+                    'total_download_flows_source') or 'unknown',
+                'total_upload_flows_source': rb.get(
+                    'total_upload_flows_source') or 'unknown',
             },
             'members': members,
         })

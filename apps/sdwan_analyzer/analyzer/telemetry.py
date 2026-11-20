@@ -244,8 +244,15 @@ def wbond_runtime(bonding, collected_ts):
             'member_count': b.get('member_count'),
             'total_download_flows': b.get('total_download_flows'),
             'total_upload_flows': b.get('total_upload_flows'),
+            # reported | summed | unknown; absent on pre-0.8.2 observations.
+            'total_download_flows_source': b.get(
+                'total_download_flows_source') or 'unknown',
+            'total_upload_flows_source': b.get(
+                'total_upload_flows_source') or 'unknown',
             'members': [{
                 'member_uid': m.get('member_uid'),
+                # Tunnel iface as collected; null when not resolvable.
+                'tunnel_iface': m.get('tunnel_iface'),
                 'configured_weight': m.get('configured_weight'),
                 'current_download_weight': m.get('current_download_weight'),
                 'current_upload_weight': m.get('current_upload_weight'),

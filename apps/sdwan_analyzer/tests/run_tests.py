@@ -1143,7 +1143,7 @@ def test_qoe_wbond_telemetry():
     check(set(m) == {'member_uid', 'configured_weight',
                      'current_download_weight', 'current_upload_weight',
                      'download_flows', 'upload_flows', 'has_loss',
-                     'link_state', 'attach_state'}, 'member fields')
+                     'link_state', 'attach_state', 'tunnel_iface'}, 'member fields')
     blob = json.dumps(w)
     check('ds_curr_bw' not in blob and 'last_bw_sample' not in blob and
           'trend' not in blob, 'raw BW fields not persisted as throughput')

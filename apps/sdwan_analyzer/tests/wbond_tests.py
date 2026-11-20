@@ -1,4 +1,4 @@
-"""v0.8.1: GET /api/analytics/wbond (WBOND runtime analysis).
+"""v0.8.1/0.8.2: GET /api/analytics/wbond (WBOND runtime analysis).
 
 Two-member (captured fixture) and three-member bonds; member relationships,
 runtime fields, unavailable values, stale data. Run through run_tests.py.
@@ -11,7 +11,7 @@ import urllib.request
 from http.server import HTTPServer
 
 import fixtures
-from analyzer import web
+from analyzer import normalize, telemetry, web
 from analyzer.service import AnalyzerService
 
 check = None
@@ -180,9 +180,81 @@ def test_wbond_stale_and_route():
             s.server_close()
 
 
+def _prov(bond):
+    b = normalize.wan_bonding_detail(bond)['bonds'][0]
+    return b['total_download_flows_source'], b['total_upload_flows_source']
+
+
+def test_flow_total_provenance():
+    print('test_flow_total_provenance')
+    # reported: fixture carries DL/UL total flows
+    check(_prov(fixtures.WAN_BONDING) == ('reported', 'reported'),
+          'reported totals -> reported')
+    b = _svc().query_wbond()['bonds'][0]['observed']
+    check(b['total_download_flows_source'] == 'reported' and
+          b['total_upload_flows_source'] == 'reported' and
+          b['total_download_flows'] == 29, 'API exposes reported provenance')
+    # summed: download total absent only; upload stays reported
+    bond = copy.deepcopy(fixtures.WAN_BONDING)
+    bond['interfaces']['gres_wb0-hub0'].pop('DL total flows')
+    check(_prov(bond) == ('summed', 'reported'),
+          'provenance is independent per direction')
+    o = _svc(bonding=bond).query_wbond()['bonds'][0]['observed']
+    check(o['total_download_flows_source'] == 'summed' and
+          o['total_download_flows'] == 29,
+          'API exposes summed provenance')
+    # unknown: no reported total and no members to sum
+    bond = copy.deepcopy(fixtures.WAN_BONDING)
+    bi = bond['interfaces']['gres_wb0-hub0']
+    for k in ('DL total flows', 'UL total flows', 'members_list'):
+        bi.pop(k, None)
+    check(_prov(bond) == ('unknown', 'unknown'),
+          'nothing reported or summable -> unknown')
+    # a reported 0 is still reported
+    bond = copy.deepcopy(fixtures.WAN_BONDING)
+    bond['interfaces']['gres_wb0-hub0']['DL total flows'] = 0
+    check(_prov(bond)[0] == 'reported', 'reported zero stays reported')
+
+
+def test_history_record_integrity():
+    print('test_history_record_integrity')
+    bonding = normalize.wan_bonding_detail(fixtures.WAN_BONDING)
+    rec = telemetry.wbond_runtime(bonding, 100)[0]
+    check(rec['total_download_flows_source'] == 'reported' and
+          rec['total_upload_flows_source'] == 'reported',
+          'record carries provenance for both directions')
+    ifaces = sorted(m['tunnel_iface'] for m in rec['members'])
+    check(ifaces == ['gres-hub0_164d3', 'gres-hub0_wan'],
+          'member records carry the collected tunnel_iface')
+    check(all(m['member_uid'] for m in rec['members']),
+          'member_uid preserved')
+    # tunnel identity is never inferred: a member without it stays null
+    bonding['bonds'][0]['members'][0].pop('tunnel_iface')
+    rec = telemetry.wbond_runtime(bonding, 100)[0]
+    check(rec['members'][0]['tunnel_iface'] is None and
+          rec['members'][1]['tunnel_iface'] is not None,
+          'missing tunnel identity -> null, no inference')
+    # legacy (pre-0.8.2) normalized input: no source keys -> unknown
+    legacy = {'bonds': [{'iface': 'b', 'total_download_flows': 3,
+                         'members': [{'member_uid': 'x'}]}]}
+    rec = telemetry.wbond_runtime(legacy, 100)[0]
+    check(rec['total_download_flows_source'] == 'unknown' and
+          rec['total_upload_flows_source'] == 'unknown' and
+          rec['members'][0]['tunnel_iface'] is None,
+          'input lacking provenance/tunnel -> unknown/null')
+    # old stored observations lack the keys and are never rewritten here;
+    # the API reads the live snapshot, not history.
+    old = {'iface': 'b', 'members': [{'member_uid': 'x'}]}
+    check('total_download_flows_source' not in old and
+          old['members'][0].get('tunnel_iface') is None,
+          'legacy stored record reads as absent/null')
+
+
 TESTS = [
     test_wbond_two_member,
     test_wbond_three_member,
     test_wbond_unavailable_values,
     test_wbond_stale_and_route,
+    test_flow_total_provenance,
+    test_history_record_integrity,
 ]

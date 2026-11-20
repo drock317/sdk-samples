@@ -142,8 +142,8 @@ def test_ui_static_serving_is_confined():
             check(code == 200 and b'/api/analytics/interfaces' in body,
                   'previous index page still available at /dev')
             code, body = srv.json('/api/status')
-            check(code == 200 and body['version'] == '0.8.1',
-                  '/api/status reports version 0.8.1')
+            check(code == 200 and body['version'] == '0.8.2',
+                  '/api/status reports version 0.8.2')
         finally:
             srv.close()
 

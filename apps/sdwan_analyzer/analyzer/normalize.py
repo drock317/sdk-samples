@@ -960,6 +960,15 @@ def wan_bonding_detail(raw_wan_bonding):
             obj, ('DL total flows', 'total_download_flows')))
         reported_ul = _num(_first_present(
             obj, ('UL total flows', 'total_upload_flows')))
+        # Provenance of each bond total, decided by the same fallback below.
+        if reported_dl is not None:
+            dl_source = 'reported'
+        else:
+            dl_source = 'summed' if members else 'unknown'
+        if reported_ul is not None:
+            ul_source = 'reported'
+        else:
+            ul_source = 'summed' if members else 'unknown'
         bonds.append({
             'present': True,
             'iface': str(key),
@@ -974,6 +983,8 @@ def wan_bonding_detail(raw_wan_bonding):
                                      else (summed_dl if members else None)),
             'total_upload_flows': (reported_ul if reported_ul is not None
                                    else (summed_ul if members else None)),
+            'total_download_flows_source': dl_source,
+            'total_upload_flows_source': ul_source,
             'computed_download_flows': summed_dl if members else None,
             'computed_upload_flows': summed_ul if members else None,
             'negotiated_capabilities': _cap_list(

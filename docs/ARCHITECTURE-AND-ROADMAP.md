@@ -37,9 +37,9 @@ collectors.py   normalize.py     storage.py      (new) counters.py      service.
 | Acquisition | `collectors.py` | Read-only NCOS `status/` and `config/` reads with a 15 s wall-clock guard. No business logic | Implemented |
 | Normalization | `normalize.py`, `telemetry.py`, `cellular.py` | Convert raw NCOS shapes to stable records; timestamp envelope; counter and SWANS/QoE/WBOND records | Implemented |
 | Persistence | `storage.py`, `persistence.py`, `durable.py`, `recording.py` | Bounded in-memory stores, durable segmented JSONL under `tmp/telemetry`, Recording jobs | Implemented |
-| Mathematical analysis | `counters.py` | Pure functions over normalized records. Imports only `math`. No I/O, no `cp`, no storage access, no UI imports. Library only, not yet wired to the service or API | Implemented (v0.5.0, uncommitted) |
+| Mathematical analysis | `counters.py` | Pure functions over normalized records. Imports only `math`. No I/O, no `cp`, no storage access, no UI imports. Used by the interface rate API (`/api/analytics/interfaces`, v0.6.0) | Implemented (v0.5.0, wired in v0.6.0) |
 | API | `service.py`, `query.py`, `web.py` | `service` is the only layer the web tier may call. Read-only paginated `/api/history` and Recording samples | Implemented |
-| Presentation | none yet | Ericsson-branded shell, then screens from approved artboards | Approved direction (not started) |
+| Presentation | `static/`, `index.html` | Throughput trends UI exists (v0.7.x); further screens follow approved artboards | Partly implemented |
 
 Rules that keep the layers separate:
 
@@ -106,7 +106,7 @@ From project instructions for the v0.5.0 phase:
 
 Not built, and not to be implied by any current document or UI:
 
-- Exposing counter rates through the service or API, or storing them.
+- Storing counter rates. (Interface rates are exposed read-only by `/api/analytics/interfaces` since v0.6.0.)
 - Counter wrap correction. Counter width is unknown, so a decrease is never corrected.
 - A default collection-gap threshold.
 - Averages, percentiles, rolling statistics, and bandwidth utilization percentages.
@@ -161,6 +161,8 @@ Still open:
 | 8 | Package prepared for manual validation (not deployed) | Done |
 | 9 | Review, then push or merge on approval | Waiting for review. Nothing committed or pushed |
 | v0.8.0 | Current-state topology and relationships, `GET /api/analytics/topology` | Done, see `docs/analytics/topology.md` |
+| v0.8.1 | Read-only WBOND runtime analysis, `GET /api/analytics/wbond` | Done, see `docs/analytics/wbond.md` |
+| v0.8.2 | Stored WBOND observations keep `tunnel_iface` and flow-total provenance (`reported`/`summed`/`unknown`) | Done, see `docs/analytics/wbond.md`. Pre-0.8.2 history is not back-filled. Normal collection intervals are 5, 15, 30 and 60 min; sub-5-min is for short recordings; the 1-minute schedule is temporary testing |
 
 ## 7. Failed-read invariant and runtime audit
 
