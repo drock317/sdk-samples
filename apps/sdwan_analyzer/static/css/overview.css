@@ -56,3 +56,24 @@
 @media (max-width:1180px){.ov-summary{grid-template-columns:repeat(3,minmax(0,1fr));}.ov-row-main{grid-template-columns:1fr;}.ov-side{grid-template-columns:1fr 1fr;grid-template-rows:auto;}}
 @media (max-width:800px){.ov-summary{grid-template-columns:repeat(2,minmax(0,1fr));}.ov-side,.ov-bottom,.ov-chart-layout{grid-template-columns:1fr;}.ov-wide{grid-column:auto;}.ov-topology{justify-content:flex-start;}}
 @media (max-width:480px){.ov-summary{grid-template-columns:1fr;}.ov-flow{grid-template-columns:1fr auto;}.ov-flow-meter{grid-column:1 / -1;}}
+/* v1.0.1 — compact Overview heading, controls and temporal context. */
+.content-area { padding: 1.3rem 1.5rem; }
+#homepage > .section-title { margin-bottom: .75rem; padding-bottom: .65rem; }
+.sa-overview { gap: .85rem; }
+.ov-toolbar { padding: 0; gap: .75rem; align-items: center; }
+.ov-toolbar-left { gap: .75rem; min-width: 0; }
+.ov-toolbar-right { flex: none; gap: .5rem; flex-wrap: nowrap; align-items: center; }
+.ov-range-label { font-size: .86rem; font-weight: 600; white-space: nowrap; }
+.ov-toolbar-right .form-select { width: 6rem; min-width: 6rem; max-width: 6rem; padding: .55rem .8rem; }
+.ov-toolbar-right .sa-btn { white-space: nowrap; margin: 0; }
+.ov-range-window { font-size: .81rem; color: var(--text-secondary); margin-top: -.4rem; }
+.ov-error { margin: 0; padding: .6rem .8rem; border-left: 3px solid var(--eds-red, #c52a32); }
+.ov-error[hidden] { display: none; }
+.ov-router-name { font-size: .95rem; }
+.ov-stat:last-child .ov-stat-value { font-size: 1.12rem; line-height: 1.5; font-variant-numeric: tabular-nums; }
+.ov-stat:last-child .ov-stat-sub { font-size: .75rem; }
+@media (max-width: 800px) {
+    .content-area { padding: 1rem; }
+    .ov-toolbar-right { flex-wrap: wrap; }
+    .ov-range-window { margin-top: 0; }
+}
