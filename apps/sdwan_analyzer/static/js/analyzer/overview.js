@@ -137,6 +137,7 @@
         this.snapshot = null; this.topology = null; this.wbond = null; this.dayMeta = null;
         this.range = '86400'; this.activeUid = null; this.series = [];
         this.hiddenKey = null; this.hiddenUids = [];
+        this._topologyObserver = null;
         this._build(); this.reload();
     }
     Overview.prototype._build = function () {
@@ -238,6 +239,8 @@
             clock12(end, true) + ' (' + F.timeZoneName() + '; ends at last observation)';
     };
     Overview.prototype._topology = function (topo, phys, bonds) {
+        var self = this;
+        if (this._topologyObserver) { this._topologyObserver.disconnect(); this._topologyObserver = null; }
         var container = h('div'), flow = h('div', {class: 'ov-topology' + (bonds.length ? '' : ' ov-topology-no-bond')});
         var model = ((this.snapshot || {}).wan || {}).identity || {};
         var router = h('div', {class: 'ov-node ov-router'}, [
@@ -245,10 +248,10 @@
             h('div', {}, [h('strong', {text:'NCOS Router'}),
                 h('span', {class:'ov-muted', text:txt(model.host_model, 'Router model unavailable')})])]);
         flow.appendChild(router);
-        var first = bonds[0];
+        var first = bonds[0], bondNode = null;
         if (first) {
             var health = bondHealth(first);
-            var bondNode = h('div', {class: 'ov-node ov-bond ov-bond-' + health.kind}, [
+            bondNode = h('div', {class: 'ov-node ov-bond ov-bond-' + health.kind}, [
                 h('span', {class:'ov-topology-glyph', 'aria-hidden':'true'}, [h('i', {class:'fas fa-link'})]),
                 h('div', {}, [
                     h('strong', {text:txt(first.display_name, 'Bonded WAN')}),
@@ -271,13 +274,21 @@
                 wrap.appendChild(b); wrap.appendChild(pop); bondNode.appendChild(wrap);
                 attachPopover(b,pop);
             }
-            flow.appendChild(h('span', {class:'ov-link-line', 'aria-hidden':'true'}));
             flow.appendChild(bondNode);
         }
         var members = h('div', {class:'ov-member-list'});
         var visible = first ? validArray(first.members).filter(function (m) {
             return !m.physical || (this.hiddenUids || []).indexOf(m.physical.uid) === -1;
         }, this) : phys;
+        function memberOrder(m) {
+            var ref = first ? (m.physical || {}) : {uid:m.uid};
+            var path = validArray(topo.physical).filter(function (p) {return p.uid === ref.uid;})[0];
+            var owner = String(((path || {}).identity || {}).modem_owner || '');
+            if (owner === 'internal') {return 0;}
+            if (owner === 'captive') {return 2;}
+            return 1;
+        }
+        visible = visible.slice().sort(function (a,b) {return memberOrder(a)-memberOrder(b);});
         if (!visible.length) { members.appendChild(h('p', {class:'ov-muted', text:'No displayable WAN members.'})); }
         visible.forEach(function (m) {
             var ref = first ? m.physical || {} : {state:'resolved',uid:m.uid};
@@ -290,7 +301,10 @@
             var state = first ? txt(observed.link_attach_state,'Unknown') : pathState(path || m);
             var overlay = m.overlay && m.overlay.state === 'resolved' ?
                 validArray(topo.overlays).filter(function (o) {return o.uid === m.overlay.uid;})[0] : null;
-            var sdwanTunnel = overlay && overlay.iface && overlay.iface !== m.tunnel_iface ? overlay.iface : null;
+            // GRE bond member tunnel and sdwan-* overlay are different NCOS layers.
+            // Prefer the overlay's reported UID when available; never synthesize a name.
+            var sdwanTunnel = overlay ? (overlay.uid || overlay.iface) : null;
+            if (sdwanTunnel === m.tunnel_iface) { sdwanTunnel = null; }
             var rows = first ? [['Bond tunnel',m.tunnel_iface],
                 ['SD-WAN tunnel',sdwanTunnel],
                 ['Physical interface',m.reported_intf_name]] :
@@ -307,13 +321,64 @@
                     h('span', {class:'ov-health ov-health-'+(good?'active':'unknown'), text:state})]),
                 wrap]));
         });
-        if (first) { flow.appendChild(h('span', {class:'ov-link-line', 'aria-hidden':'true'})); }
         flow.appendChild(members); container.appendChild(flow);
+        // Draw continuous, rounded paths from actual card positions, not CSS arrows.
+        this._connectTopology(flow, router, bondNode, members);
         if (validArray(topo.unresolved).length) {
             container.appendChild(h('p', {class:'ov-muted', text:validArray(topo.unresolved).length+
                 ' unresolved topology association(s).'}));
         }
         return panel('Topology & Relationship',container);
+    };
+    Overview.prototype._connectTopology = function (flow, router, bond, memberList) {
+        var self = this;
+        var ns = 'http://www.w3.org/2000/svg';
+        var svg = document.createElementNS(ns,'svg');
+        svg.setAttribute('class','ov-connector-canvas');
+        svg.setAttribute('aria-hidden','true');
+        flow.insertBefore(svg,flow.firstChild);
+        function paint() {
+            if (!flow.isConnected) {return;}
+            var bb = flow.getBoundingClientRect(), w = flow.clientWidth, ht = flow.clientHeight;
+            if (!w || !ht) {return;}
+            svg.setAttribute('viewBox','0 0 '+w+' '+ht);
+            svg.setAttribute('width',w);svg.setAttribute('height',ht);
+            while (svg.firstChild) {svg.removeChild(svg.firstChild);}
+            function coords(el, edge) {
+                var r = el.getBoundingClientRect();
+                return {x: (edge === 'left' ? r.left : edge === 'right' ? r.right : r.left+r.width/2)-bb.left,
+                        y:(edge === 'top' ? r.top : edge === 'bottom' ? r.bottom : r.top+r.height/2)-bb.top};
+            }
+            var small = window.matchMedia('(max-width:650px)').matches;
+            function path(a,b) {
+                var d;
+                if (small) {
+                    var ydelta = Math.max(10,(b.y-a.y)*.48);
+                    d='M'+a.x+','+a.y+' C'+a.x+','+(a.y+ydelta)+' '+b.x+','+(b.y-ydelta)+' '+b.x+','+b.y;
+                } else {
+                    var dx=Math.max(14,(b.x-a.x)*.5);
+                    d='M'+a.x+','+a.y+' C'+(a.x+dx)+','+a.y+' '+(b.x-dx)+','+b.y+' '+b.x+','+b.y;
+                }
+                [['ov-connector-glow',8],['ov-connector-soft',4],['ov-connector-core',2]].forEach(function (spec) {
+                    var el=document.createElementNS(ns,'path');
+                    el.setAttribute('d',d);el.setAttribute('class',spec[0]);
+                    el.setAttribute('stroke-width',spec[1]);svg.appendChild(el);
+                });
+            }
+            var origin=router;
+            if (bond) {
+                path(coords(router,small?'bottom':'right'),coords(bond,small?'top':'left'));
+                origin=bond;
+            }
+            Array.prototype.forEach.call(memberList.querySelectorAll('.ov-member'),function (card) {
+                path(coords(origin,small?'bottom':'right'),coords(card,small?'top':'left'));
+            });
+        }
+        window.requestAnimationFrame(paint);
+        if (typeof ResizeObserver !== 'undefined') {
+            this._topologyObserver = new ResizeObserver(function () {window.requestAnimationFrame(paint);});
+            this._topologyObserver.observe(flow);
+        }
     };
     Overview.prototype._steering = function (rules) {
         var rows = [], body = h('div');
