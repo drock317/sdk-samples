@@ -189,7 +189,9 @@
 .ov-rule-trigger:hover,.ov-rule-trigger:focus-visible {color:var(--ov-blue);text-decoration:underline;}
 .ov-rule-trigger:focus-visible {outline:2px solid var(--ov-blue);outline-offset:3px;border-radius:2px;}
 .ov-popover.ov-portal {position:fixed;z-index:2147483000;min-width:0;max-height:calc(100vh - 20px);
-    overflow-y:auto;box-sizing:border-box;right:auto;bottom:auto;top:auto;left:auto;}
+    overflow-y:auto;box-sizing:border-box;right:auto;bottom:auto;top:auto;left:auto;
+    background:var(--sa-surface,var(--surface,#fff));color:var(--text-primary,#222);
+    border-color:var(--border-color,#dedee2);}
 .ov-popover.ov-portal .ov-popover-row {align-items:baseline;gap:.45rem;}
 .ov-popover.ov-portal .ov-popover-row span {flex:1;min-width:7rem;}
 .ov-popover.ov-portal .ov-popover-row code {font-family:inherit;flex:1.1;text-align:right;font-weight:600;}
