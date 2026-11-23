@@ -521,6 +521,16 @@
             text:'Current/aging NCOS flow populations, not bandwidth or 24-hour totals.'}));
         return panel('Most Active Steering Rules',body);
     };
+    // Stable carrier palette for WBOND members. Match explicit carrier names and
+    // verified abbreviations; never assign a color from member position.
+    function wbondCarrierColor(member) {
+        var label = String((member || {}).physical_display_name || '');
+        if (/(?:^|[^a-z0-9])(?:at&t|att)(?=$|[^a-z0-9])/i.test(label)) { return '#1677e8'; }
+        if (/(?:^|[^a-z0-9])(?:t-mobile|tmobile|tmo)(?=$|[^a-z0-9])/i.test(label)) { return '#e0008b'; }
+        if (/(?:^|[^a-z0-9])(?:verizon|vzw)(?=$|[^a-z0-9])/i.test(label)) { return '#d92332'; }
+        // Ethernet, Starlink/SpaceX, and any unrecognized carrier use black.
+        return '#181818';
+    }
     // Configured criterion weights, runtime baseline and current direction weights
     // are separate quantities. Never infer traffic shares from any of these.
     Overview.prototype._bond = function (bonds) {
@@ -574,7 +584,7 @@
         ]);
         content.appendChild(labelRow);
         members.forEach(function (m,i) {
-            var o=m.observed||{}, physical=m.physical||{}, color=COLORS[i%COLORS.length];
+            var o=m.observed||{}, color=wbondCarrierColor(m);
             var label=txt(m.physical_display_name,txt(m.tunnel_iface,'Unknown member'));
             var vals=[o.runtime_config_weight,o.current_download_weight,o.current_upload_weight];
             var maxes=[baselineMax,dlMax,ulMax];
@@ -585,7 +595,7 @@
             ]);
             vals.forEach(function (v,j) {
                 member.appendChild(h('div',{class:'ov-weight-metric'},[
-                    h('strong',{text:fmt(v)}),bar(v,j===0?'var(--ov-muted)':color,maxes[j])]));
+                    h('strong',{text:fmt(v)}),bar(v,color,maxes[j])]));
             });
             content.appendChild(member);
         });
