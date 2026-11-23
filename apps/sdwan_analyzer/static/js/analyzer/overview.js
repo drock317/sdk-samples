@@ -56,39 +56,81 @@
         if (note) { content.appendChild(h('p', {class: 'ov-muted', text: note})); }
         return content;
     }
-    function attachPopover(btn, popup) {
+    // Portals escape per-card stacking contexts; anchor position is viewport-relative.
+    function closePopovers(except) {
+        document.querySelectorAll('.ov-popover:not([hidden])').forEach(function (p) {
+            if (p === except) { return; }
+            p.hidden = true;
+            if (p._ovTrigger) { p._ovTrigger.setAttribute('aria-expanded', 'false'); }
+        });
+    }
+    function positionPopover(btn, popup) {
+        var anchor = btn.getBoundingClientRect(), margin = 10, gap = 8;
+        var width = Math.min(350, window.innerWidth - margin * 2);
+        popup.style.width = width + 'px';
+        popup.style.maxWidth = width + 'px';
+        popup.style.left = Math.max(margin, Math.min(anchor.right - width,
+            window.innerWidth - width - margin)) + 'px';
+        var height = popup.getBoundingClientRect().height;
+        var below = anchor.bottom + gap;
+        var above = anchor.top - height - gap;
+        popup.style.top = (below + height <= window.innerHeight - margin || above < margin ?
+            Math.max(margin, Math.min(below, window.innerHeight - height - margin)) : above) + 'px';
+    }
+    function attachPopover(btn, popup, hover) {
+        popup._ovTrigger = btn;
         btn.setAttribute('aria-expanded', 'false');
-        btn.addEventListener('click', function (e) {
-            e.stopPropagation();
-            var opening = popup.hidden;
-            document.querySelectorAll('.ov-popover:not([hidden])').forEach(function (p) {
-                p.hidden = true;
-                var toggle = p.parentNode.querySelector('.ov-iconbtn');
-                if (toggle) { toggle.setAttribute('aria-expanded', 'false'); }
-            });
+        function toggle(opening) {
+            if (opening) {
+                closePopovers(popup);
+                if (!popup.classList.contains('ov-portal')) {
+                    popup.classList.add('ov-portal');
+                    document.body.appendChild(popup);
+                }
+            }
             popup.hidden = !opening;
             btn.setAttribute('aria-expanded', String(opening));
+            if (opening) { positionPopover(btn, popup); }
+        }
+        btn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            toggle(popup.hidden);
         });
         btn.addEventListener('keydown', function (e) {
-            if (e.key === 'Escape') { popup.hidden = true; btn.setAttribute('aria-expanded', 'false'); btn.focus(); }
+            if (e.key === 'Escape') { toggle(false); btn.focus(); }
         });
+        if (hover) {
+            var hideTimer = null;
+            function cancelHide() { if (hideTimer !== null) { clearTimeout(hideTimer); hideTimer = null; } }
+            function soonHide() { cancelHide(); hideTimer = setTimeout(function () { toggle(false); }, 160); }
+            btn.addEventListener('mouseenter', function () { cancelHide(); toggle(true); });
+            btn.addEventListener('mouseleave', soonHide);
+            popup.addEventListener('mouseenter', cancelHide);
+            popup.addEventListener('mouseleave', soonHide);
+        }
+        btn._ovPosition = function () { if (!popup.hidden) { positionPopover(btn, popup); } };
     }
     document.addEventListener('click', function (e) {
         document.querySelectorAll('.ov-popover:not([hidden])').forEach(function (p) {
-            if (p.contains(e.target)) { return; }
-            p.hidden = true;
-            var toggle = p.parentNode.querySelector('.ov-iconbtn');
-            if (toggle) { toggle.setAttribute('aria-expanded', 'false'); }
+            if (!p.contains(e.target) && p._ovTrigger !== e.target &&
+                !(p._ovTrigger && p._ovTrigger.contains(e.target))) { closePopovers(); }
         });
     });
     document.addEventListener('keydown', function (e) {
-        if (e.key !== 'Escape') { return; }
+        if (e.key === 'Escape') {
+            document.querySelectorAll('.ov-popover:not([hidden])').forEach(function (p) {
+                if (p._ovTrigger) { p._ovTrigger.focus(); }
+            });
+            closePopovers();
+        }
+    });
+    window.addEventListener('resize', function () {
         document.querySelectorAll('.ov-popover:not([hidden])').forEach(function (p) {
-            p.hidden = true;
-            var toggle = p.parentNode.querySelector('.ov-iconbtn');
-            if (toggle) { toggle.setAttribute('aria-expanded', 'false'); toggle.focus(); }
+            if (p._ovTrigger && p._ovTrigger.isConnected) { positionPopover(p._ovTrigger, p); }
+            else { p.hidden = true; }
         });
     });
+    window.addEventListener('scroll', function () { closePopovers(); }, true);
     function bondHealth(b) {
         var ob = b.observed || {}, state = String(ob.link_state || '').toLowerCase();
         var members = validArray(b.members);
@@ -208,21 +250,22 @@
         var rules = validArray((snap.traffic_steering || {}).logical_rules);
         var connected = phys.filter(function (p) { return maybeStatus(p.observed) === 'connected'; }).length;
         var inactive = phys.filter(function (p) { return (p.observed || {}).operational_state === 'inactive'; }).length;
+        document.querySelectorAll('.ov-popover.ov-portal').forEach(function (p) { p.remove(); });
         U.clear(this.context); U.clear(this.stats); U.clear(this.main); U.clear(this.bottom);
+        // The Overview represents all eligible SD-WAN paths, not one primary WAN.
         child(this.context, [h('strong', {class: 'ov-context ov-router-name',
-            text: txt((snap.system_summary || {}).router_name, 'Router name unavailable')}),
-            h('span', {class: 'ov-context', text: 'Primary WAN: ' + txt((topo.primary || {}).display_name, 'Unknown')})]);
+            text: txt((snap.system_summary || {}).router_name, 'Router name unavailable')})]);
         var counts = [coloredCount(connected, 'connected', 'good')];
         if (inactive) { counts.push(document.createTextNode(' · '), coloredCount(inactive, 'inactive', 'warn')); }
         if (this.hiddenUids.length) { counts.push(document.createTextNode(' · ' + this.hiddenUids.length + ' hidden')); }
         child(this.stats, [
             stat('Physical WANs', phys.length, counts, 'broadcast-tower'),
-            stat('SD-WAN overlays', overlays.length, 'Reported by NCOS', 'layer-group'),
-            stat('WBOND interfaces', bonds.length, 'Runtime bond objects', 'link'),
+            stat('SD-WAN overlays', overlays.length, '', 'layer-group'),
+            stat('WBOND interfaces', bonds.length, '', 'link'),
             stat('Logical steering rules', rules.length, 'Latest collected snapshot', 'project-diagram'),
             stat('Last observed', clock12(snap.timestamp, true), countText(this.dayMeta), 'clock')
         ]);
-        var side = h('div', {class: 'ov-side'}, [this._steering(rules), this._bond(bonds)]);
+        var side = h('div', {class: 'ov-side'}, [this._steering(rules, validArray(snap.traffic_classes)), this._bond(bonds)]);
         child(this.main, [this._topology(topo, phys, bonds), side]);
         child(this.bottom, [this._paths(phys, overlays, snap.swans), this._events(snap), this._throughputPanel()]);
     };
@@ -236,7 +279,7 @@
         if (end === null || end <= 0) { this.rangeLabel.textContent = 'Time window unavailable'; return; }
         var start = end - Number(this.range);
         this.rangeLabel.textContent = 'Selected window: ' + clock12(start, true) + ' – ' +
-            clock12(end, true) + ' (' + F.timeZoneName() + '; ends at last observation)';
+            clock12(end, true) + ' (' + F.timeZoneName() + ')';
     };
     Overview.prototype._topology = function (topo, phys, bonds) {
         var self = this;
@@ -380,25 +423,73 @@
             this._topologyObserver.observe(flow);
         }
     };
-    Overview.prototype._steering = function (rules) {
+    function ruleDetails(rule, trafficClasses, value, p, n) {
+        var branch = validArray(rule.branches)[0] || {};
+        var tcId = branch.traffic_class_id || rule.traffic_class_id;
+        var tcName = branch.traffic_class_name || rule.traffic_class_name;
+        var tc = trafficClasses.filter(function (t) {
+            return (tcId && (t.intent_id === tcId || t.traffic_class_id === tcId)) ||
+                (!tcId && tcName && t.name === tcName);
+        })[0] || null;
+        var rawSelector = rule.wan_selector_type || branch.wan_selector_type;
+        var selectorLabels = {explicit_priority:'Custom',bonded:'Bonded WAN',
+            all_sdwan:'All SD-WAN',specific:'Specific WAN',unknown:'Unavailable'};
+        var selector = selectorLabels[rawSelector] || rawSelector;
+        var priorities = validArray(branch.wan_priority_order).length ?
+            branch.wan_priority_order : validArray(rule.wan_priority_order);
+        var rows = [['WAN Selector', selector],
+            ['Allow Failover', typeof branch.failover === 'boolean' ? (branch.failover ? 'Enabled' : 'Disabled') :
+                (typeof rule.failover === 'boolean' ? (rule.failover ? 'Enabled' : 'Disabled') : 'Unavailable')],
+            ['Traffic Class', tc ? tc.name : (tcName || 'Unavailable')]];
+        if (rawSelector === 'explicit_priority' || (rule.wan_priority_enabled && priorities.length)) {
+            rows.push(['Priority List', rule.wan_priority_enabled ? 'Enabled' : 'Disabled']);
+            priorities.forEach(function (v, i) {
+                var priority = typeof v === 'string' ? v : (v && (v.display_name || v.name || v.trigger_string));
+                var ncmOrder = v && typeof v.trigger_priority === 'number' ? v.trigger_priority : null;
+                rows.push(['WAN ' + (i + 1) + (ncmOrder === null ? '' : ' (priority ' + ncmOrder + ')'),
+                    priority || 'Unresolved']);
+            });
+        }
+        if (tc) {
+            rows.push(['FEC', typeof tc.forward_error_correction === 'boolean' ?
+                (tc.forward_error_correction ? 'Enabled' : 'Disabled') : 'Unavailable']);
+            rows.push(['Multiple WAN', tc.loadbalance_algo ?
+                (tc.loadbalance_algo === 'none' ? 'Disabled' : 'Enabled (' + tc.loadbalance_algo + ')') : 'Unavailable']);
+            var modes = {flow_balance:'Multi-flow Optimization',flow_duplication:'Flow Duplication',
+                large_flow:'Large Flow Optimization'};
+            rows.push(['Bonded WAN mode', modes[tc.wan_bonding_algorithm] || tc.wan_bonding_algorithm || 'Unavailable']);
+        } else {
+            rows.push(['FEC', 'Unavailable'], ['Multiple WAN', 'Unavailable'],
+                ['Bonded WAN mode', 'Unavailable']);
+        }
+        rows.push(['Preferred flows', p], ['Nonpreferred flows', n]);
+        return makePopover(rule.logical_name || 'Steering rule', rows);
+    }
+    Overview.prototype._steering = function (rules, trafficClasses) {
         var rows = [], body = h('div');
         rules.forEach(function (r) {
             var p = number(r.preferred_flows), n = number(r.nonpreferred_flows);
             if (p === null && n === null) { return; }
-            rows.push({name: txt(r.logical_name, 'Unnamed rule'), value: (p || 0) + (n || 0), p: p, n: n});
+            rows.push({rule:r, name:txt(r.logical_name,'Unnamed rule'), value:(p || 0)+(n || 0), p:p, n:n});
         });
-        rows.sort(function (a, b) { return b.value - a.value; });
+        rows.sort(function (a,b) { return b.value-a.value; });
         var max = rows.length ? rows[0].value : 0;
-        rows.slice(0, 5).forEach(function (r) {
-            var meter = h('div', {class: 'ov-flow-meter'}, [h('span', {style: 'width:' +
-                (max ? Math.round(r.value / max * 100) : 0) + '%;'})]);
-            body.appendChild(h('div', {class: 'ov-flow'}, [h('span', {text: r.name}), meter,
-                h('span', {text: r.value.toLocaleString() + ' flows', title: 'Preferred: ' +
-                    txt(r.p, 'unknown') + ' · Nonpreferred: ' + txt(r.n, 'unknown')})]));
+        rows.slice(0,5).forEach(function (r) {
+            var meter = h('div', {class:'ov-flow-meter'}, [h('span', {style:'width:' +
+                (max ? Math.round(r.value/max*100) : 0) + '%;'})]);
+            var pop = ruleDetails(r.rule,trafficClasses,r.value,r.p,r.n);
+            var trigger = h('button', {class:'ov-rule-trigger',type:'button',
+                text:r.name, 'aria-label':'Details for steering rule '+r.name});
+            var wrap = h('span', {class:'ov-popover-wrap'}, [trigger,pop]);
+            attachPopover(trigger,pop,true);
+            body.appendChild(h('div',{class:'ov-flow'},[wrap,meter,
+                h('span',{text:r.value.toLocaleString()+' flows'})]));
         });
-        if (!rows.length) { body.appendChild(h('p', {class: 'ov-muted', text: 'No valid per-rule flow populations reported.'})); }
-        body.appendChild(h('p', {class: 'ov-muted', text: 'Current/aging NCOS flow populations, not bandwidth or 24-hour totals.'}));
-        return panel('Most Active Steering Rules', body);
+        if (!rows.length) { body.appendChild(h('p',{class:'ov-muted',
+            text:'No valid per-rule flow populations reported.'})); }
+        body.appendChild(h('p',{class:'ov-muted',
+            text:'Current/aging NCOS flow populations, not bandwidth or 24-hour totals.'}));
+        return panel('Most Active Steering Rules',body);
     };
     Overview.prototype._bond = function (bonds) {
         var b = (this.wbond.bonds || [])[0] || bonds[0] || {};
@@ -466,10 +557,15 @@
         events.slice(0,5).forEach(function (e) {
             var from = wanRef(e.wan_from_identity,e.wan_from);
             var to = wanRef(e.wan_to_identity,e.wan_to);
-            var change = (e.wan_from || e.wan_to) ?
-                txt(from,'Previous path not reported')+' → '+txt(to,'Destination not reported') :
-                'Destination not reported';
-            var row = h('tr',{},[cell(time(e.epoch)),cell(e.steering_rule),cell(change,'ov-wrap')]);
+            var reason = String(e.reason || '');
+            var registered = /^register policy\b/i.test(reason);
+            var change = registered ? 'Policy registered' :
+                (e.wan_from && e.wan_to ? (e.wan_from === e.wan_to ?
+                    'Path reaffirmed — ' + txt(to) : txt(from) + ' → ' + txt(to)) :
+                (!e.wan_from && e.wan_to ? 'Path selected — ' + txt(to) :
+                 (e.wan_from && !e.wan_to ? 'Path cleared — ' + txt(from) :
+                  'Steering event')));
+            var row = h('tr',{},[cell(clock12(e.epoch, true)),cell(e.steering_rule),cell(change,'ov-wrap')]);
             var extra = [['NCOS reason', e.reason],['Flows moved', e.total_flows_moved]];
             if (extra.some(function (x) {return x[1] !== undefined && x[1] !== null && x[1] !== '';})) {
                 var anchor = h('span',{class:'ov-popover-wrap'});
@@ -542,8 +638,11 @@
         })).then(function (results) {
             if (token !== self.chartToken) { return; }
             self.series = results;
-            self._drawChart(from, now);
-        });
+            try { self._drawChart(from, now); }
+            catch (err) { U.clear(self.chartHost); self.chartHost.appendChild(h('p',
+                {class:'ov-loading',text:'Unable to render throughput history: '+String(err && err.message || err)})); }
+        }).catch(function (err) { if (token === self.chartToken) { U.clear(self.chartHost);
+            self.chartHost.appendChild(h('p',{class:'ov-loading',text:'Throughput history unavailable: '+A.describe(err)})); } });
     };
     Overview.prototype._drawChart = function (from, to) {
         var self = this, series = this.series;
@@ -580,6 +679,11 @@
                 var d = run.map(function (p,j) { return (j ? 'L' : 'M') + x(p.t).toFixed(2) + ',' + y(p.v).toFixed(2); }).join(' ');
                 node('path', {d:d, fill:'none', stroke:color, 'stroke-width':focused?2.7:1.7,
                     opacity:focused?1:0.25, 'stroke-linecap':'round', 'stroke-linejoin':'round'});
+                // A single valid interval has no line segment; show a point rather than hiding it.
+                run.forEach(function (pt) {
+                    node('circle',{cx:x(pt.t),cy:y(pt.v),r:focused?3.1:2.2,fill:color,
+                        opacity:focused?1:0.55});
+                });
             });
             var box = h('input',{type:'radio', name:'ov-focused-interface', value:s.uid});
             box.checked = focused;
@@ -589,6 +693,11 @@
         });
         this.chartHost.appendChild(svg);
         if (series.every(function (s) { return !S.hasAnyValue(s.intervals); })) {
+            var intervalCount = series.reduce(function (n,s) { return n+s.intervals.length; },0);
+            var explanation = intervalCount ? 'History returned '+intervalCount+
+                ' interval(s), but none contains a valid RX or TX rate. Check counter validity and interval statuses.' :
+                'No throughput intervals returned for these interfaces in the selected window.';
+            this.chartHost.appendChild(h('p',{class:'ov-muted',text:explanation}));
             this.chartHost.appendChild(h('p',{class:'ov-muted',text:'No valid RX intervals were reported in the selected time window.'}));
         }
         var failed = series.filter(function (s) { return s.error; });
