@@ -13,6 +13,17 @@
     function txt(v, fallback) { return v === null || v === undefined || v === '' ? (fallback || 'Unavailable') : String(v); }
     function number(v) { return typeof v === 'number' && isFinite(v) ? v : null; }
     function time(v) { return number(v) !== null && v > 0 ? F.dateTime(v) : 'Time unavailable'; }
+    function clock12(ts, includeYear) {
+        if (number(ts) === null || ts <= 0) { return 'Unavailable'; }
+        var opts = {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true};
+        if (includeYear) { opts.year = 'numeric'; }
+        return new Date(ts * 1000).toLocaleString('en-US', opts);
+    }
+    function countText(meta) {
+        if (!meta || number(meta.observations_today) === null) { return 'Today’s observations: unavailable'; }
+        return 'Today’s observations: ' + (meta.count_complete ? '' : 'at least ') +
+            meta.observations_today.toLocaleString('en-US') + (meta.count_complete ? '' : ' (partial count)');
+    }
     function stateLabel(v) { return v === 'connected' || v === 'up' || v === 'active' ? 'Connected' : txt(v, 'Unknown'); }
     function child(el, nodes) { (nodes || []).forEach(function (n) { el.appendChild(n); }); return el; }
     function cell(v, className) { return h('td', {class: className || '', text: txt(v, '—')}); }
@@ -27,44 +38,50 @@
 
     function Overview(mount) {
         this.mount = mount; this.token = 0; this.chartToken = 0;
-        this.snapshot = null; this.topology = null; this.wbond = null;
+        this.snapshot = null; this.topology = null; this.wbond = null; this.dayMeta = null;
         this.range = '86400'; this.activeUid = null; this.series = [];
         this._build(); this.reload();
     }
     Overview.prototype._build = function () {
         var self = this;
         this.context = h('div', {class: 'ov-toolbar-left'});
+        this.rangeLabel = h('div', {class: 'ov-range-window', 'aria-live': 'polite'});
         this.chartRange = h('select', {class: 'form-select', 'aria-label': 'Throughput time range'});
         RANGES.forEach(function (r) { self.chartRange.appendChild(h('option', {value: r.v, text: r.label})); });
         this.chartRange.value = this.range;
-        this.chartRange.addEventListener('change', function () { self.range = self.chartRange.value; self.loadChart(); });
+        this.chartRange.addEventListener('change', function () { self.range = self.chartRange.value; self._updateTimeWindow(); self.loadChart(); });
         this.refresh = U.button('Refresh', function () { self.reload(); });
         this.toolbar = h('div', {class: 'ov-toolbar'}, [this.context,
-            h('div', {class: 'ov-toolbar-right'}, [this.chartRange, this.refresh])]);
+            h('div', {class: 'ov-toolbar-right'}, [
+                h('label', {class: 'ov-range-label', text: 'Time range', for: 'ov-time-range'}),
+                this.chartRange, this.refresh])]);
+        this.chartRange.id = 'ov-time-range';
         this.stats = h('div', {class: 'ov-summary'});
         this.main = h('div', {class: 'ov-row-main'});
         this.bottom = h('div', {class: 'ov-bottom'});
-        this.status = h('p', {class: 'ov-muted', 'aria-live': 'polite'});
+        this.status = h('p', {class: 'ov-error', 'aria-live': 'polite', hidden: true});
         this.mount.classList.add('sa-overview');
-        child(this.mount, [this.toolbar, this.status, this.stats, this.main, this.bottom]);
+        child(this.mount, [this.toolbar, this.rangeLabel, this.status, this.stats, this.main, this.bottom]);
     };
     Overview.prototype.reload = function () {
         var self = this, token = ++this.token;
         this.refresh.disabled = true;
-        this.status.textContent = 'Loading the last saved router measurements…';
+        this.status.hidden = true;
+        this.status.textContent = '';
         Promise.all([
             A.getJson('api/snapshot'), A.getJson('api/analytics/topology'),
-            A.getJson('api/analytics/wbond')
+            A.getJson('api/analytics/wbond'),
+            A.getJson('api/analytics/overview_meta').catch(function () { return {data: null}; })
         ]).then(function (r) {
             if (token !== self.token) { return; }
             self.snapshot = r[0].data || {};
             self.topology = r[1].data || {};
             self.wbond = r[2].data || {};
-            self._render(); self.loadChart();
-            self.status.textContent = 'Read-only overview · last saved snapshot ' +
-                time(self.snapshot.timestamp) + ' · No automatic router collection';
+            self.dayMeta = r[3].data;
+            self._render(); self._updateTimeWindow(); self.loadChart();
         }).catch(function (err) {
             if (token !== self.token) { return; }
+            self.status.hidden = false;
             self.status.textContent = 'Overview unavailable: ' + A.describe(err);
             U.clear(self.stats); U.clear(self.main); U.clear(self.bottom);
             self.main.appendChild(U.statePanel('error', 'Could not load the overview',
@@ -76,20 +93,26 @@
         var phys = validArray(topo.physical), overlays = validArray(topo.overlays), bonds = validArray(topo.bonds);
         var rules = validArray((snap.traffic_steering || {}).logical_rules);
         U.clear(this.context); U.clear(this.stats); U.clear(this.main); U.clear(this.bottom);
-        child(this.context, [h('strong', {class: 'ov-context', text: 'Current NCOS router'}),
-            h('span', {class: 'ov-pill good', text: 'Saved telemetry'}),
-            h('span', {class: 'ov-context', text: 'Primary WAN: ' + txt((topo.primary || {}).display_name, 'Unknown')}),
-            h('span', {class: 'ov-muted', text: 'Updated: ' + time(snap.timestamp)})]);
+        child(this.context, [h('strong', {class: 'ov-context ov-router-name',
+            text: txt((snap.system_summary || {}).router_name, 'Router name unavailable')}),
+            h('span', {class: 'ov-context', text: 'Primary WAN: ' + txt((topo.primary || {}).display_name, 'Unknown')})]);
         child(this.stats, [
             stat('Physical WANs', phys.length, phys.filter(function (p) { return maybeStatus(p.observed) === 'connected'; }).length + ' connected'),
             stat('SD-WAN overlays', overlays.length, 'Reported by NCOS'),
             stat('WBOND interfaces', bonds.length, 'Runtime bond objects'),
             stat('Logical steering rules', rules.length, 'Defined in latest snapshot'),
-            stat('Last observed', snap.timestamp ? F.timeOnly(snap.timestamp) : null, 'Router snapshot time')
+            stat('Last observed', clock12(snap.timestamp, true), countText(this.dayMeta))
         ]);
         var side = h('div', {class: 'ov-side'}, [this._steering(rules), this._bond(bonds)]);
         child(this.main, [this._topology(topo, phys, bonds), side]);
         child(this.bottom, [this._paths(phys, overlays, snap.swans), this._events(snap), this._throughputPanel()]);
+    };
+    Overview.prototype._updateTimeWindow = function () {
+        var end = number(this.snapshot && this.snapshot.timestamp);
+        if (end === null || end <= 0) { this.rangeLabel.textContent = 'Time window unavailable'; return; }
+        var start = end - Number(this.range);
+        this.rangeLabel.textContent = 'Selected window: ' + clock12(start, true) + ' – ' +
+            clock12(end, true) + ' (' + F.timeZoneName() + '; ends at last observation)';
     };
     Overview.prototype._topology = function (topo, phys, bonds) {
         var self = this;
