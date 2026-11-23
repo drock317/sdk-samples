@@ -279,7 +279,7 @@
         if (end === null || end <= 0) { this.rangeLabel.textContent = 'Time window unavailable'; return; }
         var start = end - Number(this.range);
         this.rangeLabel.textContent = 'Selected window: ' + clock12(start, true) + ' – ' +
-            clock12(end, true) + ' (' + F.timeZoneName() + '; ends at last observation)';
+            clock12(end, true) + ' (' + F.timeZoneName() + ')';
     };
     Overview.prototype._topology = function (topo, phys, bonds) {
         var self = this;
