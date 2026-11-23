@@ -201,3 +201,9 @@
 .ov-toolbar-left .ov-router-name {display:block;font-size:1.13rem;font-weight:750;
     color:var(--text-primary);line-height:1.3;letter-spacing:-.012em;}
 @media(max-width:650px){.ov-toolbar-left .ov-router-name{font-size:1.08rem;}}
+
+/* Validation fix: rule names stay labels; details open from explicit info buttons next to flows. */
+.ov-flow-end {display:inline-flex;align-items:center;justify-content:flex-end;gap:.45rem;white-space:nowrap;}
+.ov-flow-end .ov-iconbtn {width:1.4rem;height:1.4rem;font-size:.74rem;}
+.ov-rule-name {font-weight:600;min-width:0;overflow-wrap:anywhere;}
+.ov-flow .ov-popover-wrap {align-items:center;}
