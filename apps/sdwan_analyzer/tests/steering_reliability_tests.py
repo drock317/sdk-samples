@@ -32,9 +32,12 @@ check = None            # bound by run_tests.main()
 _Clock = None
 
 T0 = 1790380800
-STEERING_KEYS = ('steering_rules', 'steering_events', 'steering_stats',
-                 'steering_intents')
+STEERING_KEYS = ('steering_rules', 'steering_events', 'steering_stats')
 _PATH_KEY = {p: k for k, p in collectors._PATHS.items()}
+_CHILD_OF = {'status/wan/steering/rules': 'rules',
+             'status/wan/steering/stats': 'stats',
+             'status/wan/steering/events': 'events'}
+PROHIBITED = ('status/wan/steering', 'status/wan/steering/intents')
 
 
 def bind(check_fn, clock_cls):
@@ -55,6 +58,8 @@ class _Reads(object):
         self.data.update(fixtures.heavy_raw())
         self.steering = copy.deepcopy(fixtures.STEERING_PARENT)
         self.logs = []
+        self.paths = []
+        self.fail_children = set()
 
     def __enter__(self):
         self._saved_get = collectors._get_result
@@ -62,12 +67,19 @@ class _Reads(object):
         collectors._steering_source.update(state=None, repeat=0)
 
         def fake(path):
-            if path == 'status/wan/steering':
-                if self.steering is self.FAIL:
+            # v1.0.5: the scenario object `steering` is parent-SHAPED data
+            # served through the three child paths. The parent and /intents
+            # are prohibited reads and fail the test if ever requested.
+            self.paths.append(path)
+            child = _CHILD_OF.get(path)
+            if child is not None:
+                if self.steering is self.FAIL or child in self.fail_children:
                     return collectors.CollectResult(
                         False, error='timeout after 8s',
                         error_type=collectors.ERR_TIMEOUT)
-                return collectors.CollectResult(True, value=self.steering,
+                val = (self.steering.get(child)
+                       if isinstance(self.steering, dict) else None)
+                return collectors.CollectResult(True, value=val,
                                                 acquired_at=None)
             key = _PATH_KEY.get(path)
             return collectors.CollectResult(
@@ -103,7 +115,8 @@ def test_split_transport_failure():
               == {collectors.ERR_TIMEOUT},
               'transport failure: original error_type kept')
         check(collectors.steering_source_state()['state']
-              == 'transport_failure', 'transport failure classified')
+              == collectors.ERR_EMPTY_SOURCE,
+              'all children failed classified')
 
 
 def test_split_empty_source_variants():
@@ -130,17 +143,14 @@ def test_split_incomplete_source():
         split = _split(r, parent)
         check(not split['steering_rules'].ok and
               split['steering_rules'].error_type
-              == collectors.ERR_INCOMPLETE_SOURCE,
-              'incomplete: rules failed as incomplete_source')
+              == collectors.ERR_EMPTY_SOURCE,
+              'rules child with no data fails (never an empty config)')
         check(split['steering_events'].ok and split['steering_stats'].ok,
-              'incomplete: other children of the parent still current')
+              'failed rules child leaves events/stats current')
         parent['rules'] = None
         split = _split(r, parent)
-        check(split['steering_rules'].error_type
-              == collectors.ERR_INCOMPLETE_SOURCE,
-              'incomplete: rules None is incomplete, not empty')
-
-
+        check(not split['steering_rules'].ok,
+              'rules None is a failed read, not empty')
 def test_split_successful_empty_rules():
     print('test_split_successful_empty_rules')
     with _Reads() as r:
@@ -163,7 +173,8 @@ def test_split_logging_is_sanitized_and_transition_only():
         _split(r, None)
         _split(r, None)
         logs = r.steering_logs()
-        check(len(logs) == 1 and 'no usable object (no data)' in logs[0],
+        check(len(logs) == 1 and 'children all failed' in logs[0]
+              and 'no data' in logs[0],
               'three identical empty reads: one log line')
         _split(r, copy.deepcopy(fixtures.STEERING_PARENT))
         logs = r.steering_logs()
@@ -177,10 +188,10 @@ def test_split_logging_is_sanitized_and_transition_only():
         _split(r, parent)
         _split(r, _Reads.FAIL)
         logs = r.steering_logs()
-        check(any('incomplete (rules NoneType)' in m for m in logs) and
+        check(any('children partly failed' in m for m in logs) and
               any('explicit empty rules list' in m for m in logs) and
-              any('read failed (timeout)' in m for m in logs),
-              'four distinct states produce four distinct messages')
+              any('children all failed' in m for m in logs),
+              'distinct states produce distinct messages')
         raw_names = [x['xpolicy']['name'] for x in fixtures.STEERING_RULES
                      if isinstance(x.get('xpolicy'), dict)]
         check(not any(n in m for m in logs for n in raw_names),
@@ -318,7 +329,96 @@ def test_service_empty_rules_needs_confirmation_for_legacy():
               is True, 'confirmed empty: steering_rule_defs agrees')
 
 
+# --- v1.0.5: independent children, no parent / intents read ----------------
+
+def test_children_values_and_prohibited_paths():
+    print('test_children_values_and_prohibited_paths')
+    with _Reads() as r:
+        split = _split(r, copy.deepcopy(fixtures.STEERING_PARENT))
+        check(r.paths == ['status/wan/steering/rules',
+                          'status/wan/steering/stats',
+                          'status/wan/steering/events'],
+              'exactly the three child paths read, once each')
+        check(not any(p in PROHIBITED for p in r.paths),
+              'neither status/wan/steering nor /intents is ever read')
+        check(split['steering_rules'].value == fixtures.STEERING_RULES and
+              split['steering_stats'].value == fixtures.STEERING_STATS and
+              split['steering_events'].value == fixtures.STEERING_EVENTS,
+              'each key carries its own child response')
+        check(all(split[k].ok for k in STEERING_KEYS), 'all children ok')
+        check('steering_intents' not in split,
+              'steering_intents is not collected (no fake ok-empty result)')
+        check(collectors.STEERING_UNCOLLECTED_KEYS == ('steering_intents',),
+              'steering_intents declared intentionally uncollected')
+    # Through collect_keys, including the intents key in the request.
+    with _Reads() as r:
+        out = collectors.collect_keys(('steering_rules', 'steering_events',
+                                       'steering_stats', 'steering_intents'))
+        check(set(out) == {'steering_rules', 'steering_events',
+                           'steering_stats'},
+              'collect_keys: intents yields no result, others present')
+        check(not any(p in PROHIBITED for p in r.paths),
+              'collect_keys: prohibited endpoints never read')
+def test_children_partial_failure_isolated():
+    print('test_children_partial_failure_isolated')
+    for failing in ('rules', 'stats', 'events'):
+        with _Reads() as r:
+            r.fail_children = {failing}
+            split = _split(r, copy.deepcopy(fixtures.STEERING_PARENT))
+            bad = 'steering_' + failing
+            check(not split[bad].ok and
+                  split[bad].error_type == collectors.ERR_TIMEOUT,
+                  '{}: failed child reports its own error'.format(failing))
+            check(all(split[k].ok for k in STEERING_KEYS if k != bad),
+                  '{}: other children unaffected'.format(failing))
+            check(collectors.steering_source_state()['state']
+                  == collectors.ERR_INCOMPLETE_SOURCE,
+                  '{}: partial failure classified'.format(failing))
+def test_children_empty_child_is_failed_not_empty():
+    print('test_children_empty_child_is_failed_not_empty')
+    with _Reads() as r:
+        parent = copy.deepcopy(fixtures.STEERING_PARENT)
+        parent['stats'] = None
+        parent['events'] = {}
+        split = _split(r, parent)
+        check(not split['steering_stats'].ok and
+              not split['steering_events'].ok and split['steering_rules'].ok,
+              'None/{} stats+events fail; rules unaffected')
+        check(split['steering_stats'].error_type
+              == collectors.ERR_EMPTY_SOURCE, 'classified empty_source')
+def test_service_partial_failure_keeps_last_known_good():
+    print('test_service_partial_failure_keeps_last_known_good')
+    with _Reads() as r:
+        svc = _svc()
+        svc.collect_startup()
+        good_stats = copy.deepcopy(svc._runtime_raw.data['steering_stats'])
+        parent = copy.deepcopy(fixtures.STEERING_PARENT)
+        r.fail_children = {'stats'}
+        obs = _pass(svc, r, parent)
+        errs = {e['collector'] for e in obs['collector_errors']}
+        check('steering_stats' in errs and 'steering_rules' not in errs and
+              'steering_events' not in errs and
+              'steering_intents' not in errs,
+              'only the failed child (never intents) is a collector error')
+        check(svc._runtime_raw.data['steering_stats'] == good_stats,
+              'failed stats child keeps last-known-good')
+        check(svc._runtime_raw.data['steering_rules']
+              == fixtures.STEERING_RULES,
+              'rules child still refreshed')
+        check('steering_intents' not in svc._runtime_raw.health(),
+              'intents never appears as a collector (no false success)')
+        check(svc._freshness.get('traffic_steering', {}).get('collected_ts')
+              != int(svc._clock()),
+              'traffic_steering freshness not advanced by a failed child')
+        r.fail_children = set()
+        obs = _pass(svc, r, copy.deepcopy(parent))
+        check(svc._freshness['traffic_steering']['collected_ts']
+              == int(svc._clock()), 'freshness advances once all children ok')
 TESTS = [
+    test_children_values_and_prohibited_paths,
+    test_children_partial_failure_isolated,
+    test_children_empty_child_is_failed_not_empty,
+    test_service_partial_failure_keeps_last_known_good,
     test_split_transport_failure,
     test_split_empty_source_variants,
     test_split_incomplete_source,

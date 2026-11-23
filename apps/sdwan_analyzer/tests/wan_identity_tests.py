@@ -874,8 +874,8 @@ def test_versions_in_sync():
     got = tuple(int(re.search(r'^version_%s\s*=\s*(\d+)' % k, ini,
                               re.M).group(1))
                 for k in ('major', 'minor', 'patch'))
-    check('.'.join(str(n) for n in got) == VERSION == '1.0.2',
-          'package.ini {} == analyzer.VERSION {} == 1.0.2'.format(got,
+    check('.'.join(str(n) for n in got) == VERSION == '1.0.5',
+          'package.ini {} == analyzer.VERSION {} == 1.0.5'.format(got,
                                                                  VERSION))
 
 

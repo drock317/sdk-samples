@@ -20,7 +20,7 @@ VERIFIED (documented structure, safe to consume specific fields):
     status/wan/swans                   docs/ncos-api/status/wan/swans.md
     status/wan/sdwan                   docs/ncos-api/status/wan/sdwan.md
     status/sdwan_adv                   docs/ncos-api/status/sdwan_adv.md
-    status/wan/steering                docs/ncos-api/status/wan/steering.md
+    status/wan/steering/{rules,stats,events}  docs/ncos-api/status/wan/steering.md
 
 HOST MODEL (v1.0.2, static):
     status/product_info/product_name   cp.get_product_type() reads the same
@@ -224,6 +224,10 @@ def sdwan_links():
 def steering():
     """status/wan/steering -> {events,stats,perf,rules,intents}.
 
+    DO NOT CALL (v1.0.5): every read triggers the NCOS
+    SteeringEngine.wrap_intents_hook exception. Unused; the scheduled
+    collection reads the rules/stats/events children instead.
+
     rules/intents entry shapes are OPAQUE until steering is configured.
     """
     return _get('status/wan/steering')
@@ -335,6 +339,10 @@ def steering_rules():
 def steering_intents():
     """status/wan/steering/intents -> runtime intent map (may be sparse).
 
+    DO NOT CALL (v1.0.5): every read triggers the NCOS
+    SteeringEngine.wrap_intents_hook exception. Unused; intents are
+    intentionally uncollected.
+
     Do NOT treat an empty map as proof Traffic Classes do not exist; the
     authoritative class definitions live in the config tree (see
     traffic_class_config / intent_config below).
@@ -425,10 +433,10 @@ _steering_source = {'state': None, 'repeat': 0}
 
 STEERING_SOURCE_MESSAGES = {
     'transport_failure': 'read failed ({})',
-    ERR_EMPTY_SOURCE: 'returned no usable object ({}); treated as a failed '
-                      'read, last known steering data kept',
-    ERR_INCOMPLETE_SOURCE: 'incomplete ({}); rules treated as a failed '
-                           'read, last known definitions kept',
+    ERR_EMPTY_SOURCE: 'children all failed ({}); last known steering data '
+                      'kept',
+    ERR_INCOMPLETE_SOURCE: 'children partly failed ({}); failed children '
+                           'keep last known data',
     'ok_empty_rules': 'read ok with an explicit empty rules list ({} rules)',
     'ok': 'read ok ({} rules)',
 }
@@ -449,7 +457,7 @@ def _note_steering_source(state, detail):
         return  # steady healthy state: nothing to report
     msg = STEERING_SOURCE_MESSAGES.get(state, '{}').format(detail)
     suffix = '' if prev is None else ' (previous: {} x{})'.format(prev, held)
-    cp.log('collectors: status/wan/steering {}{}'.format(msg, suffix))
+    cp.log('collectors: status/wan/steering/* {}{}'.format(msg, suffix))
 
 
 def steering_source_state():
@@ -458,62 +466,58 @@ def steering_source_state():
 
 
 def _steering_split_results():
-    """Read status/wan/steering ONCE and split into per-key CollectResults.
+    """Read the steering children INDEPENDENTLY and return per-key results.
 
-    COLLECTION EFFICIENCY: the four steering sub-trees (rules/events/stats/
-    intents) are all children of the single status/wan/steering object (see
-    docs/ncos-api/status/wan/steering.md, which documents the parent as one
-    object returning {events, stats, perf, rules, intents}). One cp.get() of
-    the parent is strictly fewer API dispatches than four separate sub-path
-    reads and returns identical data, so we fetch once and split locally.
+    v1.0.5: reads status/wan/steering/{rules,stats,events} as three separate
+    cp.get() calls. The parent status/wan/steering and status/wan/steering/
+    intents are NEVER read: on NCOS 7.26.81 (R2400 + R1900, isolated REST
+    test) every read of either one raises SteeringEngine.wrap_intents_hook
+    in the router log, while the three children above never do.
 
-    If the single parent read FAILS, all four keys report that same failure
-    (so the LKG cache keeps each key's previous value). We do NOT fall back
-    to four separate reads -- that would defeat the load reduction.
+    `steering_intents` is intentionally uncollected (STEERING_UNCOLLECTED_KEYS):
+    it is absent from the returned dict, so it is never cached, never counted
+    as a successful (empty) read and never reported as a collector error.
+    Intents were empty on both routers and nothing downstream consumes them.
+
+    Each child is its own CollectResult: one failed child fails only its own
+    key (last-known-good keeps its previous value). A child that "succeeds"
+    with no usable value fails as ERR_EMPTY_SOURCE (on-router cp.get() yields
+    None on a config-store socket error), never as an empty configuration. An
+    explicit empty rules list ([] or {}) is a legitimate empty. Source health
+    is logged on transition only, with counts and type names (no payload).
     """
-    res = _get_result('status/wan/steering')
-    if not res.ok:
-        _note_steering_source('transport_failure', res.error_type)
-        return {k: CollectResult(False, error=res.error,
-                                 error_type=res.error_type)
-                for k in _STEERING_KEYS}
-    parent = res.value
-    if not isinstance(parent, dict) or not parent:
-        # v0.8.5: NCOS always returns the parent as a non-empty object
-        # ({events, stats, perf, rules, intents}); on-router cp.get() yields
-        # None for a socket timeout/error. Never treat that as "no steering":
-        # fail every key so the LKG cache, freshness and version stores keep
-        # the last good state and the gap is visible in collector_errors.
-        detail = 'no data' if parent is None else type(parent).__name__
-        _note_steering_source(ERR_EMPTY_SOURCE, detail)
-        err = 'status/wan/steering returned no usable object ({})'.format(
-            detail)
-        return {k: CollectResult(False, error=err,
-                                 error_type=ERR_EMPTY_SOURCE)
-                for k in _STEERING_KEYS}
-    rules = parent.get('rules')
-    if isinstance(rules, (list, dict)):
-        rules_res = CollectResult(True, value=rules)
+    out = {}
+    failed = []
+    for key, path in _STEERING_CHILD_PATHS:
+        res = _get_result(path)
+        if not res.ok:
+            failed.append('{} {}'.format(key, res.error_type))
+            out[key] = CollectResult(False, error=res.error,
+                                     error_type=res.error_type)
+            continue
+        value = res.value
+        if key == 'steering_rules':
+            usable = isinstance(value, (list, dict))
+        else:
+            usable = isinstance(value, dict) and bool(value)
+        if not usable:
+            detail = 'no data' if value is None else type(value).__name__
+            failed.append('{} {}'.format(key, detail))
+            out[key] = CollectResult(
+                False, error='{} returned no usable object ({})'.format(
+                    path, detail), error_type=ERR_EMPTY_SOURCE)
+            continue
+        out[key] = CollectResult(True, value=value,
+                                 acquired_at=res.acquired_at)
+    if failed:
+        _note_steering_source(ERR_EMPTY_SOURCE if len(failed) == 3
+                              else ERR_INCOMPLETE_SOURCE,
+                              '; '.join(failed))
+    else:
+        rules = out['steering_rules'].value
         _note_steering_source('ok' if rules else 'ok_empty_rules',
                               len(rules))
-    else:
-        # The parent object arrived but without a usable rules child:
-        # incomplete, not an empty configuration (that is an explicit []).
-        # Only the rules key fails; the other children are still current.
-        detail = 'rules {}'.format(type(rules).__name__)
-        _note_steering_source(ERR_INCOMPLETE_SOURCE, detail)
-        rules_res = CollectResult(
-            False, error='status/wan/steering incomplete ({})'.format(detail),
-            error_type=ERR_INCOMPLETE_SOURCE)
-    # A successful parent read that lacks a NON-rules child key is a
-    # legitimate empty for that child (ok=True, value None) -- it must
-    # replace stale data.
-    return {
-        'steering_rules': rules_res,
-        'steering_events': CollectResult(True, value=parent.get('events')),
-        'steering_stats': CollectResult(True, value=parent.get('stats')),
-        'steering_intents': CollectResult(True, value=parent.get('intents')),
-    }
+    return out
 
 
 # --- Collection groups ----------------------------------------------------
@@ -550,6 +554,16 @@ _PATHS = {
 }
 _STEERING_KEYS = ('steering_rules', 'steering_events', 'steering_stats',
                   'steering_intents')
+# v1.0.5: collected from independent children. status/wan/steering (parent)
+# and status/wan/steering/intents are NEVER read (NCOS wrap_intents_hook
+# exception on every read of either). steering_intents stays a valid key for
+# refresh groups/recording but yields NO result (not collected).
+_STEERING_CHILD_PATHS = (
+    ('steering_rules', 'status/wan/steering/rules'),
+    ('steering_stats', 'status/wan/steering/stats'),
+    ('steering_events', 'status/wan/steering/events'),
+)
+STEERING_UNCOLLECTED_KEYS = ('steering_intents',)
 
 # Key classes. loadbalancers is RUNTIME data (not static config) but is
 # expensive on the R1900, so it is read only at startup, ~hourly reconciliation
@@ -607,7 +621,7 @@ def collect_keys(keys):
     if any(k in _STEERING_KEYS for k in keys):
         split = _steering_split_results()
         for key in keys:
-            if key in _STEERING_KEYS:
+            if key in split:  # steering_intents: intentionally uncollected
                 out[key] = split[key]
     return out
 

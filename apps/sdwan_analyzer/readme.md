@@ -196,7 +196,7 @@ only sleeps; the UI always shows the latest saved normalized state.
    | Group | Reads |
    |-------|-------|
    | `traffic_classes` | `config/identities/intent`, `config/sdwan_adv/traffic_class` |
-   | `steering` | `status/wan/steering` (one read, split locally), `config/identities/ip` |
+   | `steering` | `status/wan/steering/{rules,stats,events}` (three independent reads), `config/identities/ip` |
    | `bonding` | `status/wan/devices`, `status/sdwan_adv/wan_bonding` |
    | `wan_paths` | `status/wan/devices`, `primary_device`, `swans`, `qoe` |
    | `overview` | all runtime endpoints |
@@ -304,7 +304,7 @@ poll that are still inside NCOS's rolling window.
 `ds/us_curr_bw`, `*_last_bw_sample` and trend fields are neither persisted
 nor used as throughput; future bandwidth comes from interface counters.
 
-**Steering runtime** reuses the single `status/wan/steering` read. Observations
+**Steering runtime** reuses the three `status/wan/steering/{rules,stats,events}` reads. Observations
 store per-rule runtime only (preferred WAN, `steering_to`, flows, latest event
 reason); static definitions live in the versioned `steering_definitions`.
 Events are stored once, keyed with their exact epoch.
@@ -354,9 +354,11 @@ link/attach state, `gre_key`, `mtu`. Configured weight, runtime directional
 weight, and observed flow share stay separate; bandwidth units are not
 assumed.
 
-The four steering sub-trees are children of one `status/wan/steering` object,
-so a pass reads that parent **once** and splits it locally rather than
-issuing four sub-path reads.
+Since v1.0.5 a pass reads `status/wan/steering/rules`, `/stats` and `/events`
+as three independent reads (one failed child never fails the others). The
+parent `status/wan/steering` and `/intents` are **never** read: on NCOS 7.26.81
+(R2400 and R1900) every read of either raises a `SteeringEngine.wrap_intents_hook`
+exception in the router log. `steering_intents` is intentionally uncollected.
 
 Caching is **per collector**. Each read returns an explicit success/error
 result, so a failed endpoint retains its previous last-known-good value while
@@ -435,7 +437,7 @@ timeout/busy guard; a failing or busy collector is counted in
 |-------|--------|---------|
 | `wan` | `status/wan/devices` (state, counters, cellular/CA) + `status/wan/primary_device` | 5 s |
 | `wbond` | `status/sdwan_adv/wan_bonding` | 5 s |
-| `steering` | `status/wan/steering` (one read, split locally) | 10 s |
+| `steering` | `status/wan/steering/{rules,stats,events}` (three reads) | 10 s |
 | `qoe` | `status/sdwan_adv/qoe` | 10 s |
 | `swans` | `status/wan/swans` (unseen `(uid, epoch)` only) | 10 s |
 

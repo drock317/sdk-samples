@@ -449,34 +449,32 @@ def test_per_collector_lkg_cache():
 
 def test_steering_single_read_split():
     print('test_steering_single_read_split')
-    # Simulate collectors._get_result over the single parent object.
+    # v1.0.5: three independent child reads; parent and /intents never read.
     saved = collectors._get_result
-    calls = {'n': 0, 'paths': []}
-
+    calls = {'paths': []}
+    children = {'status/wan/steering/rules': fixtures.STEERING_RULES,
+                'status/wan/steering/stats': fixtures.STEERING_STATS,
+                'status/wan/steering/events': fixtures.STEERING_EVENTS}
     def fake(path):
-        calls['n'] += 1
         calls['paths'].append(path)
-        if path == 'status/wan/steering':
-            return collectors.CollectResult(True, value=fixtures.STEERING_PARENT)
-        return collectors.CollectResult(True, value=None)
-
+        return collectors.CollectResult(True, value=children.get(path))
     collectors._get_result = fake
     try:
         split = collectors._steering_split_results()
     finally:
         collectors._get_result = saved
-
-    check(calls['paths'].count('status/wan/steering') == 1,
-          'steering parent read exactly once (not four sub-reads)')
+    check(sorted(calls['paths']) == sorted(children),
+          'steering read as three child paths, once each')
+    check('status/wan/steering' not in calls['paths'] and
+          'status/wan/steering/intents' not in calls['paths'],
+          'steering parent and intents never read')
     check(split['steering_rules'].value is fixtures.STEERING_RULES,
-          'rules split from parent')
+          'rules from child')
     check(split['steering_stats'].value is fixtures.STEERING_STATS,
-          'stats split from parent')
+          'stats from child')
     check(split['steering_events'].value is fixtures.STEERING_EVENTS,
-          'events split from parent')
-    check(split['steering_intents'].ok is True, 'intents split (ok)')
-
-
+          'events from child')
+    check('steering_intents' not in split, 'intents intentionally uncollected')
 # -------------------------------------------------------------------------
 # Service end-to-end + compact history + change detection + privacy
 # -------------------------------------------------------------------------
