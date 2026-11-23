@@ -69,7 +69,9 @@
         var width = Math.min(350, window.innerWidth - margin * 2);
         popup.style.width = width + 'px';
         popup.style.maxWidth = width + 'px';
-        popup.style.left = Math.max(margin, Math.min(anchor.right - width,
+        var desiredLeft = btn.classList.contains('ov-rule-info') ? anchor.right + gap : anchor.right - width;
+        if (desiredLeft + width > window.innerWidth - margin) { desiredLeft = anchor.left - width - gap; }
+        popup.style.left = Math.max(margin, Math.min(desiredLeft,
             window.innerWidth - width - margin)) + 'px';
         var height = popup.getBoundingClientRect().height;
         var below = anchor.bottom + gap;
@@ -444,10 +446,18 @@
         if (rawSelector === 'explicit_priority' || (rule.wan_priority_enabled && priorities.length)) {
             rows.push(['Priority List', rule.wan_priority_enabled ? 'Enabled' : 'Disabled']);
             priorities.forEach(function (v, i) {
-                var priority = typeof v === 'string' ? v : (v && (v.display_name || v.name || v.trigger_string));
+                var triggerString = typeof v === 'string' ? v : (v && v.trigger_string);
+                var name = v && (v.display_name || v.name);
+                // Triggers describe interface types, not necessarily named carriers/profiles.
+                var plain = String(triggerString || '').toLowerCase();
+                if (!name && plain.indexOf('wbond') !== -1) { name = 'Bonded WAN'; }
+                if (!name && plain.indexOf('service_type|is|5g') !== -1) { name = '5G SD-WAN (provider not resolved)'; }
+                if (!name && plain.indexOf('service_type|is|lte') !== -1) { name = 'LTE SD-WAN (provider not resolved)'; }
+                if (!name && plain.indexOf('ethernet') !== -1) { name = 'Ethernet'; }
+                if (!name && plain.indexOf('wwan') !== -1) { name = 'Wireless WAN'; }
                 var ncmOrder = v && typeof v.trigger_priority === 'number' ? v.trigger_priority : null;
                 rows.push(['WAN ' + (i + 1) + (ncmOrder === null ? '' : ' (priority ' + ncmOrder + ')'),
-                    priority || 'Unresolved']);
+                    name || 'Unresolved selector']);
             });
         }
         if (tc) {
@@ -456,7 +466,8 @@
             rows.push(['Multiple WAN', tc.loadbalance_algo ?
                 (tc.loadbalance_algo === 'none' ? 'Disabled' : 'Enabled (' + tc.loadbalance_algo + ')') : 'Unavailable']);
             var modes = {flow_balance:'Multi-flow Optimization',flow_duplication:'Flow Duplication',
-                large_flow:'Large Flow Optimization'};
+                flow_duplicate:'Flow Duplication',large_flow:'Large Flow Optimization',
+                large_flow_optimization:'Large Flow Optimization'};
             rows.push(['Bonded WAN mode', modes[tc.wan_bonding_algorithm] || tc.wan_bonding_algorithm || 'Unavailable']);
         } else {
             rows.push(['FEC', 'Unavailable'], ['Multiple WAN', 'Unavailable'],
@@ -478,12 +489,16 @@
             var meter = h('div', {class:'ov-flow-meter'}, [h('span', {style:'width:' +
                 (max ? Math.round(r.value/max*100) : 0) + '%;'})]);
             var pop = ruleDetails(r.rule,trafficClasses,r.value,r.p,r.n);
-            var trigger = h('button', {class:'ov-rule-trigger',type:'button',
-                text:r.name, 'aria-label':'Details for steering rule '+r.name});
+            var trigger = h('button', {class:'ov-iconbtn ov-rule-info',type:'button',
+                text:'i', 'aria-label':'Show configuration for steering rule '+r.name,
+                title:'Steering rule details'});
             var wrap = h('span', {class:'ov-popover-wrap'}, [trigger,pop]);
-            attachPopover(trigger,pop,true);
-            body.appendChild(h('div',{class:'ov-flow'},[wrap,meter,
-                h('span',{text:r.value.toLocaleString()+' flows'})]));
+            attachPopover(trigger,pop);
+            body.appendChild(h('div',{class:'ov-flow'},[
+                h('span',{class:'ov-rule-name',text:r.name}),meter,
+                h('span',{class:'ov-flow-end'},[
+                    h('span',{text:r.value.toLocaleString()+' flows'}),wrap])
+            ]));
         });
         if (!rows.length) { body.appendChild(h('p',{class:'ov-muted',
             text:'No valid per-rule flow populations reported.'})); }
