@@ -448,16 +448,27 @@
             priorities.forEach(function (v, i) {
                 var triggerString = typeof v === 'string' ? v : (v && v.trigger_string);
                 var name = v && (v.display_name || v.name);
-                // Triggers describe interface types, not necessarily named carriers/profiles.
-                var plain = String(triggerString || '').toLowerCase();
-                if (!name && plain.indexOf('wbond') !== -1) { name = 'Bonded WAN'; }
-                if (!name && plain.indexOf('service_type|is|5g') !== -1) { name = '5G SD-WAN (provider not resolved)'; }
-                if (!name && plain.indexOf('service_type|is|lte') !== -1) { name = 'LTE SD-WAN (provider not resolved)'; }
-                if (!name && plain.indexOf('ethernet') !== -1) { name = 'Ethernet'; }
-                if (!name && plain.indexOf('wwan') !== -1) { name = 'Wireless WAN'; }
+                var expression = String(triggerString || '');
+                // NCOS selector terms are %-delimited. Extract only provider/service
+                // fields that the actual compiled expression explicitly contains.
+                var carrier = expression.match(/(?:^|%)carrid\|roughly contains\|([^%]+)/i);
+                var service = expression.match(/(?:^|%)service_type\|is\|([^%]+)/i);
+                var subtype = expression.match(/(?:^|%)subtype\|is\|([^%]+)/i);
+                var kind = expression.match(/(?:^|%)type\|is\|([^%]+)/i);
+                if (!name && carrier) {
+                    var provider = carrier[1].trim();
+                    if (/^att$/i.test(provider)) { provider = 'AT&T'; }
+                    name = provider + (service ? ' ' + service[1].toUpperCase() : '');
+                }
+                if (!name && kind && /^wbond$/i.test(kind[1])) { name = 'Bonded WAN'; }
+                if (!name && subtype && /^ethernet$/i.test(subtype[1])) { name = 'Ethernet'; }
+                if (!name && subtype && /^wwan$/i.test(subtype[1])) { name = 'Wireless WAN'; }
+                if (!name && service) { name = service[1].toUpperCase() + ' SD-WAN (any provider)'; }
+                if (!name && subtype && /^mdm$/i.test(subtype[1])) { name = 'Cellular SD-WAN'; }
+                if (!name && kind && /^sdwan$/i.test(kind[1])) { name = 'SD-WAN (any interface)'; }
                 var ncmOrder = v && typeof v.trigger_priority === 'number' ? v.trigger_priority : null;
-                rows.push(['WAN ' + (i + 1) + (ncmOrder === null ? '' : ' (priority ' + ncmOrder + ')'),
-                    name || 'Unresolved selector']);
+                rows.push(['WAN ' + (i + 1) + (ncmOrder === null ? '' : ' · Priority ' + ncmOrder),
+                    name || 'Selector unavailable']);
             });
         }
         if (tc) {
@@ -474,7 +485,9 @@
                 ['Bonded WAN mode', 'Unavailable']);
         }
         rows.push(['Preferred flows', p], ['Nonpreferred flows', n]);
-        return makePopover(rule.logical_name || 'Steering rule', rows);
+        var popup = makePopover(rule.logical_name || 'Steering rule', rows);
+        popup.classList.add('ov-rule-popover');
+        return popup;
     }
     Overview.prototype._steering = function (rules, trafficClasses) {
         var rows = [], body = h('div');
