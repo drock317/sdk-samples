@@ -69,7 +69,9 @@
         var width = Math.min(350, window.innerWidth - margin * 2);
         popup.style.width = width + 'px';
         popup.style.maxWidth = width + 'px';
-        popup.style.left = Math.max(margin, Math.min(anchor.right - width,
+        var desiredLeft = btn.classList.contains('ov-rule-info') ? anchor.right + gap : anchor.right - width;
+        if (desiredLeft + width > window.innerWidth - margin) { desiredLeft = anchor.left - width - gap; }
+        popup.style.left = Math.max(margin, Math.min(desiredLeft,
             window.innerWidth - width - margin)) + 'px';
         var height = popup.getBoundingClientRect().height;
         var below = anchor.bottom + gap;
@@ -176,7 +178,7 @@
 
     function Overview(mount) {
         this.mount = mount; this.token = 0; this.chartToken = 0;
-        this.snapshot = null; this.topology = null; this.wbond = null; this.dayMeta = null;
+        this.snapshot = null; this.topology = null; this.wbond = null; this.wbondConfig = null; this.dayMeta = null;
         this.range = '86400'; this.activeUid = null; this.series = [];
         this.hiddenKey = null; this.hiddenUids = [];
         this._topologyObserver = null;
@@ -212,13 +214,15 @@
         Promise.all([
             A.getJson('api/snapshot'), A.getJson('api/analytics/topology'),
             A.getJson('api/analytics/wbond'),
-            A.getJson('api/analytics/overview_meta').catch(function () { return {data: null}; })
+            A.getJson('api/analytics/overview_meta').catch(function () { return {data: null}; }),
+            A.getJson('api/analytics/wbond_config').catch(function () { return {data: null}; })
         ]).then(function (r) {
             if (token !== self.token) { return; }
             self.snapshot = r[0].data || {};
             self.topology = r[1].data || {};
             self.wbond = r[2].data || {};
             self.dayMeta = r[3].data;
+            self.wbondConfig = r[4].data;
             var key = storageKey(self.snapshot);
             if (self.hiddenKey !== key) { self.hiddenKey = key; self.hiddenUids = safeHidden(key); }
             self._render(); self._updateTimeWindow(); self.loadChart();
@@ -444,10 +448,29 @@
         if (rawSelector === 'explicit_priority' || (rule.wan_priority_enabled && priorities.length)) {
             rows.push(['Priority List', rule.wan_priority_enabled ? 'Enabled' : 'Disabled']);
             priorities.forEach(function (v, i) {
-                var priority = typeof v === 'string' ? v : (v && (v.display_name || v.name || v.trigger_string));
+                var triggerString = typeof v === 'string' ? v : (v && v.trigger_string);
+                var name = v && (v.display_name || v.name);
+                var expression = String(triggerString || '');
+                // NCOS selector terms are %-delimited. Extract only provider/service
+                // fields that the actual compiled expression explicitly contains.
+                var carrier = expression.match(/(?:^|%)carrid\|roughly contains\|([^%]+)/i);
+                var service = expression.match(/(?:^|%)service_type\|is\|([^%]+)/i);
+                var subtype = expression.match(/(?:^|%)subtype\|is\|([^%]+)/i);
+                var kind = expression.match(/(?:^|%)type\|is\|([^%]+)/i);
+                if (!name && carrier) {
+                    var provider = carrier[1].trim();
+                    if (/^att$/i.test(provider)) { provider = 'AT&T'; }
+                    name = provider + (service ? ' ' + service[1].toUpperCase() : '');
+                }
+                if (!name && kind && /^wbond$/i.test(kind[1])) { name = 'Bonded WAN'; }
+                if (!name && subtype && /^ethernet$/i.test(subtype[1])) { name = 'Ethernet'; }
+                if (!name && subtype && /^wwan$/i.test(subtype[1])) { name = 'Wireless WAN'; }
+                if (!name && service) { name = service[1].toUpperCase() + ' SD-WAN (any provider)'; }
+                if (!name && subtype && /^mdm$/i.test(subtype[1])) { name = 'Cellular SD-WAN'; }
+                if (!name && kind && /^sdwan$/i.test(kind[1])) { name = 'SD-WAN (any interface)'; }
                 var ncmOrder = v && typeof v.trigger_priority === 'number' ? v.trigger_priority : null;
-                rows.push(['WAN ' + (i + 1) + (ncmOrder === null ? '' : ' (priority ' + ncmOrder + ')'),
-                    priority || 'Unresolved']);
+                rows.push(['WAN ' + (i + 1) + (ncmOrder === null ? '' : ' · Priority ' + ncmOrder),
+                    name || 'Selector unavailable']);
             });
         }
         if (tc) {
@@ -456,14 +479,17 @@
             rows.push(['Multiple WAN', tc.loadbalance_algo ?
                 (tc.loadbalance_algo === 'none' ? 'Disabled' : 'Enabled (' + tc.loadbalance_algo + ')') : 'Unavailable']);
             var modes = {flow_balance:'Multi-flow Optimization',flow_duplication:'Flow Duplication',
-                large_flow:'Large Flow Optimization'};
+                flow_duplicate:'Flow Duplication',large_flow:'Large Flow Optimization',
+                large_flow_optimization:'Large Flow Optimization'};
             rows.push(['Bonded WAN mode', modes[tc.wan_bonding_algorithm] || tc.wan_bonding_algorithm || 'Unavailable']);
         } else {
             rows.push(['FEC', 'Unavailable'], ['Multiple WAN', 'Unavailable'],
                 ['Bonded WAN mode', 'Unavailable']);
         }
         rows.push(['Preferred flows', p], ['Nonpreferred flows', n]);
-        return makePopover(rule.logical_name || 'Steering rule', rows);
+        var popup = makePopover(rule.logical_name || 'Steering rule', rows);
+        popup.classList.add('ov-rule-popover');
+        return popup;
     }
     Overview.prototype._steering = function (rules, trafficClasses) {
         var rows = [], body = h('div');
@@ -478,12 +504,16 @@
             var meter = h('div', {class:'ov-flow-meter'}, [h('span', {style:'width:' +
                 (max ? Math.round(r.value/max*100) : 0) + '%;'})]);
             var pop = ruleDetails(r.rule,trafficClasses,r.value,r.p,r.n);
-            var trigger = h('button', {class:'ov-rule-trigger',type:'button',
-                text:r.name, 'aria-label':'Details for steering rule '+r.name});
+            var trigger = h('button', {class:'ov-iconbtn ov-rule-info',type:'button',
+                text:'i', 'aria-label':'Show configuration for steering rule '+r.name,
+                title:'Steering rule details'});
             var wrap = h('span', {class:'ov-popover-wrap'}, [trigger,pop]);
-            attachPopover(trigger,pop,true);
-            body.appendChild(h('div',{class:'ov-flow'},[wrap,meter,
-                h('span',{text:r.value.toLocaleString()+' flows'})]));
+            attachPopover(trigger,pop);
+            body.appendChild(h('div',{class:'ov-flow'},[
+                h('span',{class:'ov-rule-name',text:r.name}),meter,
+                h('span',{class:'ov-flow-end'},[
+                    h('span',{text:r.value.toLocaleString()+' flows'}),wrap])
+            ]));
         });
         if (!rows.length) { body.appendChild(h('p',{class:'ov-muted',
             text:'No valid per-rule flow populations reported.'})); }
@@ -491,25 +521,109 @@
             text:'Current/aging NCOS flow populations, not bandwidth or 24-hour totals.'}));
         return panel('Most Active Steering Rules',body);
     };
+    // Stable carrier palette for WBOND members. Match explicit carrier names and
+    // verified abbreviations; never assign a color from member position.
+    function wbondCarrierColor(member) {
+        var label = String((member || {}).physical_display_name || '');
+        if (/(?:^|[^a-z0-9])(?:at&t|att)(?=$|[^a-z0-9])/i.test(label)) { return '#1677e8'; }
+        if (/(?:^|[^a-z0-9])(?:t-mobile|tmobile|tmo)(?=$|[^a-z0-9])/i.test(label)) { return '#e0008b'; }
+        if (/(?:^|[^a-z0-9])(?:verizon|vzw)(?=$|[^a-z0-9])/i.test(label)) { return '#d92332'; }
+        // Ethernet, Starlink/SpaceX, and any unrecognized carrier use black.
+        return '#181818';
+    }
+    // Configured criterion weights, runtime baseline and current direction weights
+    // are separate quantities. Never infer traffic shares from any of these.
     Overview.prototype._bond = function (bonds) {
-        var b = (this.wbond.bonds || [])[0] || bonds[0] || {};
-        var ob = b.observed || {};
-        var members = validArray(b.members);
-        function mini(label, value) { return h('div', [h('strong', {text: txt(value, '—')}), h('small', {text: label})]); }
-        var values = [mini('Listed members', ob.listed_member_count === undefined ? members.length || null : ob.listed_member_count),
-            mini('Download flows', ob.total_download_flows === null ? null : ob.total_download_flows),
-            mini('Upload flows', ob.total_upload_flows === null ? null : ob.total_upload_flows)];
-        var content = h('div', [h('div', {class: 'ov-bond-grid'}, values),
-            h('p', {class: 'ov-muted', text: 'Mode: ' + txt(ob.bonding_mode, 'Unknown') +
-                ' · Link: ' + txt(ob.link_state, 'Unknown')})]);
-        if (members.length) {
-            var observed = members.map(function (m) { return m.observed || {}; });
-            var weight = observed.map(function (o) { return number(o.current_download_weight); });
-            content.appendChild(h('p', {class: 'ov-muted', text: 'Router-reported DL weights: ' +
-                weight.map(function (w) { return w === null ? '—' : String(w); }).join(' : ') +
-                ' (not traffic percentages)'}));
+        var view = this.wbond || {}, cfgView = this.wbondConfig || {};
+        var b = validArray(view.bonds)[0] || bonds[0] || {};
+        var ob = b.observed || {}, members = validArray(b.members);
+        var configList = validArray(cfgView.configured);
+        var matchedConfig = configList.filter(function (c) {
+            var assoc = c.association || {};
+            return assoc.state === 'candidate' && assoc.runtime_bond_iface === b.iface;
+        });
+        var config = matchedConfig.length === 1 ? matchedConfig[0] : null;
+        var content = h('div', {class:'ov-weight-dashboard'});
+        if (!members.length) {
+            content.appendChild(h('p',{class:'ov-muted',text:'No runtime WBOND members reported.'}));
+            return panel('WBOND Snapshot',content);
         }
-        return panel('WBOND Snapshot', content);
+        var mode = config ? config.operating_mode : null;
+        var header = h('div',{class:'ov-weight-header'},[
+            h('span',{class:'ov-weight-subhead',text:'WAN Bond • '+members.length+' members'}),
+            h('span',{class:'ov-weight-mode',text:mode === 'dynamic' ? 'Dynamic weights' :
+                mode === 'static' ? 'Static weights' : 'Mode unverified'})
+        ]);
+        content.appendChild(header);
+        function fmt(v) { return number(v) === null ? '—' : String(v); }
+        function bar(value, color, max) {
+            var n = number(value);
+            var track = h('div',{class:'ov-weight-track'});
+            if (n !== null && max > 0) {
+                track.appendChild(h('span',{class:'ov-weight-fill',style:
+                    'width:'+Math.max(0,Math.min(100,n/max*100))+'%;background:'+color}));
+            }
+            return track;
+        }
+        // Each direction is scaled against that direction's largest observed value,
+        // so bars are relative visual comparisons, not percentage traffic shares.
+        var dlMax = Math.max(0,...members.map(function (m) {
+            return number((m.observed || {}).current_download_weight) || 0;
+        }));
+        var ulMax = Math.max(0,...members.map(function (m) {
+            return number((m.observed || {}).current_upload_weight) || 0;
+        }));
+        var baselineMax = Math.max(0,...members.map(function (m) {
+            return number((m.observed || {}).runtime_config_weight) || 0;
+        }));
+        var labelRow = h('div',{class:'ov-weight-column-head'},[
+            h('span',{text:'Member'}),
+            h('span',{text:'Baseline'}),
+            h('span',{text:'Live download'}),
+            h('span',{text:'Live upload'})
+        ]);
+        content.appendChild(labelRow);
+        members.forEach(function (m,i) {
+            var o=m.observed||{}, color=wbondCarrierColor(m);
+            var label=txt(m.physical_display_name,txt(m.tunnel_iface,'Unknown member'));
+            var vals=[o.runtime_config_weight,o.current_download_weight,o.current_upload_weight];
+            var maxes=[baselineMax,dlMax,ulMax];
+            var member=h('div',{class:'ov-weight-member'},[
+                h('div',{class:'ov-weight-member-name'},[
+                    h('span',{class:'ov-weight-dot',style:'background:'+color}),
+                    h('span',{text:label})])
+            ]);
+            vals.forEach(function (v,j) {
+                member.appendChild(h('div',{class:'ov-weight-metric'},[
+                    h('strong',{text:fmt(v)}),bar(v,color,maxes[j])]));
+            });
+            content.appendChild(member);
+        });
+        if (config) {
+            var configured = h('div',{class:'ov-weight-criteria'},[
+                h('div',{class:'ov-weight-section-title',text:'Configured policy criteria'})
+            ]);
+            validArray(config.criteria).forEach(function (c) {
+                var label=c.form==='profile' ? c.profile_name :
+                    c.form==='type' ? c.type_value : 'Unresolved criterion';
+                configured.appendChild(h('div',{class:'ov-weight-criterion'},[
+                    h('span',{text:txt(label,'Unknown criterion')}),
+                    h('strong',{text:fmt(c.weight)})]));
+            });
+            if (!validArray(config.criteria).length) {
+                configured.appendChild(h('p',{class:'ov-muted',text:'No criteria reported.'}));
+            }
+            content.appendChild(configured);
+        } else {
+            content.appendChild(h('p',{class:'ov-muted',
+                text:'Configured criteria unavailable or not reliably associated with this runtime bond.'}));
+        }
+        content.appendChild(h('p',{class:'ov-weight-foot',text:
+            'Weights are router-reported control values, not traffic percentages. Baseline is runtime config_weight; configured policy criteria are separate. Updated at each successful data collection.'}));
+        if (view.data_state === 'stale') {
+            content.appendChild(h('p',{class:'ov-muted',text:'Runtime data stale — last successful observation shown.'}));
+        }
+        return panel('WBOND Snapshot',content);
     };
     Overview.prototype._paths = function (phys, overlays, swans) {
         var self = this, swanById = {};
