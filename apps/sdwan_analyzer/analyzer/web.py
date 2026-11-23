@@ -241,6 +241,15 @@ def _make_handler(service):
                 if m is not None:
                     self._send_json(service.query_recording_samples(
                         m.group(1), raw_query))
+                elif path == '/api/analytics/overview_meta':
+                    self._send_json(service.query_overview_meta())
+                elif path == '/api/analytics/wan_identity':
+                    ident = service.query_wan_identity(raw_query)
+                    if ident is None:
+                        self._send_json(
+                            {'error': 'snapshot not ready'}, code=503)
+                    else:
+                        self._send_json(ident)
                 elif path == '/api/analytics/topology':
                     topo = service.query_topology()
                     if topo is None:

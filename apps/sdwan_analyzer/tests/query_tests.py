@@ -13,7 +13,7 @@ from http.server import HTTPServer
 from urllib.parse import urlencode
 
 import cp
-from analyzer import durable, persistence as P, query as Q, web
+from analyzer import VERSION, durable, persistence as P, query as Q, web
 from analyzer.service import AnalyzerService
 import durable_tests as D
 
@@ -992,7 +992,10 @@ def test_q_storage_report_and_lifecycle_unchanged():
         check(d['state'] in ('completed', 'expired', 'stopped') and
               d['sample_count'] == len(svc.recording_samples(jid)),
               'Recording lifecycle and counts unchanged')
-        check(svc.status()['version'] == '0.8.5', 'version 0.8.5')
+        # Tracks the runtime version constant (was a hard-coded 0.8.5 that
+        # went stale at v1.0.0); package.ini sync is asserted in
+        # wan_identity_tests.
+        check(svc.status()['version'] == VERSION, 'status reports VERSION')
 
 
 TESTS = [

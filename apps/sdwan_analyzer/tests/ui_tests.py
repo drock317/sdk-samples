@@ -30,7 +30,7 @@ if _APP_DIR not in sys.path:
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from analyzer import web          # noqa: E402
+from analyzer import VERSION, topology, wbond, web   # noqa: E402
 import durable_tests as D         # noqa: E402
 
 check = None            # bound by run_tests.main()
@@ -142,8 +142,8 @@ def test_ui_static_serving_is_confined():
             check(code == 200 and b'/api/analytics/interfaces' in body,
                   'previous index page still available at /dev')
             code, body = srv.json('/api/status')
-            check(code == 200 and body['version'] == '0.8.5',
-                  '/api/status reports version 0.8.5')
+            check(code == 200 and body['version'] == VERSION,
+                  '/api/status reports VERSION')
         finally:
             srv.close()
 
@@ -292,6 +292,14 @@ class _UiService(object):
 
     def section(self, name):
         return self._snap.get(name)
+
+    # The Overview (v1.0.0+) also loads topology + WBOND analytics. The stub
+    # has no cached raw devices, so build them from the fixed path list.
+    def query_topology(self):
+        return topology.build(self._snap, {}, {})
+
+    def query_wbond(self):
+        return wbond.build(self._snap, {}, {})
 
     def __getattr__(self, name):
         return getattr(self._svc, name)

@@ -4,31 +4,32 @@ This layer isolates the app from NCOS field naming and quirks. Downstream
 code (storage, service, web) depends on THESE record shapes, not on raw
 NCOS JSON. If NCOS field names change, only this module changes.
 
-Friendly-naming and cellular-classification logic here is a distilled reuse
-of the VALIDATED patterns in Speedtest Analyzer (speedtest_web.py:
-_friendly_wan_name / _wan_is_cellular_device / _satellite_wan_label). We
-reuse the *concepts* proven to work on real NCOS devices, not the
-speed-test code:
+WAN identity (v1.0.2)
+---------------------
+WAN classification, SIM presence, modem ownership, carrier and friendly
+naming live in ONE place: wan_identity.py (a reuse of the validated Speedtest
+Analyzer logic against a private model catalog). The functions below
+(classify_wan_kind, object_class, friendly_name, friendly_name_ex,
+sdwan_underlay_uid, wan_paths) are thin delegates so every caller shares the
+same answer. Nothing here classifies a WAN independently.
 
-  - An mdm-* UID alone is NOT proof of cellular. Require carrier (CARRID),
-    SIM slot, or an LTE/5G/NR/cellular/wwan service token.
-  - Starlink/satellite must be detected BEFORE cellular, because Starlink
-    can present an mdm-* UID while reporting like a non-cellular WAN.
-  - The raw iface / UID is preserved untouched as the routing identity;
-    friendly names are display-only.
+  - The raw uid / iface is the immutable routing identity; display names are
+    presentation only.
+  - An mdm-* UID alone is NOT proof of cellular. Satellite is evaluated
+    before cellular.
+  - A confirmed empty SIM slot is classified `empty_sim`: it stays in the raw
+    path list (topology integrity, diagnostics) but is not displayable
+    inventory.
 
 Internal record shapes (documented contract):
 
-  WanPathRecord = {
-    'uid': str,                 # NCOS device UID (routing identity)
-    'iface': str,               # raw NCOS iface (routing identity)
-    'kind': str,                # 'cellular'|'ethernet'|'wifi'|'satellite'|'sdwan'|'wbond'|'unknown'
-    'display_name': str,        # friendly, display-only
-    'connection_state': str,    # e.g. 'connected'
-    'ip_address': str|None,
-    'priority': number,         # config priority (lower = higher priority)
-    'is_primary': bool,
-  }
+  WanPathRecord = every wan_identity.PUBLIC_FIELDS key (uid, iface, info_uid,
+    display_name, object_class, classification, kind, connection_state,
+    operational_state, failure_reason, sim_presence, sim_type, sim_slot,
+    carrier, carrier_name, carrier_source, modem_owner, modem_model,
+    host_model, inventory_visible, underlay_*, classification_evidence) plus:
+    'is_overlay', 'ip_address', 'cm_priority', 'original_priority',
+    'parent_priority', 'is_primary'.
 
   SdwanOverlayRecord / WbondRecord / SteeringRecord are declared with the
   fields we can populate from VERIFIED paths; fields sourced from OPAQUE
@@ -40,91 +41,30 @@ import hashlib
 import json
 import re
 
-# Overlay/tunnel wan_type values that are NOT physical WAN paths. Matches
-# Speedtest Analyzer's exclude set; SD-WAN Analyzer keeps them but tags kind.
-_OVERLAY_TYPES = ('sdwan', 'vpn', 'gre', 'ipsec')
+from . import wan_identity
+
+# Overlay/tunnel wan_type values that are NOT physical WAN paths.
+_OVERLAY_TYPES = wan_identity.OVERLAY_TYPES
 
 # High-level object classes for a WAN dictionary entry. This is a DIFFERENT
 # axis from classify_wan_kind() (which describes the physical medium of a
 # path). object_class answers: physical WAN vs SD-WAN overlay vs WBOND
 # virtual interface. WBOND is a separate forwarding object and is NEVER
 # flattened into its physical members.
-OBJ_PHYSICAL = 'physical'
-OBJ_SDWAN = 'sdwan'
-OBJ_WBOND = 'wbond'
-OBJ_UNKNOWN = 'unknown'
-
-_CELLULAR_TOKEN_RE = re.compile(
-    r'(^|[^a-z0-9])(lte|4g|5g|nr5g|nr|cellular|wwan)([^a-z0-9]|$)')
-
-_BLANK_CARRIER = ('', '--', 'unknown', 'none', 'n/a', 'not available')
+OBJ_PHYSICAL = wan_identity.OBJ_PHYSICAL
+OBJ_SDWAN = wan_identity.OBJ_SDWAN
+OBJ_WBOND = wan_identity.OBJ_WBOND
+OBJ_UNKNOWN = wan_identity.OBJ_UNKNOWN
 
 
 def _s(value):
-    """Safe lower-cased string of a possibly-None value."""
+    """Safe stripped string of a possibly-None value."""
     return str(value if value is not None else '').strip()
-
-
-def _identity_blob(uid, info, diagnostics):
-    """Join identifying fields into one lower-case string for token tests."""
-    parts = [
-        _s(uid),
-        _s(info.get('iface')),
-        _s(info.get('type')),
-        _s(info.get('product')),
-    ]
-    for v in (diagnostics or {}).values():
-        if v is not None:
-            parts.append(_s(v))
-    return ' '.join(parts).lower()
-
-
-def _is_satellite(identity_blob):
-    return 'starlink' in identity_blob or 'satellite' in identity_blob
-
-
-def _is_cellular(uid, info, diagnostics):
-    """Positive-evidence cellular test (ported from Speedtest Analyzer)."""
-    info = info or {}
-    diagnostics = diagnostics or {}
-    identity = _identity_blob(uid, info, diagnostics)
-
-    if _is_satellite(identity):
-        return False
-
-    modem_identity = (
-        _s(info.get('type')).lower() == 'mdm'
-        or _s(uid).lower().startswith('mdm-')
-    )
-    if not modem_identity:
-        return False
-
-    carrier_present = _s(diagnostics.get('CARRID')).lower() not in _BLANK_CARRIER
-    sim_present = bool(_s(info.get('sim')))
-    service_token = _CELLULAR_TOKEN_RE.search(identity) is not None
-    return carrier_present or sim_present or service_token
 
 
 def classify_wan_kind(uid, device):
     """Return one of cellular|ethernet|wifi|satellite|unknown."""
-    device = device if isinstance(device, dict) else {}
-    info = device.get('info') if isinstance(device.get('info'), dict) else {}
-    diagnostics = (device.get('diagnostics')
-                   if isinstance(device.get('diagnostics'), dict) else {})
-
-    identity = _identity_blob(uid, info, diagnostics)
-    if _is_satellite(identity):
-        return 'satellite'
-    if _is_cellular(uid, info, diagnostics):
-        return 'cellular'
-
-    wan_type = _s(info.get('type')).lower()
-    iface = _s(info.get('iface')).lower()
-    if wan_type in ('wifi', 'wi-fi', 'wlan') or 'wifi' in identity:
-        return 'wifi'
-    if wan_type in ('ethernet', 'eth') or iface in ('wan', 'ethernet-wan'):
-        return 'ethernet'
-    return 'unknown'
+    return wan_identity.classify_wan_kind(uid, device)
 
 
 def object_class(uid, device):
@@ -134,114 +74,44 @@ def object_class(uid, device):
     'ethernet', ...) then falls back to UID prefix conventions. This is the
     object-topology axis; classify_wan_kind() is the physical-medium axis.
     """
-    device = device if isinstance(device, dict) else {}
-    info = device.get('info') if isinstance(device.get('info'), dict) else {}
-    wan_type = _s(info.get('type')).lower()
-    u = _s(uid).lower()
-
-    if wan_type == 'wbond' or u.startswith('wbond-') or u.startswith('wbond'):
-        return OBJ_WBOND
-    if wan_type == 'sdwan' or u.startswith('sdwan-') or u.startswith('sdwan'):
-        return OBJ_SDWAN
-    if wan_type in ('mdm', 'ethernet', 'eth', 'wwan', 'wifi', 'wi-fi', 'wlan'):
-        return OBJ_PHYSICAL
-    if wan_type in _OVERLAY_TYPES:
-        # vpn/gre/ipsec overlays that are not SD-WAN/WBOND
-        return OBJ_UNKNOWN
-    # A device with a recognizable physical medium is physical.
-    if classify_wan_kind(uid, device) in (
-            'cellular', 'ethernet', 'wifi', 'satellite'):
-        return OBJ_PHYSICAL
-    return OBJ_UNKNOWN
+    return wan_identity.object_class(uid, device)
 
 
-def _cellular_label(uid, device, diagnostics):
-    """Best-available cellular display label using carrier/model, no PII."""
-    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
-    device = device if isinstance(device, dict) else {}
-    info = device.get('info') if isinstance(device.get('info'), dict) else {}
-    carrier = _s(diagnostics.get('CARRID'))
-    service = _s(diagnostics.get('SERDIS')) or _s(diagnostics.get('RFBAND'))
-    if carrier and carrier.lower() not in _BLANK_CARRIER:
-        if service:
-            return '{} {}'.format(carrier, service)
-        return carrier
-    prod = _s(info.get('product'))
-    if prod:
-        return prod
-    return 'Cellular WAN'
+def friendly_name(uid, device, host_model=None):
+    """Display-only WAN name for a single PHYSICAL-style device (STA naming).
 
-
-def friendly_name(uid, device):
-    """Display-only WAN name for PHYSICAL paths. Overlay/WBOND naming is
-    handled by friendly_name_ex() which can correlate an underlay label.
-
-    NOTE: The full Speedtest implementation also folds in a device
-    validation catalog (captive-modem model names). That refinement is
-    intentionally DEFERRED; this returns a correct, generic label.
+    Prefer the inventory (wan_identity.build_inventory) when many devices are
+    named together; this is the single-device convenience form.
     """
-    device = device if isinstance(device, dict) else {}
-    info = device.get('info') if isinstance(device.get('info'), dict) else {}
-    diagnostics = (device.get('diagnostics')
-                   if isinstance(device.get('diagnostics'), dict) else {})
-    kind = classify_wan_kind(uid, device)
-
-    if kind == 'satellite':
-        ident = _s(uid) or _s(info.get('iface'))
-        m = re.search(r'([a-zA-Z0-9]{4})$', ident)
-        return 'Satellite WAN-' + m.group(1).upper() if m else 'Satellite WAN'
-    if kind == 'cellular':
-        return _cellular_label(uid, device, diagnostics)
-    if kind == 'wifi':
-        return 'Wi-Fi as WAN'
-    if kind == 'ethernet':
-        return 'Ethernet WAN'
-    return _s(info.get('product')) or _s(info.get('iface')) or _s(uid) or 'Unknown WAN'
+    return wan_identity.friendly_name(uid, device, host_model)
 
 
 def friendly_name_ex(uid, device, devices=None, underlay_uid='',
-                     bond_config_name=''):
+                     bond_config_name='', host_model=None):
     """Object-aware friendly name.
 
-    - physical: delegates to friendly_name().
-    - sdwan overlay: 'SD-WAN — <underlay label>' when the underlay device is
-      resolvable, else a generic 'SD-WAN Overlay'.
+    - physical: STA-compatible name (see wan_identity).
+    - sdwan overlay: 'SD-WAN Tunnel - <underlay name>' when the underlay
+      device is resolvable, else 'SD-WAN Tunnel'.
     - wbond: configured bond name when supplied, else 'Bonded WAN'.
-
-    devices is the full status/wan/devices map so an overlay can borrow its
-    physical underlay's label. Never discards the raw UID/iface upstream.
     """
-    device = device if isinstance(device, dict) else {}
-    devices = devices if isinstance(devices, dict) else {}
-    oclass = object_class(uid, device)
-
-    if oclass == OBJ_WBOND:
-        name = _s(bond_config_name)
-        if name:
-            return 'Bonded WAN ({})'.format(name)
-        return 'Bonded WAN'
-
-    if oclass == OBJ_SDWAN:
-        underlay_uid = _s(underlay_uid)
-        underlay_dev = devices.get(underlay_uid) if underlay_uid else None
-        if isinstance(underlay_dev, dict):
-            return 'SD-WAN — {}'.format(friendly_name(underlay_uid, underlay_dev))
-        return 'SD-WAN Overlay'
-
-    if oclass == OBJ_PHYSICAL:
-        return friendly_name(uid, device)
-
-    # Unknown object class: fall back to physical-style naming, never blank.
-    return friendly_name(uid, device)
+    return wan_identity.friendly_name_ex(
+        uid, device, devices, underlay_uid, bond_config_name, host_model)
 
 
-def wan_paths(raw_devices, primary_uid, underlay_map=None):
+def wan_paths(raw_devices, primary_uid, underlay_map=None, inventory=None,
+              host_model=None):
     """Normalize status/wan/devices into a list of WanPathRecord.
 
-    Includes overlay + WBOND objects too but tags each with object_class so
-    the analyzer never flattens WBOND into its members and never confuses an
-    overlay with a physical path. underlay_map (sdwan_uid -> underlay_uid),
-    when supplied, lets overlay display names borrow the underlay label.
+    Includes overlay + WBOND objects and every physical object (including a
+    confirmed empty SIM slot, flagged `classification: 'empty_sim'` and
+    `inventory_visible: False`): this is the RAW inventory. Consumers that
+    want the user-facing physical inventory filter on `inventory_visible`.
+
+    `inventory` is the wan_identity.build_inventory() result; when omitted it
+    is built here (identical output). `underlay_map` (sdwan_uid ->
+    underlay_uid), when supplied, takes precedence for the overlay's
+    underlay uid (kept for compatibility with the service's own resolver).
 
     Priority domains are kept SEPARATE and named clearly (they are not the
     same scale):
@@ -252,38 +122,31 @@ def wan_paths(raw_devices, primary_uid, underlay_map=None):
     records = []
     if not isinstance(raw_devices, dict):
         return records
+    if inventory is None:
+        inventory = wan_identity.build_inventory(raw_devices, host_model)
+    ident = inventory.get('by_uid') or {}
     underlay_map = underlay_map if isinstance(underlay_map, dict) else {}
     for uid, device in raw_devices.items():
-        if not isinstance(device, dict):
+        if not isinstance(device, dict) or uid not in ident:
             continue
         info = device.get('info') if isinstance(device.get('info'), dict) else {}
         status = device.get('status') if isinstance(device.get('status'), dict) else {}
         config = device.get('config') if isinstance(device.get('config'), dict) else {}
         ipinfo = status.get('ipinfo') if isinstance(status.get('ipinfo'), dict) else {}
 
-        oclass = object_class(uid, device)
-        underlay_uid = underlay_map.get(uid, '')
-        display = friendly_name_ex(uid, device, raw_devices, underlay_uid)
-
+        rec = wan_identity.public_view(ident[uid])
+        oclass = rec['object_class']
+        if oclass == OBJ_SDWAN and underlay_map.get(uid):
+            rec['underlay_uid'] = underlay_map[uid]
         # Priority fields can live in config or status depending on tree.
         cm_priority = config.get('priority')
         if cm_priority is None:
             cm_priority = status.get('priority')
-        records.append({
-            'uid': uid,
-            'iface': _s(info.get('iface')),
-            'info_uid': _s(info.get('uid')),
-            'object_class': oclass,
+        rec.update({
             # SD-WAN overlays / WBOND are topology objects, not a physical
-            # medium: kind mirrors object_class for them. Physical kinds are
-            # unchanged.
-            'kind': (oclass if oclass in (OBJ_SDWAN, OBJ_WBOND)
-                     else classify_wan_kind(uid, device)),
+            # medium: kind mirrors object_class for them.
             'is_overlay': oclass in (OBJ_SDWAN,) or _s(info.get('type')).lower() in _OVERLAY_TYPES,
-            'display_name': display,
-            'connection_state': _s(status.get('connection_state')) or 'unknown',
             'ip_address': ipinfo.get('ip_address') or None,
-            'underlay_uid': underlay_uid or None,
             'cm_priority': cm_priority if cm_priority is not None else 999,
             'original_priority': config.get('original_priority',
                                             status.get('original_priority')),
@@ -291,6 +154,7 @@ def wan_paths(raw_devices, primary_uid, underlay_map=None):
                                           status.get('parent_priority')),
             'is_primary': (uid == primary_uid),
         })
+        records.append(rec)
     records.sort(key=lambda r: (r.get('cm_priority') if isinstance(
         r.get('cm_priority'), (int, float)) else 999))
     return records
@@ -316,25 +180,7 @@ def sdwan_underlay_uid(device):
     STA-validated (_sdwan_underlay_uid): prefer status.active_dep_wandev,
     then the first entry of status.dep_wandevs (list or dict). '' if none.
     """
-    device = device if isinstance(device, dict) else {}
-    status = device.get('status') if isinstance(device.get('status'), dict) else {}
-
-    active_dep = _s(status.get('active_dep_wandev'))
-    if active_dep:
-        return active_dep
-
-    dep = status.get('dep_wandevs')
-    if isinstance(dep, list):
-        for d in dep:
-            d = _s(d)
-            if d:
-                return d
-    elif isinstance(dep, dict):
-        for d in dep:
-            d = _s(d)
-            if d:
-                return d
-    return ''
+    return wan_identity.sdwan_underlay_uid(device)
 
 
 def wbond_member_uids(raw_wbond_interface):
@@ -1984,6 +1830,9 @@ def topology_fingerprint(wan_path_records):
             'kind': _s(r.get('kind')),
             'connection_state': _s(r.get('connection_state')),
             'underlay_uid': _s(r.get('underlay_uid')),
+            # v1.0.2: a SIM removed/inserted is a topology change.
+            'classification': _s(r.get('classification')),
+            'sim_presence': _s(r.get('sim_presence')),
         })
     items.sort(key=lambda x: x['uid'])
     return _stable_hash(items)

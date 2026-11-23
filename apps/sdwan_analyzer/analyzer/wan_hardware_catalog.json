@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "catalog_version": "2026-08-20",
+  "derived_from": "Speedtest Analyzer device_validation_catalog.json (catalog_version 2026-08-20), reduced to the model names WAN identity needs. SD-WAN Analyzer keeps its own copy; there is no runtime dependency on Speedtest Analyzer.",
+  "maintenance": [
+    "controllers: host routers that can pair with captive modems. A cellular WAN owned by one of these is labelled '<MODEL> Internal'. Same set as the keys of single_captive_combinations in the Speedtest Analyzer catalog.",
+    "standalone_devices: host routers whose own modem carries no ' Internal' suffix. Used only to recognise the host model family.",
+    "captive_modems: attachable modem models. Matched case-insensitively against info.remote.product_name; the longest match wins.",
+    "Model matching is token based: E3000 matches E3000-5GB, but R98 does not match R980.",
+    "Restart or rebuild the application after editing so the catalog is reloaded."
+  ],
+  "controllers": ["E400", "E3000", "R920", "R980", "R1900", "R2400"],
+  "standalone_devices": ["E400", "E3000", "R1900", "R980", "W2255", "W1850", "W1855", "R920", "R2400"],
+  "captive_modems": [
+    "W1850", "W1855", "W2255", "W2000", "R2105", "R2155", "W2005", "W4005",
+    "L950", "CBA550", "CBA850", "RC1250", "170900-022"
+  ]
+}

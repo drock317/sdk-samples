@@ -25,13 +25,19 @@ counters, rates, bandwidth utilization or efficiency figures.
 | `schema_version` | `1` |
 | `as_of` | snapshot time, WAN and bonding collection times, per-source `last_success_ts`, `read_error`, `stale` |
 | `primary` | `state` `known` / `unknown` / `unresolved`; when known: uid, class, kind, name, connection state, IP |
-| `physical[]` | `config` (priorities), `observed` (connection state, IP, `is_primary`), `overlays[]` riding on it, `bond_memberships[]` |
+| `physical[]` | displayable physical WANs (confirmed empty SIM slots excluded, v1.0.2): `identity` block, `config` (priorities), `observed` (connection state, `operational_state`, `failure_reason`, IP, `is_primary`), `overlays[]` riding on it, `bond_memberships[]` |
+| `hidden_physical[]` | v1.0.2: confirmed empty SIM slots, same shape as `physical[]`. Kept for diagnostics and relationship targets |
+| `inventory` | v1.0.2: raw / empty / displayable / connected / inactive counts |
+| `unavailable_references[]` | v1.0.2: bond members and overlay underlays whose physical target is an empty SIM slot (the relationship stays `resolved`, flagged `available: false`) |
 | `overlays[]` | `config`, `observed`, `underlay` relationship, `bond_memberships[]` |
 | `bonds[]` | `wbond_device` relationship, `config` (`membership: not_collected`), `observed` (link state, mode, reported vs listed member count), `members[]` |
 | `bonds[].members[]` | `tunnel_iface`, `reported_intf_name`, `overlay`, `physical`, `underlay_consistency`, `observed`, `config.configured_weight` |
 | `bonding_runtime` | `read` or `unknown` (never read), and bond count |
 | `unresolved[]` | flat list of `{kind, uid, reason}` for every relationship not established |
 | `notes[]` | fixed statements of what is not claimed |
+
+Names, SIM presence, modem ownership and the empty-SIM rules come from the
+shared WAN identity layer: see [wan-identity.md](wan-identity.md).
 
 Every relationship object has `state` `resolved` or `unresolved`. Resolved ones
 carry `basis` (the NCOS field used); unresolved ones carry `reason` and `uid:

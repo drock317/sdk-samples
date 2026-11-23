@@ -81,8 +81,10 @@ def build(snapshot, raw_devices, health):
     snapshot = snapshot if isinstance(snapshot, dict) else {}
     topo = topology.build(snapshot, raw_devices, health)
     runtime = _runtime_index(snapshot)
+    # Names come from the shared identity layer. An empty-SIM member is not
+    # in topo['physical'] but is still a real member: keep its name.
     phys_names = {p['uid']: p.get('display_name')
-                  for p in topo['physical']}
+                  for p in topo['physical'] + topo['hidden_physical']}
     bonds = []
     for tb in topo['bonds']:
         rb, rmembers = runtime.get(tb['iface'], ({}, {}))
@@ -149,6 +151,11 @@ def build(snapshot, raw_devices, health):
         'data_state': _data_state(as_of),
         'bonding_runtime': topo['bonding_runtime'],
         'bonds': bonds,
+        # Members whose physical WAN is a confirmed empty SIM slot: kept
+        # in members[] (never filtered) and flagged here.
+        'unavailable_references': [
+            u for u in topo['unavailable_references']
+            if u['kind'] == 'bond_member_physical'],
         'unresolved': [u for u in topo['unresolved']
                        if u['kind'] in ('bond_device', 'member_overlay',
                                         'member_physical',
