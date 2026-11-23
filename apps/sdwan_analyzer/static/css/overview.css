@@ -147,3 +147,7 @@
  .ov-member-list:before,.ov-member-list .ov-member:before {display:none;}
  .ov-member-list .ov-member {width:100%;}
 }
+
+.ov-topology-no-bond {grid-template-columns:minmax(8.5rem,1fr) minmax(12rem,2fr);}
+.ov-panel:has(.ov-popover) .ov-table-wrap {overflow:visible;}
+@media(max-width:650px){.ov-topology-no-bond {display:flex;}}
