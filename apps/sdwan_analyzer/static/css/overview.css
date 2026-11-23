@@ -151,3 +151,30 @@
 .ov-topology-no-bond {grid-template-columns:minmax(8.5rem,1fr) minmax(12rem,2fr);}
 .ov-panel:has(.ov-popover) .ov-table-wrap {overflow:visible;}
 @media(max-width:650px){.ov-topology-no-bond {display:flex;}}
+
+/* Curved topology paths: actual card anchors, translucent halo, no arrows. */
+.ov-topology { position:relative; isolation:isolate; display:grid;
+  grid-template-columns:minmax(8.5rem,1fr) minmax(9rem,1.05fr) minmax(12rem,1.85fr);
+  column-gap:clamp(1.2rem,3.4vw,3.6rem); align-items:center;
+  justify-content:stretch; }
+.ov-topology-no-bond {grid-template-columns:minmax(8.5rem,1fr) minmax(12rem,2fr);}
+.ov-topology .ov-node,.ov-topology .ov-member-list {position:relative;z-index:2;}
+.ov-topology .ov-member-list {padding-left:0;}
+.ov-topology .ov-member-list:before,.ov-topology .ov-member:before,
+.ov-topology .ov-link-line {display:none;}
+.ov-connector-canvas {position:absolute;inset:0;display:block;width:100%;height:100%;
+  overflow:visible;pointer-events:none;z-index:1;}
+.ov-connector-canvas path {fill:none;stroke-linecap:round;stroke-linejoin:round;
+  stroke:var(--ov-blue);vector-effect:non-scaling-stroke;}
+.ov-connector-glow {opacity:.085;filter:blur(3px);}
+.ov-connector-soft {opacity:.20;}
+.ov-connector-core {opacity:.95;}
+@media(max-width:1050px) and (min-width:651px) {
+ .ov-topology {grid-template-columns:minmax(7rem,1fr) minmax(8rem,1.1fr) minmax(10rem,1.7fr);
+   column-gap:1.5rem;}
+ .ov-topology-no-bond {grid-template-columns:minmax(7rem,1fr) minmax(10rem,2fr);}
+}
+@media(max-width:650px) {
+ .ov-topology,.ov-topology-no-bond {display:flex;flex-direction:column;align-items:stretch;gap:1.2rem;}
+ .ov-topology .ov-member-list {display:grid;gap:.65rem;}
+}
