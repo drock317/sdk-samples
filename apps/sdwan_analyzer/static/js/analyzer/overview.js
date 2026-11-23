@@ -565,7 +565,7 @@
                 (!e.wan_from && e.wan_to ? 'Path selected — ' + txt(to) :
                  (e.wan_from && !e.wan_to ? 'Path cleared — ' + txt(from) :
                   'Steering event')));
-            var row = h('tr',{},[cell(time(e.epoch)),cell(e.steering_rule),cell(change,'ov-wrap')]);
+            var row = h('tr',{},[cell(clock12(e.epoch, true)),cell(e.steering_rule),cell(change,'ov-wrap')]);
             var extra = [['NCOS reason', e.reason],['Flows moved', e.total_flows_moved]];
             if (extra.some(function (x) {return x[1] !== undefined && x[1] !== null && x[1] !== '';})) {
                 var anchor = h('span',{class:'ov-popover-wrap'});
