@@ -69,15 +69,26 @@
             popup.hidden = !opening;
             btn.setAttribute('aria-expanded', String(opening));
         });
-        document.addEventListener('click', function (e) {
-            if (!popup.hidden && !popup.contains(e.target) && e.target !== btn) {
-                popup.hidden = true; btn.setAttribute('aria-expanded', 'false');
-            }
-        });
         btn.addEventListener('keydown', function (e) {
             if (e.key === 'Escape') { popup.hidden = true; btn.setAttribute('aria-expanded', 'false'); btn.focus(); }
         });
     }
+    document.addEventListener('click', function (e) {
+        document.querySelectorAll('.ov-popover:not([hidden])').forEach(function (p) {
+            if (p.contains(e.target)) { return; }
+            p.hidden = true;
+            var toggle = p.parentNode.querySelector('.ov-iconbtn');
+            if (toggle) { toggle.setAttribute('aria-expanded', 'false'); }
+        });
+    });
+    document.addEventListener('keydown', function (e) {
+        if (e.key !== 'Escape') { return; }
+        document.querySelectorAll('.ov-popover:not([hidden])').forEach(function (p) {
+            p.hidden = true;
+            var toggle = p.parentNode.querySelector('.ov-iconbtn');
+            if (toggle) { toggle.setAttribute('aria-expanded', 'false'); toggle.focus(); }
+        });
+    });
     function bondHealth(b) {
         var ob = b.observed || {}, state = String(ob.link_state || '').toLowerCase();
         var members = validArray(b.members);
@@ -88,12 +99,14 @@
             return {kind: 'unknown', text: txt(ob.link_state, 'Unknown'), reason: 'Bond state is not verified'};
         }
         var affected = members.filter(function (m) {
-            var a = String((m.observed || {}).link_attach_state || '').toLowerCase();
-            return a && a !== 'attached';
+            var o = m.observed || {}, a = String(o.link_attach_state || '').toLowerCase();
+            var link = String(o.link_state || '').toLowerCase();
+            return (a && a !== 'attached') || ['down','failed','disconnected'].indexOf(link) !== -1 ||
+                o.has_loss === true;
         });
         if (affected.length) {
             return {kind: 'degraded', text: 'Degraded',
-                reason: affected.length + ' member(s) not attached',
+                reason: affected.length + ' member(s) report attachment, link or loss issues',
                 affected: affected};
         }
         if (!members.length || members.some(function (m) { return !((m.observed || {}).link_attach_state); })) {
@@ -250,6 +263,8 @@
                         .filter(function (x) {return x.uid === ref.uid;})[0];
                     rows.push(['Affected member', p ? p.display_name : txt(m.reported_intf_name,'Unresolved interface')]);
                     rows.push(['Reported attachment', (m.observed || {}).link_attach_state]);
+                    rows.push(['Reported link', (m.observed || {}).link_state]);
+                    if ((m.observed || {}).has_loss === true) { rows.push(['Member loss', 'Reported by NCOS']); }
                 });
                 var pop = makePopover('WBOND ' + health.text, rows,
                     'Based on NCOS-reported link and member attachment state.');
@@ -273,8 +288,11 @@
             var attached = String(observed.link_attach_state || '').toLowerCase() === 'attached';
             var good = first ? attached : maybeStatus(observed) === 'connected';
             var state = first ? txt(observed.link_attach_state,'Unknown') : pathState(path || m);
+            var overlay = m.overlay && m.overlay.state === 'resolved' ?
+                validArray(topo.overlays).filter(function (o) {return o.uid === m.overlay.uid;})[0] : null;
+            var sdwanTunnel = overlay && overlay.iface && overlay.iface !== m.tunnel_iface ? overlay.iface : null;
             var rows = first ? [['Bond tunnel',m.tunnel_iface],
-                ['SD-WAN tunnel',m.overlay && m.overlay.state === 'resolved' && m.overlay.uid !== m.tunnel_iface ? m.overlay.uid : null],
+                ['SD-WAN tunnel',sdwanTunnel],
                 ['Physical interface',m.reported_intf_name]] :
                 [['Physical interface',m.uid]];
             var wrap = h('span', {class:'ov-popover-wrap'});
