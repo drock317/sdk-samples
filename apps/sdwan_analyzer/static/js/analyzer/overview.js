@@ -29,9 +29,78 @@
     function cell(v, className) { return h('td', {class: className || '', text: txt(v, '—')}); }
     function heading(label, extra) { return h('div', {class: 'ov-heading'}, [h('span', {text: label}), extra || null]); }
     function panel(label, body, action) { return h('section', {class: 'ov-panel'}, [heading(label, action), h('div', {class: 'ov-panel-body'}, [body])]); }
-    function stat(label, value, sub) { return h('div', {class: 'ov-stat'}, [
-        h('p', {class: 'ov-stat-label', text: label}), h('p', {class: 'ov-stat-value', text: txt(value, '—')}),
-        h('p', {class: 'ov-stat-sub', text: sub || ''})]); }
+    function stat(label, value, sub, glyph) { return h('div', {class: 'ov-stat'}, [
+        h('div', {class: 'ov-stat-head'}, [
+            h('span', {class: 'ov-stat-icon', 'aria-hidden': 'true'}, [h('i', {class: 'fas fa-' + glyph})]),
+            h('p', {class: 'ov-stat-label', text: label})]),
+        h('p', {class: 'ov-stat-value', text: txt(value, '—')}),
+        h('p', {class: 'ov-stat-sub'}, Array.isArray(sub) ? sub : [document.createTextNode(sub || '')])]); }
+    function coloredCount(n, label, cls) { return h('span', {class: 'ov-count-' + cls, text: n + ' ' + label}); }
+    function storageKey(snap) {
+        var name = (snap.system_summary || {}).router_name || 'unknown';
+        return 'sdwan_analyzer_overview_hidden_v1:' + encodeURIComponent(name);
+    }
+    function safeHidden(key) {
+        try { var raw = JSON.parse(localStorage.getItem(key) || '[]'); return Array.isArray(raw) ? raw.filter(function (x) { return typeof x === 'string'; }) : []; }
+        catch (_) { return []; }
+    }
+    function makePopover(title, rows, note) {
+        var content = h('div', {class: 'ov-popover', role: 'region', 'aria-label': title, hidden: true},
+            [h('strong', {class: 'ov-popover-title', text: title})]);
+        rows.forEach(function (r) {
+            if (r[1] !== null && r[1] !== undefined && r[1] !== '') {
+                content.appendChild(h('div', {class: 'ov-popover-row'}, [
+                    h('span', {text: r[0]}), h('code', {text: String(r[1])})]));
+            }
+        });
+        if (note) { content.appendChild(h('p', {class: 'ov-muted', text: note})); }
+        return content;
+    }
+    function attachPopover(btn, popup) {
+        btn.setAttribute('aria-expanded', 'false');
+        btn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            var opening = popup.hidden;
+            document.querySelectorAll('.ov-popover:not([hidden])').forEach(function (p) {
+                p.hidden = true;
+                var toggle = p.parentNode.querySelector('.ov-iconbtn');
+                if (toggle) { toggle.setAttribute('aria-expanded', 'false'); }
+            });
+            popup.hidden = !opening;
+            btn.setAttribute('aria-expanded', String(opening));
+        });
+        document.addEventListener('click', function (e) {
+            if (!popup.hidden && !popup.contains(e.target) && e.target !== btn) {
+                popup.hidden = true; btn.setAttribute('aria-expanded', 'false');
+            }
+        });
+        btn.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') { popup.hidden = true; btn.setAttribute('aria-expanded', 'false'); btn.focus(); }
+        });
+    }
+    function bondHealth(b) {
+        var ob = b.observed || {}, state = String(ob.link_state || '').toLowerCase();
+        var members = validArray(b.members);
+        if (['down', 'failed', 'error', 'disconnected'].indexOf(state) !== -1) {
+            return {kind: 'down', text: 'Down', reason: 'NCOS reports bond link state: ' + ob.link_state};
+        }
+        if (state !== 'up' && state !== 'active' && state !== 'connected') {
+            return {kind: 'unknown', text: txt(ob.link_state, 'Unknown'), reason: 'Bond state is not verified'};
+        }
+        var affected = members.filter(function (m) {
+            var a = String((m.observed || {}).link_attach_state || '').toLowerCase();
+            return a && a !== 'attached';
+        });
+        if (affected.length) {
+            return {kind: 'degraded', text: 'Degraded',
+                reason: affected.length + ' member(s) not attached',
+                affected: affected};
+        }
+        if (!members.length || members.some(function (m) { return !((m.observed || {}).link_attach_state); })) {
+            return {kind: 'unknown', text: 'State unverified', reason: 'Member attachment state is not fully reported'};
+        }
+        return {kind: 'active', text: 'Active', reason: null};
+    }
     function validArray(v) { return Array.isArray(v) ? v : []; }
     function icon(kind) { return kind === 'ethernet' ? '▣' : kind === 'cellular' ? '▥' : kind === 'wbond' ? '↗' : '◇'; }
     function maybeStatus(d) { return d && d.connection_state ? d.connection_state : 'unknown'; }
@@ -54,6 +123,7 @@
         this.mount = mount; this.token = 0; this.chartToken = 0;
         this.snapshot = null; this.topology = null; this.wbond = null; this.dayMeta = null;
         this.range = '86400'; this.activeUid = null; this.series = [];
+        this.hiddenKey = null; this.hiddenUids = [];
         this._build(); this.reload();
     }
     Overview.prototype._build = function () {
@@ -63,19 +133,20 @@
         this.chartRange = h('select', {class: 'form-select', 'aria-label': 'Throughput time range'});
         RANGES.forEach(function (r) { self.chartRange.appendChild(h('option', {value: r.v, text: r.label})); });
         this.chartRange.value = this.range;
-        this.chartRange.addEventListener('change', function () { self.range = self.chartRange.value; self._updateTimeWindow(); self.loadChart(); });
+        this.chartRange.addEventListener('change', function () { self.range = self.chartRange.value; self._updateTimeWindow(); self._renderEvents(); self.loadChart(); });
         this.refresh = U.button('Refresh', function () { self.reload(); });
         this.toolbar = h('div', {class: 'ov-toolbar'}, [this.context,
-            h('div', {class: 'ov-toolbar-right'}, [
-                h('label', {class: 'ov-range-label', text: 'Time range', for: 'ov-time-range'}),
-                this.chartRange, this.refresh])]);
+            h('div', {class: 'ov-toolbar-controls'}, [
+                h('div', {class: 'ov-toolbar-right'}, [
+                    h('label', {class: 'ov-range-label', text: 'Time range', for: 'ov-time-range'}),
+                    this.chartRange, this.refresh]), this.rangeLabel])]);
         this.chartRange.id = 'ov-time-range';
         this.stats = h('div', {class: 'ov-summary'});
         this.main = h('div', {class: 'ov-row-main'});
         this.bottom = h('div', {class: 'ov-bottom'});
         this.status = h('p', {class: 'ov-error', 'aria-live': 'polite', hidden: true});
         this.mount.classList.add('sa-overview');
-        child(this.mount, [this.toolbar, this.rangeLabel, this.status, this.stats, this.main, this.bottom]);
+        child(this.mount, [this.toolbar, this.status, this.stats, this.main, this.bottom]);
     };
     Overview.prototype.reload = function () {
         var self = this, token = ++this.token;
@@ -92,6 +163,8 @@
             self.topology = r[1].data || {};
             self.wbond = r[2].data || {};
             self.dayMeta = r[3].data;
+            var key = storageKey(self.snapshot);
+            if (self.hiddenKey !== key) { self.hiddenKey = key; self.hiddenUids = safeHidden(key); }
             self._render(); self._updateTimeWindow(); self.loadChart();
         }).catch(function (err) {
             if (token !== self.token) { return; }
@@ -102,26 +175,47 @@
                 A.describe(err), U.button('Retry', function () { self.reload(); })));
         }).then(function () { if (token === self.token) { self.refresh.disabled = false; } });
     };
+    Overview.prototype._visiblePhysical = function () {
+        var hidden = this.hiddenUids || [];
+        return validArray((this.topology || {}).physical).filter(function (p) {
+            return hidden.indexOf(p.uid) === -1;
+        });
+    };
+    Overview.prototype._setWanVisible = function (uid, visible) {
+        if (!uid) { return; }
+        this.hiddenUids = this.hiddenUids.filter(function (x) { return x !== uid; });
+        if (!visible) { this.hiddenUids.push(uid); }
+        try { localStorage.setItem(this.hiddenKey, JSON.stringify(this.hiddenUids)); } catch (_) {}
+        this._render(); this.loadChart();
+    };
     Overview.prototype._render = function () {
-        var snap = this.snapshot, topo = this.topology;
-        var phys = validArray(topo.physical), overlays = validArray(topo.overlays), bonds = validArray(topo.bonds);
+        var snap = this.snapshot, topo = this.topology, phys = this._visiblePhysical();
+        var overlays = validArray(topo.overlays), bonds = validArray(topo.bonds);
         var rules = validArray((snap.traffic_steering || {}).logical_rules);
+        var connected = phys.filter(function (p) { return maybeStatus(p.observed) === 'connected'; }).length;
+        var inactive = phys.filter(function (p) { return (p.observed || {}).operational_state === 'inactive'; }).length;
         U.clear(this.context); U.clear(this.stats); U.clear(this.main); U.clear(this.bottom);
         child(this.context, [h('strong', {class: 'ov-context ov-router-name',
             text: txt((snap.system_summary || {}).router_name, 'Router name unavailable')}),
             h('span', {class: 'ov-context', text: 'Primary WAN: ' + txt((topo.primary || {}).display_name, 'Unknown')})]);
+        var counts = [coloredCount(connected, 'connected', 'good')];
+        if (inactive) { counts.push(document.createTextNode(' · '), coloredCount(inactive, 'inactive', 'warn')); }
+        if (this.hiddenUids.length) { counts.push(document.createTextNode(' · ' + this.hiddenUids.length + ' hidden')); }
         child(this.stats, [
-            stat('Physical WANs', phys.length, phys.filter(function (p) { return maybeStatus(p.observed) === 'connected'; }).length + ' connected' +
-                (phys.filter(function (p) { return (p.observed || {}).operational_state === 'inactive'; }).length ?
-                    ' · ' + phys.filter(function (p) { return (p.observed || {}).operational_state === 'inactive'; }).length + ' inactive' : '')),
-            stat('SD-WAN overlays', overlays.length, 'Reported by NCOS'),
-            stat('WBOND interfaces', bonds.length, 'Runtime bond objects'),
-            stat('Logical steering rules', rules.length, 'Defined in latest snapshot'),
-            stat('Last observed', clock12(snap.timestamp, true), countText(this.dayMeta))
+            stat('Physical WANs', phys.length, counts, 'broadcast-tower'),
+            stat('SD-WAN overlays', overlays.length, 'Reported by NCOS', 'layer-group'),
+            stat('WBOND interfaces', bonds.length, 'Runtime bond objects', 'link'),
+            stat('Logical steering rules', rules.length, 'Latest collected snapshot', 'project-diagram'),
+            stat('Last observed', clock12(snap.timestamp, true), countText(this.dayMeta), 'clock')
         ]);
         var side = h('div', {class: 'ov-side'}, [this._steering(rules), this._bond(bonds)]);
         child(this.main, [this._topology(topo, phys, bonds), side]);
         child(this.bottom, [this._paths(phys, overlays, snap.swans), this._events(snap), this._throughputPanel()]);
+    };
+    Overview.prototype._renderEvents = function () {
+        if (!this.snapshot || !this.eventsHost) { return; }
+        U.clear(this.eventsHost);
+        this.eventsHost.appendChild(this._eventsTable(this.snapshot));
     };
     Overview.prototype._updateTimeWindow = function () {
         var end = number(this.snapshot && this.snapshot.timestamp);
@@ -131,54 +225,77 @@
             clock12(end, true) + ' (' + F.timeZoneName() + '; ends at last observation)';
     };
     Overview.prototype._topology = function (topo, phys, bonds) {
-        var self = this;
-        var container = h('div');
-        var flow = h('div', {class: 'ov-topology'});
-        flow.appendChild(h('div', {class: 'ov-node'}, [h('strong', {text: 'NCOS Router'}),
-            h('span', {class: 'ov-muted', text: 'Current device'})]));
+        var container = h('div'), flow = h('div', {class: 'ov-topology'});
+        var model = ((this.snapshot || {}).wan || {}).identity || {};
+        var router = h('div', {class: 'ov-node ov-router'}, [
+            h('span', {class: 'ov-topology-glyph', 'aria-hidden':'true'}, [h('i', {class:'fas fa-server'})]),
+            h('div', {}, [h('strong', {text:'NCOS Router'}),
+                h('span', {class:'ov-muted', text:txt(model.host_model, 'Router model unavailable')})])]);
+        flow.appendChild(router);
         var first = bonds[0];
         if (first) {
-            flow.appendChild(h('span', {class: 'ov-divider-arrow', 'aria-hidden': 'true', text: '→'}));
-            flow.appendChild(h('div', {class: 'ov-node ov-bond'}, [h('strong', {text: txt(first.display_name, 'Bonded WAN')}),
-                h('span', {class: 'ov-muted', text: txt((first.observed || {}).link_state, 'Unknown') +
-                    ' · ' + validArray(first.members).length + ' listed members'})]));
+            var health = bondHealth(first);
+            var bondNode = h('div', {class: 'ov-node ov-bond ov-bond-' + health.kind}, [
+                h('span', {class:'ov-topology-glyph', 'aria-hidden':'true'}, [h('i', {class:'fas fa-link'})]),
+                h('div', {}, [
+                    h('strong', {text:txt(first.display_name, 'Bonded WAN')}),
+                    h('span', {class:'ov-health ov-health-' + health.kind, text:health.text})])]);
+            if (health.kind === 'degraded' || health.kind === 'down') {
+                var wrap = h('span', {class:'ov-popover-wrap'});
+                var b = h('button', {class:'ov-iconbtn', type:'button', text:'i',
+                    'aria-label':'Why is WBOND ' + health.text + '?'});
+                var rows = [['Condition',health.reason]];
+                (health.affected || []).forEach(function (m) {
+                    var ref = m.physical || {}, p = validArray(topo.physical).concat(validArray(topo.hidden_physical))
+                        .filter(function (x) {return x.uid === ref.uid;})[0];
+                    rows.push(['Affected member', p ? p.display_name : txt(m.reported_intf_name,'Unresolved interface')]);
+                    rows.push(['Reported attachment', (m.observed || {}).link_attach_state]);
+                });
+                var pop = makePopover('WBOND ' + health.text, rows,
+                    'Based on NCOS-reported link and member attachment state.');
+                wrap.appendChild(b); wrap.appendChild(pop); bondNode.appendChild(wrap);
+                attachPopover(b,pop);
+            }
+            flow.appendChild(h('span', {class:'ov-link-line', 'aria-hidden':'true'}));
+            flow.appendChild(bondNode);
         }
-        flow.appendChild(h('span', {class: 'ov-divider-arrow', 'aria-hidden': 'true', text: '→'}));
-        var members = h('div', {class: 'ov-member-list'}), tooltip = h('div', {class: 'ov-detail', hidden: true});
-        var visible = first ? validArray(first.members) : phys;
-        if (!visible.length) { members.appendChild(h('p', {class: 'ov-muted', text: 'No WAN paths reported.'})); }
+        var members = h('div', {class:'ov-member-list'});
+        var visible = first ? validArray(first.members).filter(function (m) {
+            return !m.physical || (this.hiddenUids || []).indexOf(m.physical.uid) === -1;
+        }, this) : phys;
+        if (!visible.length) { members.appendChild(h('p', {class:'ov-muted', text:'No displayable WAN members.'})); }
         visible.forEach(function (m) {
-            var ref = first ? (m.physical || {}) : {state: 'resolved', uid: m.uid};
+            var ref = first ? m.physical || {} : {state:'resolved',uid:m.uid};
             var path = phys.filter(function (p) { return p.uid === ref.uid; })[0] ||
                 validArray(topo.hidden_physical).filter(function (p) { return p.uid === ref.uid; })[0];
             var name = path ? txt(path.display_name, path.uid) : 'Unresolved physical WAN';
-            var detail = first ? ('Bond tunnel: ' + txt(m.tunnel_iface, 'Not reported') + '\nPhysical member: ' +
-                txt(m.reported_intf_name, 'Not reported') + '\nResolved WAN: ' +
-                txt(ref.state === 'resolved' ? ref.uid : null, 'Unresolved') + '\nRelationship: ' +
-                txt(m.underlay_consistency, 'Unknown') + '\nSIM placement: ' + simPlacement(path) +
-                (ref.available === false ? '\nAvailability: Unavailable (empty SIM slot)' : '')) :
-                ('Interface: ' + txt(m.uid) + '\nType: ' + txt(m.kind) + '\nSIM placement: ' + simPlacement(m));
-            var btn = h('button', {type: 'button', class: 'ov-iconbtn', text: 'i',
-                'aria-label': 'Details for ' + name, 'aria-expanded': 'false'});
-            btn.addEventListener('click', function () {
-                var open = tooltip.hidden || tooltip.textContent !== detail;
-                tooltip.hidden = !open; tooltip.textContent = open ? detail : '';
-                members.querySelectorAll('button').forEach(function (b) { b.setAttribute('aria-expanded', 'false'); });
-                btn.setAttribute('aria-expanded', String(open));
-            });
-            members.appendChild(h('div', {class: 'ov-node ov-member'}, [
-                h('div', {class: 'ov-member-info'}, [h('span', {class: 'ov-member-name', text: icon(path && path.kind) + '  ' + name}),
-                    h('span', {class: 'ov-muted', text: first ? 'WBOND member · ' + txt((m.observed || {}).link_attach_state, 'state unknown') +
-                        (ref.available === false ? ' · empty SIM slot' : '') : pathState(m)})]), btn]));
+            var observed = first ? m.observed || {} : path && path.observed || {};
+            var attached = String(observed.link_attach_state || '').toLowerCase() === 'attached';
+            var good = first ? attached : maybeStatus(observed) === 'connected';
+            var state = first ? txt(observed.link_attach_state,'Unknown') : pathState(path || m);
+            var rows = first ? [['Bond tunnel',m.tunnel_iface],
+                ['SD-WAN tunnel',m.overlay && m.overlay.state === 'resolved' && m.overlay.uid !== m.tunnel_iface ? m.overlay.uid : null],
+                ['Physical interface',m.reported_intf_name]] :
+                [['Physical interface',m.uid]];
+            var wrap = h('span', {class:'ov-popover-wrap'});
+            var btn = h('button', {type:'button',class:'ov-iconbtn', text:'i','aria-label':'Details for '+name});
+            var pop = makePopover(name, rows);
+            wrap.appendChild(btn); wrap.appendChild(pop); attachPopover(btn,pop);
+            members.appendChild(h('div', {class:'ov-node ov-member'}, [
+                h('span', {class:'ov-topology-glyph', 'aria-hidden':'true'},
+                    [h('i', {class:'fas fa-'+ (path && path.kind === 'ethernet' ? 'ethernet' : 'signal')})]),
+                h('div', {class:'ov-member-info'}, [
+                    h('span', {class:'ov-member-name', text:name}),
+                    h('span', {class:'ov-health ov-health-'+(good?'active':'unknown'), text:state})]),
+                wrap]));
         });
-        flow.appendChild(members); container.appendChild(flow); container.appendChild(tooltip);
+        if (first) { flow.appendChild(h('span', {class:'ov-link-line', 'aria-hidden':'true'})); }
+        flow.appendChild(members); container.appendChild(flow);
         if (validArray(topo.unresolved).length) {
-            container.appendChild(h('p', {class: 'ov-muted', text: validArray(topo.unresolved).length +
-                ' topology associations are unresolved; only confirmed member identities are labelled.'}));
-        } else {
-            container.appendChild(h('p', {class: 'ov-muted', text: 'Relationships reflect NCOS-reported runtime state; attachment alone does not establish traffic carriage.'}));
+            container.appendChild(h('p', {class:'ov-muted', text:validArray(topo.unresolved).length+
+                ' unresolved topology association(s).'}));
         }
-        return panel('Topology & Relationship', container);
+        return panel('Topology & Relationship',container);
     };
     Overview.prototype._steering = function (rules) {
         var rows = [], body = h('div');
@@ -221,46 +338,69 @@
         return panel('WBOND Snapshot', content);
     };
     Overview.prototype._paths = function (phys, overlays, swans) {
-        var swanById = {};
+        var self = this, swanById = {};
         validArray(swans && swans.paths).forEach(function (p) { swanById[p.uid] = p; });
-        var table = h('table', {class: 'ov-table'});
-        var head = h('tr');
-        ['Path', 'State', 'SWANS latency', 'SWANS jitter', 'Measurement'].forEach(function (t) { head.appendChild(h('th', {text: t})); });
-        table.appendChild(h('thead', {}, [head]));
-        var body = h('tbody');
-        phys.forEach(function (p) {
-            var assoc = overlays.filter(function (o) { return (o.underlay || {}).state === 'resolved' && (o.underlay || {}).uid === p.uid; });
-            var ms = assoc.map(function (o) { return swanById[o.uid]; }).filter(Boolean);
-            var q = ms.length === 1 ? ms[0] : null;
-            var values = [cell(p.display_name || p.uid), cell(pathState(p), 'ov-wrap'),
-                cell(q && number(q.latency_ms) !== null ? q.latency_ms + ' ms' : '—'),
-                cell(q && number(q.jitter_ms) !== null ? q.jitter_ms + ' ms' : '—'),
-                cell(q ? time(q.epoch) : ms.length > 1 ? 'Multiple overlay samples' : 'Not available')];
-            body.appendChild(h('tr', {}, values));
+        var table = h('table', {class:'ov-table'}), head = h('tr');
+        ['Path','State','SWANS latency','SWANS jitter','Measurement','Overview'].forEach(function (t) {
+            head.appendChild(h('th', {text:t}));
         });
-        if (!phys.length) { body.appendChild(h('tr', {}, [h('td', {colspan: '5', text: 'No physical WANs reported.'})])); }
+        table.appendChild(h('thead',{},[head]));
+        var body = h('tbody');
+        var all = validArray((this.topology || {}).physical);
+        all.forEach(function (p) {
+            var assoc = overlays.filter(function (o) {return (o.underlay || {}).state === 'resolved' && (o.underlay || {}).uid === p.uid;});
+            var ms = assoc.map(function (o) {return swanById[o.uid];}).filter(Boolean);
+            var q = ms.length === 1 ? ms[0] : null, shown = self.hiddenUids.indexOf(p.uid) === -1;
+            var checkbox = h('input', {type:'checkbox','aria-label':'Show '+p.display_name+' on Overview'});
+            checkbox.checked = shown;
+            checkbox.addEventListener('change', function () {self._setWanVisible(p.uid,checkbox.checked);});
+            var values = [cell(p.display_name || p.uid),cell(pathState(p),'ov-wrap'),
+                cell(q && number(q.latency_ms) !== null ? q.latency_ms+' ms' : '—'),
+                cell(q && number(q.jitter_ms) !== null ? q.jitter_ms+' ms' : '—'),
+                cell(q ? time(q.epoch) : ms.length > 1 ? 'Multiple overlay samples' : 'Not available'),
+                h('td',{},[h('label',{class:'ov-visibility-toggle'},[checkbox,h('span',{text:shown?'Shown':'Hidden'})])])];
+            body.appendChild(h('tr', {class:shown?'':'ov-hidden-wan'}, values));
+        });
+        if (!all.length) {body.appendChild(h('tr',{},[h('td',{colspan:'6',text:'No physical WANs reported.'})]));}
         table.appendChild(body);
-        return panel('WAN / Path Status', h('div', {class: 'ov-table-wrap'}, [table,
-            h('p', {class: 'ov-muted', text: 'SWANS metrics are shown only when exactly one measured overlay resolves to the physical WAN.' +
-                (validArray(this.topology && this.topology.hidden_physical).length ?
-                    ' Empty SIM slots are not listed as WAN paths.' : '')})]));
+        return panel('WAN / Path Status', h('div',{class:'ov-table-wrap'},[table,
+            h('p',{class:'ov-muted',text:'Overview visibility is local to this browser and router; hidden interfaces remain available to telemetry and analysis. SWANS metrics are displayed only for unambiguous overlay associations.'})]));
     };
     Overview.prototype._events = function (snap) {
-        var events = validArray((snap.traffic_steering || {}).events).filter(function (e) { return number(e.epoch) !== null; });
-        events.sort(function (a, b) { return b.epoch - a.epoch; });
-        var table = h('table', {class: 'ov-table'}), header = h('tr');
-        ['Time', 'Rule', 'Observed change'].forEach(function (v) { header.appendChild(h('th', {text: v})); });
-        table.appendChild(h('thead', {}, [header]));
+        this.eventsHost = h('div');
+        this.eventsHost.appendChild(this._eventsTable(snap));
+        return panel('Recent Changes & Events',this.eventsHost);
+    };
+    Overview.prototype._eventsTable = function (snap) {
+        var end = number(snap.timestamp), start = end - Number(this.range);
+        var events = validArray((snap.traffic_steering || {}).events).filter(function (e) {
+            return number(e.epoch) !== null && end !== null && e.epoch >= start && e.epoch <= end;
+        }).sort(function (a,b) {return b.epoch - a.epoch;});
+        var table = h('table',{class:'ov-table'}), header = h('tr');
+        ['Time','Rule','Observed change'].forEach(function (v) {header.appendChild(h('th',{text:v}));});
+        table.appendChild(h('thead',{},[header]));
         var body = h('tbody');
-        events.slice(0, 5).forEach(function (e) {
-            var change = (e.wan_from || e.wan_to) ? txt(wanRef(e.wan_from_identity, e.wan_from), '?') + ' → ' + txt(wanRef(e.wan_to_identity, e.wan_to), '?') :
-                'Reason: ' + txt(e.reason, 'Not reported');
-            body.appendChild(h('tr', {}, [cell(time(e.epoch)), cell(e.steering_rule), cell(change, 'ov-wrap')]));
+        events.slice(0,5).forEach(function (e) {
+            var from = wanRef(e.wan_from_identity,e.wan_from);
+            var to = wanRef(e.wan_to_identity,e.wan_to);
+            var change = (e.wan_from || e.wan_to) ?
+                txt(from,'Previous path not reported')+' → '+txt(to,'Destination not reported') :
+                'Destination not reported';
+            var row = h('tr',{},[cell(time(e.epoch)),cell(e.steering_rule),cell(change,'ov-wrap')]);
+            var extra = [['NCOS reason', e.reason],['Flows moved', e.total_flows_moved]];
+            if (extra.some(function (x) {return x[1] !== undefined && x[1] !== null && x[1] !== '';})) {
+                var anchor = h('span',{class:'ov-popover-wrap'});
+                var btn = h('button',{type:'button',class:'ov-iconbtn',text:'i','aria-label':'Event details'});
+                var pop = makePopover('Steering event details',extra);
+                anchor.appendChild(btn);anchor.appendChild(pop);attachPopover(btn,pop);
+                row.lastChild.appendChild(document.createTextNode(' '));row.lastChild.appendChild(anchor);
+            }
+            body.appendChild(row);
         });
-        if (!events.length) { body.appendChild(h('tr', {}, [h('td', {colspan: '3', text: 'No timestamped steering events in the latest snapshot.'})])); }
+        if (!events.length) {body.appendChild(h('tr',{},[h('td',{colspan:'3',text:'No timestamped steering events in the selected window (latest event cache only).'})]));}
         table.appendChild(body);
-        return panel('Recent Changes & Events', h('div', {class: 'ov-table-wrap'}, [table,
-            h('p', {class: 'ov-muted', text: 'Latest router-reported steering event cache. Historical change categories will be added once a unified event feed is verified.'})]));
+        return h('div',{class:'ov-table-wrap'},[table,
+            h('p',{class:'ov-muted',text:'Events are filtered to the selected time window; the router may retain only a limited recent-event cache.'})]);
     };
     Overview.prototype._throughputPanel = function () {
         var self = this;
@@ -281,7 +421,7 @@
         var bond = bonds.filter(function (b) { return b.wbond_device && b.wbond_device.uid === primary; })[0];
         if (bond) {
             add(primary, bond.display_name || 'Bonded WAN', 'wbond');
-            var phys = validArray(topo.physical);
+            var phys = this._visiblePhysical();
             validArray(bond.members).forEach(function (m) {
                 var ref = m.physical || {};
                 if (ref.state !== 'resolved') { return; }
@@ -289,7 +429,7 @@
                 if (p) { add(p.uid, p.display_name, 'physical'); }
             });
         } else {
-            var allPaths = validArray(topo.physical);
+            var allPaths = this._visiblePhysical();
             var primaryPath = validArray((this.snapshot.wan || {}).paths).filter(function (p) {
                 return p.uid === primary && (p.object_class === 'physical' || p.object_class === 'sdwan');
             })[0];
@@ -297,7 +437,7 @@
             allPaths.forEach(function (p) { add(p.uid, p.display_name, 'physical'); });
         }
         // If the recorded primary is unknown, fall back to the first observed path without claiming it is primary.
-        if (!all.length) { validArray(topo.physical).forEach(function (p) { add(p.uid, p.display_name, 'physical'); }); }
+        if (!all.length) { this._visiblePhysical().forEach(function (p) { add(p.uid, p.display_name, 'physical'); }); }
         return all;
     };
     Overview.prototype.loadChart = function () {
