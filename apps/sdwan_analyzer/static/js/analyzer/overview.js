@@ -238,7 +238,7 @@
             clock12(end, true) + ' (' + F.timeZoneName() + '; ends at last observation)';
     };
     Overview.prototype._topology = function (topo, phys, bonds) {
-        var container = h('div'), flow = h('div', {class: 'ov-topology'});
+        var container = h('div'), flow = h('div', {class: 'ov-topology' + (bonds.length ? '' : ' ov-topology-no-bond')});
         var model = ((this.snapshot || {}).wan || {}).identity || {};
         var router = h('div', {class: 'ov-node ov-router'}, [
             h('span', {class: 'ov-topology-glyph', 'aria-hidden':'true'}, [h('i', {class:'fas fa-server'})]),
