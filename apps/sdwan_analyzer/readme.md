@@ -5,6 +5,12 @@ NCOS routers: WAN paths, SD-WAN interfaces, WAN bonding (WBOND), member
 interfaces, traffic steering, underlay connectivity, cellular state, and how
 these change over time.
 
+> **Current release: v1.0.2** adds the shared WAN identity layer (SIM
+> presence, internal/captive modem ownership, carrier and STA-compatible
+> friendly names used by every view). See
+> [`docs/analytics/wan-identity.md`](../../docs/analytics/wan-identity.md).
+> The status paragraph below describes the original backend build.
+>
 > **Status: BACKEND build (v0.5.0).** Targeted collectors, normalization,
 > logical Traffic Steering grouping, semantic fingerprints, a cached snapshot,
 > section JSON endpoints, and (new in 0.3.0) the **data-acquisition model**
@@ -112,7 +118,11 @@ not ready"}` until the first snapshot has been composed.
 - `GET /api/status`, `GET /api/health` — app + storage + collector health,
   effective web port, latest `system_summary`
 - `GET /api/snapshot` — full cached normalized snapshot (all sections)
-- `GET /api/wan` — `paths`, `physical`, `overlays`, `underlay_map`, `config`,
+- `GET /api/analytics/wan_identity` (1.0.2) — the shared WAN identity
+  inventory (raw `wans[]`, displayable/empty-SIM split, retained identity
+  versions; `?version=N`). Contract: `docs/analytics/wan-identity.md`.
+- `GET /api/wan` — `paths` (raw inventory), `physical` (displayable: confirmed
+  empty SIM slots excluded), `overlays`, `underlay_map`, `config`,
   and (0.3.3) `interfaces`: the latest normalized per-interface counters
   (`rx/tx_bytes`, `rx/tx_packets`, `rx/tx_errors`, `rx/tx_drops`,
   `reset_suspected`, `metric_ts`, `collected_ts`, `timestamp_source`). Raw
@@ -775,9 +785,12 @@ the legacy object until a read completes successfully.
 ```
 { timestamp,
   system_summary: { primary_device, wan_path_count, physical_count,
-                    overlay_count, bond_count, logical_rule_count },
-  wan:   { primary_device, paths[], physical[], overlays[],
-           underlay_map[], config{} },
+                    overlay_count, bond_count, logical_rule_count,
+                    wan_object_count, physical_raw_count, empty_sim_count,
+                    physical_connected_count, physical_inactive_count },
+  wan:   { primary_device, paths[] (raw, with identity fields),
+           physical[] (displayable), empty_sim_uids[], inventory{},
+           identity{}, overlays[], underlay_map[], config{} },
   swans: { paths[], history_summary, raw },
   traffic_classes: [],
   traffic_steering: { logical_rules[], compiled_rules[], events[],
@@ -803,6 +816,12 @@ not yet proven, so nothing is fabricated or discarded.
 - **`info.iface`** (e.g. `gres-hub0_wan`) — Linux interface.
 - **`object_class`** — `physical` | `sdwan` | `wbond` | `unknown`. WBOND is a
   separate forwarding object and is **never** flattened into its members.
+- **`display_name`** — presentation only (v1.0.2: one shared, STA-compatible
+  resolver). Never a join key. Classification (`classification`,
+  `sim_presence`, `modem_owner`, `operational_state`, ...) comes from
+  `analyzer/wan_identity.py`; no other module classifies, filters or names a
+  WAN. Rules, API contracts, privacy handling and validation status:
+  `docs/analytics/wan-identity.md`.
 
 ### Priority domains (kept separate)
 
@@ -885,7 +904,10 @@ for every runtime section, including persisted history and Recording) and
 `stage_a_tests.py` (bonding fingerprint and flow-total regressions) and
 `foundation_tests.py` (steering definitions/changes, application matching,
 configured bonding, component RF, QoE validity, persistence, new APIs; fixtures
-in `foundation_fixtures.py`, synthetic and sanitized). The suite has been run on CPython 3.8.20 (the cppython
+in `foundation_fixtures.py`, synthetic and sanitized) and (v1.0.2)
+`wan_identity_tests.py` (shared WAN identity: SIM presence, modem ownership,
+naming, raw vs displayable inventory, relationships, history continuity,
+privacy; fixtures in `wan_identity_fixtures.py`). The suite has been run on CPython 3.8.20 (the cppython
 version) as well as the workstation interpreter.
 
 `tests/fixtures.py` models the validated R1900 scenario (physical Ethernet +

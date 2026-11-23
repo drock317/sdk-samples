@@ -55,6 +55,7 @@ from . import steering_state
 from . import storage
 from . import telemetry
 from . import topology
+from . import wan_identity
 from . import wbond
 
 # User-selectable continuous-history intervals (minutes). No 1-minute mode.
@@ -657,6 +658,8 @@ class AnalyzerService(object):
         'steering_definitions': ('steering_rules',),
         'wbond_config': ('wan_bonding',),
         'overlay_underlay': ('wan_devices',),
+        # v1.0.2: durable WAN identity (SIM/carrier/modem/name) history.
+        'wan_identity': ('wan_devices', 'product_name'),
         'capabilities': ('wan_bonding',),
         steering_state.NAME: ('steering_rules',),
         'wan_bonding_config': ('wan_bonding_cfg',),
@@ -757,6 +760,21 @@ class AnalyzerService(object):
             if fp is None:
                 fp = normalize._stable_hash(payload)
             out[name] = self._config_store.update(name, fp, payload, now)
+        # v1.0.2: durable WAN identity. Versioned only from a fresh read of
+        # its sources and only when a non-empty inventory exists; volatile
+        # operational fields are excluded so a link flap never versions it.
+        try:
+            fresh_ident = (ok_keys is None or 'wan_devices' in ok_keys
+                           or 'product_name' in ok_keys)
+            if fresh_ident and wan.get('paths'):
+                payload = wan_identity.versioned_payload(
+                    wan.get('paths'),
+                    (wan.get('identity') or {}).get('host_model'))
+                out['wan_identity'] = self._config_store.update(
+                    'wan_identity', normalize._stable_hash(payload),
+                    payload, now)
+        except Exception as e:
+            cp.log('service: wan identity versioning error: {}'.format(e))
         try:
             if ok_keys is None or 'wan_bonding_cfg' in ok_keys:
                 st, cfg_bonds = bond_config.normalize_config(
@@ -808,15 +826,30 @@ class AnalyzerService(object):
         raw_devices = base.get('wan_devices')
         devices = raw_devices if isinstance(raw_devices, dict) else {}
 
+        # ONE authoritative WAN identity inventory (wan_identity.py): every
+        # name, SIM/modem classification and inventory decision below comes
+        # from it. Raw NCOS uids/ifaces are carried unchanged.
+        host_model = base.get('product_name')
+        inventory = wan_identity.build_inventory(
+            raw_devices, host_model if isinstance(host_model, str) else None)
+        ident = inventory['by_uid']
+
         # SD-WAN underlay correlation (per overlay device).
-        sdwan_underlays = self._resolve_sdwan_underlays(devices)
+        sdwan_underlays = self._resolve_sdwan_underlays(devices, ident)
         underlay_map = {u['sdwan_uid']: u['underlay_uid']
                         for u in sdwan_underlays if u.get('underlay_uid')}
 
-        # WAN path inventory with object_class + underlay-aware naming.
-        wan_paths = normalize.wan_paths(raw_devices, primary, underlay_map)
-        physical = [p for p in wan_paths
-                    if p.get('object_class') == normalize.OBJ_PHYSICAL]
+        # RAW inventory: every NCOS WAN object (incl. empty SIM slots).
+        wan_paths = normalize.wan_paths(raw_devices, primary, underlay_map,
+                                        inventory)
+        physical_raw = [p for p in wan_paths
+                        if p.get('object_class') == normalize.OBJ_PHYSICAL]
+        # DISPLAYABLE physical inventory: raw physical minus confirmed
+        # empty SIM slots (retained in `paths` for topology/diagnostics).
+        physical = [p for p in physical_raw if p.get('inventory_visible')]
+        empty_sim_uids = [p['uid'] for p in physical_raw
+                          if p.get('classification') ==
+                          wan_identity.CLASS_EMPTY_SIM]
         overlays = [p for p in wan_paths
                     if p.get('object_class') == normalize.OBJ_SDWAN]
 
@@ -832,6 +865,10 @@ class AnalyzerService(object):
 
         events = normalize.steering_events(base.get('steering_events'))
         stats = normalize.steering_stats(base.get('steering_stats'))
+        # Presentation names for raw WAN references. Raw selector/uid values
+        # are never replaced.
+        wan_identity.annotate_steering_refs(
+            logical, events.get('events', []), ident)
 
         # SWANS + QoE (kept separate concepts).
         swans = normalize.swans_paths(base.get('swans'))
@@ -848,7 +885,7 @@ class AnalyzerService(object):
         lbs = normalize.loadbalancers(heavy.get('loadbalancers'))
 
         # WAN bonding detailed runtime + member friendly names.
-        bonding = self._compose_bonding(heavy.get('wan_bonding'), devices)
+        bonding = self._compose_bonding(heavy.get('wan_bonding'), devices, ident)
 
         # WAN config correlation (config/wan/rules2) -- read-only.
         wan_rules2 = normalize.wan_rules2_index(heavy.get('wan_rules2'))
@@ -871,17 +908,32 @@ class AnalyzerService(object):
             'system_summary': {
                 'router_name': router_name or None,
                 'primary_device': primary,
-                'wan_path_count': len(wan_paths),
+                # Excludes confirmed empty SIM slots; the raw NCOS object
+                # count is wan_object_count.
+                'wan_path_count': len(wan_paths) - len(empty_sim_uids),
+                'wan_object_count': len(wan_paths),
                 'physical_count': len(physical),
+                'physical_raw_count': len(physical_raw),
+                'empty_sim_count': len(empty_sim_uids),
+                'physical_connected_count': inventory['summary']['connected'],
+                'physical_inactive_count': inventory['summary']['inactive'],
                 'overlay_count': len(overlays),
                 'bond_count': len(bonding.get('bonds', [])),
                 'logical_rule_count': len(logical),
             },
             'wan': {
                 'primary_device': primary,
-                'paths': wan_paths,
-                'physical': physical,
+                'paths': wan_paths,                 # RAW inventory
+                'physical': physical,               # displayable only
+                'empty_sim_uids': empty_sim_uids,
                 'overlays': overlays,
+                'inventory': inventory['summary'],
+                'identity': {
+                    'schema_version': wan_identity.SCHEMA_VERSION,
+                    'host_model': inventory['host_model'],
+                    'host_family': inventory['host_family'],
+                    'catalog': inventory['catalog'],
+                },
                 'underlay_map': sdwan_underlays,
                 'config': wan_rules2,
                 # Latest normalized counters per interface (raw counters
@@ -890,7 +942,9 @@ class AnalyzerService(object):
             },
             'cellular': {
                 'modems': [dict(r, carriers=[dict(c) for c in
-                                             r.get('carriers', [])])
+                                             r.get('carriers', [])],
+                                identity=wan_identity.public_view(
+                                    ident.get(r.get('uid'))))
                            for r in self._cur_cellular],
                 # v0.8.3 additive: component RF semantics.
                 'rf_notes': list(cellular.RF_NOTES),
@@ -952,13 +1006,16 @@ class AnalyzerService(object):
             })
         return out
 
-    def _compose_bonding(self, raw_wan_bonding, devices):
+    def _compose_bonding(self, raw_wan_bonding, devices, ident=None):
         """Normalize bonding runtime and resolve member/bond friendly names.
 
-        Member friendly names reuse normalize.friendly_name over the devices
-        map. WBOND is kept a separate forwarding object; members are NOT
-        flattened away -- they are attached to their bond.
+        Member names come from the shared WAN identity inventory (`ident`,
+        wan_identity.build_inventory). WBOND is kept a separate forwarding
+        object; members are NOT flattened away -- they are attached to their
+        bond, and an inactive or empty-SIM member is flagged, never dropped.
         """
+        if ident is None:
+            ident = wan_identity.build_inventory(devices)['by_uid']
         detail = normalize.wan_bonding_detail(raw_wan_bonding)
         for bond in detail.get('bonds', []):
             bond_name = bond.get('name') or ''
@@ -968,28 +1025,37 @@ class AnalyzerService(object):
                                            bond_name))
             for m in bond.get('members', []):
                 muid = m.get('member_uid')
-                dev = devices.get(muid) if muid else None
-                resolved_uid = muid
-                if not isinstance(dev, dict) and muid:
+                rec = ident.get(muid) if muid else None
+                if rec is None and muid:
                     # Fall back to an info.iface match (STA behavior).
-                    for duid, d in devices.items():
-                        if not isinstance(d, dict):
-                            continue
-                        if muid == (d.get('info', {}) or {}).get('iface', ''):
-                            dev, resolved_uid = d, duid
+                    for r in ident.values():
+                        if r.get('iface') == muid:
+                            rec = r
                             break
-                if isinstance(dev, dict):
-                    m['display_name'] = normalize.friendly_name(
-                        resolved_uid, dev)
+                if rec is not None:
+                    m['display_name'] = rec['display_name']
+                    m['identity'] = {
+                        'resolved_uid': rec['uid'],
+                        'classification': rec['classification'],
+                        'sim_presence': rec['sim_presence'],
+                        'operational_state': rec['operational_state'],
+                        'failure_reason': rec['failure_reason'],
+                        'available': rec['classification'] !=
+                        wan_identity.CLASS_EMPTY_SIM,
+                    }
                 else:
                     m['display_name'] = muid
+                    m['identity'] = None
         return detail
 
-    def _resolve_sdwan_underlays(self, devices):
+    def _resolve_sdwan_underlays(self, devices, ident=None):
         """Map each SD-WAN device to its dependent (underlay) WAN.
 
-        STA-validated: active_dep_wandev / dep_wandevs.
+        STA-validated: active_dep_wandev / dep_wandevs. Names come from the
+        shared identity inventory.
         """
+        if ident is None:
+            ident = wan_identity.build_inventory(devices)['by_uid']
         out = []
         for uid, device in devices.items():
             if not isinstance(device, dict):
@@ -1000,10 +1066,9 @@ class AnalyzerService(object):
                 continue
             underlay_uid = normalize.sdwan_underlay_uid(device)
             underlay_name = ''
-            underlay_dev = devices.get(underlay_uid)
-            if isinstance(underlay_dev, dict):
-                underlay_name = normalize.friendly_name(
-                    underlay_uid, underlay_dev)
+            under = ident.get(underlay_uid)
+            if under is not None:
+                underlay_name = under['display_name']
             out.append({
                 'sdwan_uid': uid,
                 'sdwan_iface': info.get('iface', ''),
@@ -1231,6 +1296,90 @@ class AnalyzerService(object):
                   if durable.sane_ts(now) else None)
         return analytics.interface_rates(self._store, p, window)
 
+    def query_wan_identity(self, raw_query=''):
+        """Shared WAN identity inventory (read-only, cached; no router I/O).
+
+        Raw inventory (every NCOS WAN object, incl. empty SIM slots) with the
+        displayable / hidden split spelled out, plus the retained identity
+        versions. `?version=N` returns that retained version's compact
+        payload so history consumers (observations and Recordings carry the
+        wan_identity version number) can resolve identity AS OF a sample.
+        Sensitive subscriber/modem identifiers are never part of it.
+        """
+        q = query.split_query(raw_query, ('version',))
+        want = None
+        if q.get('version') is not None:
+            t = q['version']
+            if not t.isdigit() or len(t) > 9 or int(t) < 1:
+                raise query.bad('version must be a positive integer')
+            want = int(t)
+        with self._lock:
+            snap = self._snapshot
+        if snap is None:
+            return None
+        wan = snap.get('wan') or {}
+        paths = [p for p in (wan.get('paths') or []) if isinstance(p, dict)]
+        versions = self._config_store.versions('wan_identity')
+        cur = self._config_store.current('wan_identity')
+        out = {
+            'schema_version': wan_identity.SCHEMA_VERSION,
+            'as_of': {'snapshot_ts': snap.get('timestamp'),
+                      'wan': (snap.get('section_freshness') or {}).get(
+                          'wan')},
+            'host_model': (wan.get('identity') or {}).get('host_model'),
+            'host_family': (wan.get('identity') or {}).get('host_family'),
+            'catalog': (wan.get('identity') or {}).get('catalog'),
+            'inventory': dict(wan.get('inventory') or {}),
+            'wans': [{k: (list(p[k]) if isinstance(p.get(k), list)
+                          else p.get(k))
+                      for k in wan_identity.PUBLIC_FIELDS} for p in paths],
+            'displayable_physical_uids': [
+                p['uid'] for p in paths
+                if p.get('object_class') == wan_identity.OBJ_PHYSICAL
+                and p.get('inventory_visible')],
+            'empty_sim_uids': list(wan.get('empty_sim_uids') or []),
+            'identity_versions': {
+                'current': cur['version'] if cur else None,
+                'retained': [{'version': v['version'],
+                              'first_seen_ts': v.get('ts')}
+                             for v in versions],
+                'max_retained': self._config_store.info().get(
+                    'max_versions_per_object'),
+            },
+            'notes': list(wan_identity.NOTES),
+        }
+        if want is not None:
+            hit = [v for v in versions if v['version'] == want]
+            if not hit:
+                raise query.QueryError(404, 'identity version not retained')
+            out['version_payload'] = {
+                'version': want, 'first_seen_ts': hit[0].get('ts'),
+                'payload': hit[0].get('payload')}
+        return out
+
+    def _identity_window_scan(self, p, sinks):
+        """_scan_history plus an IdentityWindow sink; -> (window, sink)."""
+        iw = wan_identity.IdentityWindow()
+        win = self._scan_history(p['start'], p['end'], tuple(sinks) + (iw,))
+        return win, iw
+
+    def _annotate_identity(self, rows, iw):
+        """Attach per-uid identity (current + as-of-window) to result rows.
+
+        The CURRENT identity is labelled current; identity versions seen in
+        the scanned window are listed so today's carrier/SIM placement is
+        never presented as historical fact.
+        """
+        with self._lock:
+            snap = self._snapshot
+        paths = ((snap or {}).get('wan') or {}).get('paths') or []
+        by_uid = {p.get('uid'): p for p in paths if isinstance(p, dict)}
+        versions = self._config_store.versions('wan_identity')
+        for row in rows or ():
+            if isinstance(row, dict) and row.get('uid'):
+                row['identity'] = wan_identity.history_block(
+                    row['uid'], by_uid.get(row['uid']), iw, versions)
+
     def query_topology(self):
         """Current WAN/overlay/WBOND relationships (read-only, cached).
 
@@ -1333,17 +1482,21 @@ class AnalyzerService(object):
         an = cell_analytics.CellularAnalyzer(
             uid=p['uid'], interval_hint_s=self._schedule_minutes * 60,
             max_events=p['max_events'])
-        win = self._scan_history(p['start'], p['end'], (an,))
-        return an.result(win)
+        win, iw = self._identity_window_scan(p, (an,))
+        out = an.result(win)
+        self._annotate_identity(out.get('modems'), iw)
+        return out
 
     def query_sdwan_history(self, raw_query=''):
         p = self._analysis_params(raw_query, ('start', 'end', 'max_events'))
         an = sdwan_analytics.SdwanAnalyzer(
             interval_hint_s=self._schedule_minutes * 60,
             max_events=p['max_events'])
-        win = self._scan_history(p['start'], p['end'], (an,))
+        win, iw = self._identity_window_scan(p, (an,))
         out = an.result(win)
         out.pop('_events_all', None)
+        self._annotate_identity(
+            (out.get('interfaces') or {}).get('by_interface'), iw)
         return out
 
     def query_correlation(self, raw_query=''):

@@ -35,6 +35,20 @@
     function validArray(v) { return Array.isArray(v) ? v : []; }
     function icon(kind) { return kind === 'ethernet' ? '▣' : kind === 'cellular' ? '▥' : kind === 'wbond' ? '↗' : '◇'; }
     function maybeStatus(d) { return d && d.connection_state ? d.connection_state : 'unknown'; }
+    /* Identity helpers: every name, SIM and failure fact comes from the shared backend
+     * WAN identity layer (analyzer/wan_identity.py); nothing is classified here. */
+    function simPlacement(p) {
+        var id = p && p.identity;
+        if (!id || !id.sim_presence || id.sim_presence === 'not_applicable') { return 'Not applicable'; }
+        var slot = id.sim_type === 'esim' ? 'eSIM' : txt(id.sim_slot, 'slot not reported');
+        var pres = id.sim_presence === 'empty' ? 'empty' : id.sim_presence === 'present' ? 'present' : 'presence unknown';
+        return slot + ' (' + pres + ')';
+    }
+    function pathState(p) {
+        var o = p.observed || {}, s = stateLabel(o.connection_state);
+        return o.operational_state === 'inactive' && o.failure_reason ? s + ' — ' + o.failure_reason : s;
+    }
+    function wanRef(identity, raw) { return identity && identity.resolved && identity.display_name ? identity.display_name : raw; }
 
     function Overview(mount) {
         this.mount = mount; this.token = 0; this.chartToken = 0;
@@ -97,7 +111,9 @@
             text: txt((snap.system_summary || {}).router_name, 'Router name unavailable')}),
             h('span', {class: 'ov-context', text: 'Primary WAN: ' + txt((topo.primary || {}).display_name, 'Unknown')})]);
         child(this.stats, [
-            stat('Physical WANs', phys.length, phys.filter(function (p) { return maybeStatus(p.observed) === 'connected'; }).length + ' connected'),
+            stat('Physical WANs', phys.length, phys.filter(function (p) { return maybeStatus(p.observed) === 'connected'; }).length + ' connected' +
+                (phys.filter(function (p) { return (p.observed || {}).operational_state === 'inactive'; }).length ?
+                    ' · ' + phys.filter(function (p) { return (p.observed || {}).operational_state === 'inactive'; }).length + ' inactive' : '')),
             stat('SD-WAN overlays', overlays.length, 'Reported by NCOS'),
             stat('WBOND interfaces', bonds.length, 'Runtime bond objects'),
             stat('Logical steering rules', rules.length, 'Defined in latest snapshot'),
@@ -133,13 +149,15 @@
         if (!visible.length) { members.appendChild(h('p', {class: 'ov-muted', text: 'No WAN paths reported.'})); }
         visible.forEach(function (m) {
             var ref = first ? (m.physical || {}) : {state: 'resolved', uid: m.uid};
-            var path = phys.filter(function (p) { return p.uid === ref.uid; })[0];
+            var path = phys.filter(function (p) { return p.uid === ref.uid; })[0] ||
+                validArray(topo.hidden_physical).filter(function (p) { return p.uid === ref.uid; })[0];
             var name = path ? txt(path.display_name, path.uid) : 'Unresolved physical WAN';
             var detail = first ? ('Bond tunnel: ' + txt(m.tunnel_iface, 'Not reported') + '\nPhysical member: ' +
                 txt(m.reported_intf_name, 'Not reported') + '\nResolved WAN: ' +
                 txt(ref.state === 'resolved' ? ref.uid : null, 'Unresolved') + '\nRelationship: ' +
-                txt(m.underlay_consistency, 'Unknown') + '\nSIM placement: Not available in the current topology API') :
-                ('Interface: ' + txt(m.uid) + '\nType: ' + txt(m.kind));
+                txt(m.underlay_consistency, 'Unknown') + '\nSIM placement: ' + simPlacement(path) +
+                (ref.available === false ? '\nAvailability: Unavailable (empty SIM slot)' : '')) :
+                ('Interface: ' + txt(m.uid) + '\nType: ' + txt(m.kind) + '\nSIM placement: ' + simPlacement(m));
             var btn = h('button', {type: 'button', class: 'ov-iconbtn', text: 'i',
                 'aria-label': 'Details for ' + name, 'aria-expanded': 'false'});
             btn.addEventListener('click', function () {
@@ -150,7 +168,8 @@
             });
             members.appendChild(h('div', {class: 'ov-node ov-member'}, [
                 h('div', {class: 'ov-member-info'}, [h('span', {class: 'ov-member-name', text: icon(path && path.kind) + '  ' + name}),
-                    h('span', {class: 'ov-muted', text: first ? 'WBOND member · ' + txt((m.observed || {}).link_attach_state, 'state unknown') : stateLabel(m.observed && m.observed.connection_state)})]), btn]));
+                    h('span', {class: 'ov-muted', text: first ? 'WBOND member · ' + txt((m.observed || {}).link_attach_state, 'state unknown') +
+                        (ref.available === false ? ' · empty SIM slot' : '') : pathState(m)})]), btn]));
         });
         flow.appendChild(members); container.appendChild(flow); container.appendChild(tooltip);
         if (validArray(topo.unresolved).length) {
@@ -213,7 +232,7 @@
             var assoc = overlays.filter(function (o) { return (o.underlay || {}).state === 'resolved' && (o.underlay || {}).uid === p.uid; });
             var ms = assoc.map(function (o) { return swanById[o.uid]; }).filter(Boolean);
             var q = ms.length === 1 ? ms[0] : null;
-            var values = [cell(p.display_name || p.uid), cell(stateLabel((p.observed || {}).connection_state)),
+            var values = [cell(p.display_name || p.uid), cell(pathState(p), 'ov-wrap'),
                 cell(q && number(q.latency_ms) !== null ? q.latency_ms + ' ms' : '—'),
                 cell(q && number(q.jitter_ms) !== null ? q.jitter_ms + ' ms' : '—'),
                 cell(q ? time(q.epoch) : ms.length > 1 ? 'Multiple overlay samples' : 'Not available')];
@@ -222,7 +241,9 @@
         if (!phys.length) { body.appendChild(h('tr', {}, [h('td', {colspan: '5', text: 'No physical WANs reported.'})])); }
         table.appendChild(body);
         return panel('WAN / Path Status', h('div', {class: 'ov-table-wrap'}, [table,
-            h('p', {class: 'ov-muted', text: 'SWANS metrics are shown only when exactly one measured overlay resolves to the physical WAN.'})]));
+            h('p', {class: 'ov-muted', text: 'SWANS metrics are shown only when exactly one measured overlay resolves to the physical WAN.' +
+                (validArray(this.topology && this.topology.hidden_physical).length ?
+                    ' Empty SIM slots are not listed as WAN paths.' : '')})]));
     };
     Overview.prototype._events = function (snap) {
         var events = validArray((snap.traffic_steering || {}).events).filter(function (e) { return number(e.epoch) !== null; });
@@ -232,7 +253,7 @@
         table.appendChild(h('thead', {}, [header]));
         var body = h('tbody');
         events.slice(0, 5).forEach(function (e) {
-            var change = (e.wan_from || e.wan_to) ? txt(e.wan_from, '?') + ' → ' + txt(e.wan_to, '?') :
+            var change = (e.wan_from || e.wan_to) ? txt(wanRef(e.wan_from_identity, e.wan_from), '?') + ' → ' + txt(wanRef(e.wan_to_identity, e.wan_to), '?') :
                 'Reason: ' + txt(e.reason, 'Not reported');
             body.appendChild(h('tr', {}, [cell(time(e.epoch)), cell(e.steering_rule), cell(change, 'ov-wrap')]));
         });

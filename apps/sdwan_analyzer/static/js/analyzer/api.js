@@ -85,6 +85,8 @@
                 if (!p || typeof p.uid !== 'string') { return; }
                 if (p.object_class !== 'physical' && p.object_class !== 'sdwan' &&
                     p.object_class !== 'wbond') { return; }
+                /* Confirmed empty SIM slots are not selectable paths (backend identity layer). */
+                if (p.inventory_visible === false && p.object_class === 'physical') { return; }
                 out.push({uid: p.uid, label: p.display_name || p.uid,
                           objectClass: p.object_class, state: p.connection_state || null});
             });

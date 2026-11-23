@@ -31,6 +31,7 @@ Verified source fields (see docs/analytics/topology.md):
 Python 3.8 compatible.
 """
 from . import normalize
+from . import wan_identity
 
 SCHEMA_VERSION = 1
 
@@ -47,6 +48,12 @@ NOTES = (
     'A member or tunnel reported UP/connected is not evidence that it is '
     'carrying traffic or that the path is healthy.',
     'No bandwidth utilization or bonding efficiency is calculated.',
+    'physical[] is the DISPLAYABLE physical inventory: confirmed empty SIM '
+    'slots (classification empty_sim) are listed in hidden_physical[] '
+    'instead. They stay resolvable as bond-member or overlay-underlay '
+    'targets, flagged available=false, never silently removed.',
+    'identity blocks come from the shared WAN identity layer '
+    '(wan_identity.py); operational_state is independent of sim_presence.',
 )
 
 # Collector keys whose cache health is reported under as_of.
@@ -64,6 +71,33 @@ def _unresolved(reason, **extra):
     d = {'state': 'unresolved', 'uid': None, 'reason': reason}
     d.update(extra)
     return d
+
+
+def _identity_block(path):
+    """Exportable identity fields of a normalized wan path record."""
+    return {k: path.get(k) for k in wan_identity.PUBLIC_FIELDS
+            if k not in ('uid', 'iface', 'info_uid', 'display_name',
+                         'connection_state')}
+
+
+def _decorate_ref(ref, by_uid):
+    """Add shared identity to a RESOLVED relationship reference.
+
+    Returns True when the target is a confirmed empty SIM slot (the
+    relationship is kept and flagged, never dropped).
+    """
+    if ref.get('state') != 'resolved':
+        return False
+    rec = by_uid.get(ref.get('uid')) or {}
+    ref['display_name'] = rec.get('display_name')
+    ref['classification'] = rec.get('classification')
+    ref['sim_presence'] = rec.get('sim_presence')
+    ref['operational_state'] = rec.get('operational_state')
+    empty = rec.get('classification') == wan_identity.CLASS_EMPTY_SIM
+    ref['available'] = not empty
+    if empty:
+        ref['unavailable_reason'] = 'empty_sim'
+    return empty
 
 
 def _dep_list(device):
@@ -158,6 +192,7 @@ def _primary_block(primary_uid, by_uid, health):
                 kind=rec.get('kind'),
                 display_name=rec.get('display_name'),
                 connection_state=rec.get('connection_state'),
+                operational_state=rec.get('operational_state'),
                 ip_address=rec.get('ip_address'))
 
 
@@ -188,6 +223,7 @@ def build(snapshot, raw_devices, health):
     primary = _primary_block(wan.get('primary_device'), by_uid, health)
     primary_known = primary['state'] == 'known'
     unresolved = []
+    unavailable = []     # relationships whose target is an empty SIM slot
 
     # --- overlays -------------------------------------------------------
     overlays, overlay_by_iface = [], {}
@@ -200,9 +236,14 @@ def build(snapshot, raw_devices, health):
         if under['state'] != 'resolved':
             unresolved.append({'kind': 'overlay_underlay', 'uid': uid,
                                'reason': under['reason']})
+        elif _decorate_ref(under, by_uid):
+            unavailable.append({'kind': 'overlay_underlay', 'uid': uid,
+                                'target_uid': under['uid'],
+                                'reason': 'empty_sim'})
         rec = {
             'uid': uid, 'iface': p.get('iface') or None,
             'display_name': p.get('display_name'),
+            'identity': _identity_block(p),
             'config': {'cm_priority': p.get('cm_priority'),
                        'parent_priority': p.get('parent_priority')},
             'observed': {'connection_state': p.get('connection_state'),
@@ -253,6 +294,11 @@ def build(snapshot, raw_devices, health):
             else:
                 ov = _unresolved('tunnel_iface_not_an_overlay')
             phys = _resolve_physical_ref(ref, devices, by_uid)
+            if _decorate_ref(phys, by_uid):
+                unavailable.append({'kind': 'bond_member_physical',
+                                    'uid': tun or iface,
+                                    'target_uid': phys['uid'],
+                                    'reason': 'empty_sim'})
             # Two independent routes to a physical WAN: the overlay's own
             # dependent, and the member's reported 'intf name'.
             ov_under = None
@@ -326,24 +372,30 @@ def build(snapshot, raw_devices, health):
     for o in overlays:
         if o['underlay']['state'] == 'resolved':
             carried.setdefault(o['underlay']['uid'], []).append(o['uid'])
-    physical = []
+    physical, hidden_physical = [], []
     for p in paths:
         if p.get('object_class') != normalize.OBJ_PHYSICAL:
             continue
         uid = p.get('uid')
-        physical.append({
+        entry = {
             'uid': uid, 'iface': p.get('iface') or None,
             'kind': p.get('kind'), 'display_name': p.get('display_name'),
+            'identity': _identity_block(p),
             'config': {'cm_priority': p.get('cm_priority'),
                        'original_priority': p.get('original_priority'),
                        'parent_priority': p.get('parent_priority')},
             'observed': {'connection_state': p.get('connection_state'),
+                         'operational_state': p.get('operational_state'),
+                         'failure_reason': p.get('failure_reason'),
                          'ip_address': p.get('ip_address'),
                          'is_primary': (p.get('is_primary')
                                         if primary_known else None)},
             'overlays': carried.get(uid, []),
             'bond_memberships': member_of.get(uid, []),
-        })
+        }
+        # Confirmed empty SIM slots are engineering diagnostics, not paths.
+        (physical if p.get('inventory_visible') else hidden_physical
+         ).append(entry)
 
     # --- freshness ------------------------------------------------------
     as_of = {'snapshot_ts': snapshot.get('timestamp'),
@@ -363,8 +415,11 @@ def build(snapshot, raw_devices, health):
         'as_of': as_of,
         'primary': primary,
         'physical': physical,
+        'hidden_physical': hidden_physical,
+        'inventory': dict(wan.get('inventory') or {}),
         'overlays': overlays,
         'bonds': bonds,
+        'unavailable_references': unavailable,
         'bonding_runtime': {'state': 'read' if bonding_read else 'unknown',
                             'bond_count': len(bonds)},
         'unresolved': unresolved,

@@ -61,7 +61,7 @@ def test_wan_paths():
     check(by_uid['wbond-wbond0_hub0']['object_class'] == normalize.OBJ_WBOND,
           'wbond classed wbond (not flattened)')
     check(by_uid['sdwan-hub0_wan']['display_name'] ==
-          'SD-WAN \u2014 Ethernet WAN', 'sdwan-eth named from underlay')
+          'SD-WAN Tunnel - Ethernet WAN', 'sdwan-eth named from underlay')
     check(by_uid['ethernet-wan']['is_primary'] is True,
           'primary from primary_device only')
 
@@ -2355,8 +2355,13 @@ def test_snapshot_normalized_telemetry():
         {k: v for k, v in i.items() if k != 'kind'} == o
         for i, o in zip(snap['wan']['interfaces'], obs['interfaces'])),
         'observation and current state share the same records')
-    check(obs['cellular'] == snap['cellular']['modems'],
-          'observation cellular == current cellular')
+    # v1.0.2: the snapshot adds a presentation-only `identity` block per
+    # modem; the persisted observation stays identity-free (history resolves
+    # identity through the wan_identity version instead).
+    check(obs['cellular'] == [
+        {k: v for k, v in m.items() if k != 'identity'}
+        for m in snap['cellular']['modems']],
+        'observation cellular == current cellular')
 
 
 # --- web connection handling --------------------------------------------
@@ -2968,6 +2973,10 @@ def main():
     import steering_reliability_tests
     steering_reliability_tests.bind(check, _Clock)
     tests = tests + steering_reliability_tests.TESTS
+    # v1.0.2: shared WAN identity layer.
+    import wan_identity_tests
+    wan_identity_tests.bind(check, _free_port)
+    tests = tests + wan_identity_tests.TESTS
     for t in tests:
         t()
     print('')

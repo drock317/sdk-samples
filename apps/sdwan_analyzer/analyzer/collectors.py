@@ -22,6 +22,10 @@ VERIFIED (documented structure, safe to consume specific fields):
     status/sdwan_adv                   docs/ncos-api/status/sdwan_adv.md
     status/wan/steering                docs/ncos-api/status/wan/steering.md
 
+HOST MODEL (v1.0.2, static):
+    status/product_info/product_name   cp.get_product_type() reads the same
+        path; one small string, read with the static config set (startup +
+        hourly), used only to name the host router in WAN identity.
 STA-VALIDATED (shape confirmed by Speedtest Analyzer v1.1.4 validated code,
 which resolved these on real hardware incl. R1900; see normalize.py for the
 field semantics):
@@ -533,6 +537,9 @@ _PATHS = {
     'loadbalancers': 'status/wan/loadbalancers',
     'wan_rules2': 'config/wan/rules2',
     'system_id': 'config/system/system_id',
+    # v1.0.2: host router model for WAN identity naming (tiny, static; read
+    # with the static config set, never on the observation cadence).
+    'product_name': 'status/product_info/product_name',
     'identities_ip': 'config/identities/ip',
     'identities_intent': 'config/identities/intent',
     'traffic_class_config': 'config/sdwan_adv/traffic_class',
@@ -548,7 +555,7 @@ _STEERING_KEYS = ('steering_rules', 'steering_events', 'steering_stats',
 # expensive on the R1900, so it is read only at startup, ~hourly reconciliation
 # and targeted manual refresh -- never on every observation and never during
 # high-rate Recording by default.
-STATIC_CONFIG_KEYS = ('system_id', 'wan_rules2', 'identities_ip', 'identities_intent',
+STATIC_CONFIG_KEYS = ('system_id', 'product_name', 'wan_rules2', 'identities_ip', 'identities_intent',
                       'traffic_class_config', 'wan_bonding_cfg', 'qoe_cfg')
 # Small config trees the steering definitions resolve against (identity
 # uuid, intent uuid, traffic class uuid). Read in the SAME pass as a changed
