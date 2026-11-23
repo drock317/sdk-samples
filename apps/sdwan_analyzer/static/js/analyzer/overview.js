@@ -553,7 +553,7 @@
             var from = wanRef(e.wan_from_identity,e.wan_from);
             var to = wanRef(e.wan_to_identity,e.wan_to);
             var reason = String(e.reason || '');
-            var registered = /^register policy\\b/i.test(reason);
+            var registered = /^register policy\b/i.test(reason);
             var change = registered ? 'Policy registered' :
                 (e.wan_from && e.wan_to ? (e.wan_from === e.wan_to ?
                     'Path reaffirmed — ' + txt(to) : txt(from) + ' → ' + txt(to)) :
@@ -674,6 +674,11 @@
                 var d = run.map(function (p,j) { return (j ? 'L' : 'M') + x(p.t).toFixed(2) + ',' + y(p.v).toFixed(2); }).join(' ');
                 node('path', {d:d, fill:'none', stroke:color, 'stroke-width':focused?2.7:1.7,
                     opacity:focused?1:0.25, 'stroke-linecap':'round', 'stroke-linejoin':'round'});
+                // A single valid interval has no line segment; show a point rather than hiding it.
+                run.forEach(function (pt) {
+                    node('circle',{cx:x(pt.t),cy:y(pt.v),r:focused?3.1:2.2,fill:color,
+                        opacity:focused?1:0.55});
+                });
             });
             var box = h('input',{type:'radio', name:'ov-focused-interface', value:s.uid});
             box.checked = focused;
@@ -683,6 +688,11 @@
         });
         this.chartHost.appendChild(svg);
         if (series.every(function (s) { return !S.hasAnyValue(s.intervals); })) {
+            var intervalCount = series.reduce(function (n,s) { return n+s.intervals.length; },0);
+            var explanation = intervalCount ? 'History returned '+intervalCount+
+                ' interval(s), but none contains a valid RX or TX rate. Check counter validity and interval statuses.' :
+                'No throughput intervals returned for these interfaces in the selected window.';
+            this.chartHost.appendChild(h('p',{class:'ov-muted',text:explanation}));
             this.chartHost.appendChild(h('p',{class:'ov-muted',text:'No valid RX intervals were reported in the selected time window.'}));
         }
         var failed = series.filter(function (s) { return s.error; });
