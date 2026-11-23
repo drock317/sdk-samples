@@ -861,9 +861,15 @@ class AnalyzerService(object):
         interfaces = [dict(r, kind=kinds.get(r.get('uid')))
                       for r in self._cur_interfaces]
 
+        # Router's configured system ID; the config collector may be missing.
+        # Never invent a name from a WAN interface or an SD-WAN tunnel.
+        raw_system_id = heavy.get('system_id')
+        router_name = (raw_system_id.strip() if isinstance(raw_system_id, str)
+                       else None)
         snapshot = {
             'timestamp': int(time.time()),
             'system_summary': {
+                'router_name': router_name or None,
                 'primary_device': primary,
                 'wan_path_count': len(wan_paths),
                 'physical_count': len(physical),
@@ -1198,6 +1204,24 @@ class AnalyzerService(object):
             window_start=window)
         return query.envelope(res['samples'], res['next_cursor'],
                               res['skipped_lines'])
+
+    def query_overview_meta(self):
+        """Read-only daily observation count, in the router's local calendar day.
+
+        Counts persisted observations only, without collecting router data.
+        Bounded by the existing analytics history scan limits. If retention
+        or a scan cap prevents an exact count, indicate that explicitly.
+        """
+        now = self._clock()
+        local = time.localtime(now)
+        midnight = time.mktime((local.tm_year, local.tm_mon, local.tm_mday,
+                                0, 0, 0, 0, 0, -1))
+        win = self._scan_history(midnight, now, ())
+        return {'day_start_ts': midnight, 'day_end_ts': now,
+                'observations_today': win['observations_scanned'],
+                'count_complete': not win['truncated'] and not win['skipped_lines'],
+                'truncated': win['truncated'],
+                'skipped_lines': win['skipped_lines']}
 
     def query_interface_rates(self, raw_query=''):
         """Calculated RX/TX rates for one interface, on demand (read-only)."""
