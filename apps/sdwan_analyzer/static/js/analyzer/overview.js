@@ -252,9 +252,9 @@
         var inactive = phys.filter(function (p) { return (p.observed || {}).operational_state === 'inactive'; }).length;
         document.querySelectorAll('.ov-popover.ov-portal').forEach(function (p) { p.remove(); });
         U.clear(this.context); U.clear(this.stats); U.clear(this.main); U.clear(this.bottom);
+        // The Overview represents all eligible SD-WAN paths, not one primary WAN.
         child(this.context, [h('strong', {class: 'ov-context ov-router-name',
-            text: txt((snap.system_summary || {}).router_name, 'Router name unavailable')}),
-            h('span', {class: 'ov-context', text: 'Primary WAN: ' + txt((topo.primary || {}).display_name, 'Unknown')})]);
+            text: txt((snap.system_summary || {}).router_name, 'Router name unavailable')})]);
         var counts = [coloredCount(connected, 'connected', 'good')];
         if (inactive) { counts.push(document.createTextNode(' · '), coloredCount(inactive, 'inactive', 'warn')); }
         if (this.hiddenUids.length) { counts.push(document.createTextNode(' · ' + this.hiddenUids.length + ' hidden')); }
