@@ -100,13 +100,13 @@
             if (e.key === 'Escape') { toggle(false); btn.focus(); }
         });
         if (hover) {
-            btn.addEventListener('mouseenter', function () { toggle(true); });
-            btn.addEventListener('mouseleave', function (e) {
-                if (!popup.contains(e.relatedTarget)) { toggle(false); }
-            });
-            popup.addEventListener('mouseleave', function (e) {
-                if (!btn.contains(e.relatedTarget)) { toggle(false); }
-            });
+            var hideTimer = null;
+            function cancelHide() { if (hideTimer !== null) { clearTimeout(hideTimer); hideTimer = null; } }
+            function soonHide() { cancelHide(); hideTimer = setTimeout(function () { toggle(false); }, 160); }
+            btn.addEventListener('mouseenter', function () { cancelHide(); toggle(true); });
+            btn.addEventListener('mouseleave', soonHide);
+            popup.addEventListener('mouseenter', cancelHide);
+            popup.addEventListener('mouseleave', soonHide);
         }
         btn._ovPosition = function () { if (!popup.hidden) { positionPopover(btn, popup); } };
     }
@@ -431,18 +431,23 @@
             return (tcId && (t.intent_id === tcId || t.traffic_class_id === tcId)) ||
                 (!tcId && tcName && t.name === tcName);
         })[0] || null;
-        var selector = rule.wan_selector_type || branch.wan_selector_type;
+        var rawSelector = rule.wan_selector_type || branch.wan_selector_type;
+        var selectorLabels = {explicit_priority:'Custom',bonded:'Bonded WAN',
+            all_sdwan:'All SD-WAN',specific:'Specific WAN',unknown:'Unavailable'};
+        var selector = selectorLabels[rawSelector] || rawSelector;
         var priorities = validArray(branch.wan_priority_order).length ?
             branch.wan_priority_order : validArray(rule.wan_priority_order);
         var rows = [['WAN Selector', selector],
             ['Allow Failover', typeof branch.failover === 'boolean' ? (branch.failover ? 'Enabled' : 'Disabled') :
                 (typeof rule.failover === 'boolean' ? (rule.failover ? 'Enabled' : 'Disabled') : 'Unavailable')],
             ['Traffic Class', tc ? tc.name : (tcName || 'Unavailable')]];
-        if (selector === 'custom' || (rule.wan_priority_enabled && priorities.length)) {
+        if (rawSelector === 'explicit_priority' || (rule.wan_priority_enabled && priorities.length)) {
             rows.push(['Priority List', rule.wan_priority_enabled ? 'Enabled' : 'Disabled']);
             priorities.forEach(function (v, i) {
                 var priority = typeof v === 'string' ? v : (v && (v.display_name || v.name || v.trigger_string));
-                rows.push(['WAN ' + (i + 1), priority || 'Unresolved']);
+                var ncmOrder = v && typeof v.trigger_priority === 'number' ? v.trigger_priority : null;
+                rows.push(['WAN ' + (i + 1) + (ncmOrder === null ? '' : ' (priority ' + ncmOrder + ')'),
+                    priority || 'Unresolved']);
             });
         }
         if (tc) {
