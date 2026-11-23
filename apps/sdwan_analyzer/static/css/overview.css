@@ -178,3 +178,19 @@
  .ov-topology,.ov-topology-no-bond {display:flex;flex-direction:column;align-items:stretch;gap:1.2rem;}
  .ov-topology .ov-member-list {display:grid;gap:.65rem;}
 }
+
+/* Next Overview polish: stronger summary hierarchy, accessible rule detail triggers.
+ * Fixed popover portals escape node stacking contexts and chart/table clipping. */
+.ov-stat-head .ov-stat-label {font-size:.88rem;font-weight:700;color:var(--text-primary);line-height:1.35;letter-spacing:-.01em;}
+.ov-stat-head {gap:.6rem;margin-bottom:.45rem;}
+.ov-stat-sub:empty {display:none;}
+.ov-rule-trigger {border:0;background:transparent;padding:.15rem 0;color:var(--text-primary);
+    font:inherit;font-weight:600;text-align:left;cursor:pointer;max-width:100%;overflow-wrap:anywhere;}
+.ov-rule-trigger:hover,.ov-rule-trigger:focus-visible {color:var(--ov-blue);text-decoration:underline;}
+.ov-rule-trigger:focus-visible {outline:2px solid var(--ov-blue);outline-offset:3px;border-radius:2px;}
+.ov-popover.ov-portal {position:fixed;z-index:2147483000;min-width:0;max-height:calc(100vh - 20px);
+    overflow-y:auto;box-sizing:border-box;right:auto;bottom:auto;top:auto;left:auto;}
+.ov-popover.ov-portal .ov-popover-row {align-items:baseline;gap:.45rem;}
+.ov-popover.ov-portal .ov-popover-row span {flex:1;min-width:7rem;}
+.ov-popover.ov-portal .ov-popover-row code {font-family:inherit;flex:1.1;text-align:right;font-weight:600;}
+@media(max-width:480px){.ov-stat-head .ov-stat-label {font-size:.9rem;}}
